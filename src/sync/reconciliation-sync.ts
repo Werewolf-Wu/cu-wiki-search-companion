@@ -162,7 +162,7 @@ export async function reconcileWikiMirror(
       const nextContinue = response.continue?.gapcontinue;
       const isFileBatch = namespace === FILE_NAMESPACE;
 
-      await database.transaction(
+      const committedState = await database.transaction(
         'rw',
         database.pages,
         database.fileResources,
@@ -256,9 +256,10 @@ export async function reconcileWikiMirror(
             { key: LOCAL_SEQUENCE_KEY, value: sequence },
             { key: RECONCILIATION_SYNC_KEY, value: nextState },
           ]);
-          state = nextState;
+          return nextState;
         },
       );
+      state = committedState;
 
       options.onProgress?.(state);
       if (state.namespaceIndex < state.namespaceIds.length) {

@@ -7,10 +7,139 @@ import { Analyzer } from '../src/analyzer/analyzer';
 import { WikiSearchDatabase } from '../src/storage/database';
 import { syncTitles } from '../src/sync/title-sync';
 import { WikiApi } from '../src/sync/wiki-api';
+import { abortTransactionAfterCallback } from './transaction-abort';
 
 const analyzer = new Analyzer({ cut, cutForSearch: cut_for_search });
 
 describe('title sync', () => {
+  it('retries a title batch whose transaction aborts during commit', async () => {
+    const calls: URL[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      calls.push(url);
+      if (url.searchParams.get('meta') === 'siteinfo') {
+        return json({ query: { namespaces: { 0: { id: 0, name: '' } } } });
+      }
+      if (url.searchParams.get('gapcontinue') === '第二批') {
+        return json({
+          query: {
+            pages: [
+              {
+                pageid: 2,
+                ns: 0,
+                title: '第二批标题',
+                lastrevid: 2,
+                contentmodel: 'wikitext',
+              },
+            ],
+          },
+        });
+      }
+      return json({
+        continue: { gapcontinue: '第二批' },
+        query: {
+          pages: [
+            {
+              pageid: 1,
+              ns: 0,
+              title: '必须重试的首批标题',
+              lastrevid: 1,
+              contentmodel: 'wikitext',
+            },
+          ],
+        },
+      });
+    });
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+    abortTransactionAfterCallback(database);
+
+    await expect(
+      syncTitles(database, api, analyzer, { requestIntervalMs: 0 }),
+    ).rejects.toBeDefined();
+
+    expect(await database.pages.get(1)).toBeUndefined();
+    expect((await database.syncState.get('title-sync'))?.value).toMatchObject({
+      status: 'failed',
+      namespaceIndex: 0,
+      pagesFetched: 0,
+    });
+    expect((await database.syncState.get('title-sync'))?.value).not.toHaveProperty(
+      'apcontinue',
+    );
+
+    const resumed = await syncTitles(database, api, analyzer, { requestIntervalMs: 0 });
+
+    expect(resumed).toMatchObject({ status: 'complete', pagesFetched: 2 });
+    expect(await database.pages.get(1)).toMatchObject({
+      title: '必须重试的首批标题',
+      deleted: false,
+    });
+    expect(await database.pages.get(2)).toMatchObject({
+      title: '第二批标题',
+      deleted: false,
+    });
+    expect(
+      calls.filter(
+        (url) => url.searchParams.has('gapnamespace') && !url.searchParams.has('gapcontinue'),
+      ),
+    ).toHaveLength(2);
+
+    database.close();
+    await database.delete();
+  });
+
+  it('retries title pruning when the completion transaction aborts', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      if (url.searchParams.get('meta') === 'siteinfo') {
+        return json({ query: { namespaces: { 0: { id: 0, name: '' } } } });
+      }
+      return json({ query: { pages: [] } });
+    });
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put({
+      id: 1,
+      title: '远端已经删除的旧标题',
+      normalizedTitle: analyzer.normalize('远端已经删除的旧标题'),
+      namespace: 0,
+      namespaceName: '（主）',
+      isRedirect: false,
+      localSeq: 1,
+      seenInTitleSync: 1,
+      deleted: false,
+      revisionId: 1,
+      contentModel: 'wikitext',
+    });
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+    abortTransactionAfterCallback(database, 2);
+
+    await expect(
+      syncTitles(database, api, analyzer, { requestIntervalMs: 0 }),
+    ).rejects.toBeDefined();
+
+    expect(await database.pages.get(1)).toMatchObject({ deleted: false, localSeq: 1 });
+    expect((await database.syncState.get('title-sync'))?.value).toMatchObject({
+      status: 'failed',
+      namespaceIndex: 1,
+      pagesFetched: 0,
+    });
+    expect((await database.syncState.get('title-sync'))?.value).not.toHaveProperty(
+      'completedAt',
+    );
+
+    const resumed = await syncTitles(database, api, analyzer, { requestIntervalMs: 0 });
+
+    expect(resumed).toMatchObject({ status: 'complete', namespaceIndex: 1 });
+    expect(await database.pages.get(1)).toMatchObject({ deleted: true, localSeq: 2 });
+
+    database.close();
+    await database.delete();
+  });
+
   it('persists cursor progress and avoids duplicate fetches after completion', async () => {
     const calls: URL[] = [];
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {

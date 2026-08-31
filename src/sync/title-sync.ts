@@ -101,7 +101,7 @@ export async function syncTitles(
       const nextContinue = response.continue?.gapcontinue;
       let storedBatch: PageRecord[] = [];
 
-      await database.transaction('rw', database.pages, database.syncState, async () => {
+      const committedState = await database.transaction('rw', database.pages, database.syncState, async () => {
         const ids = rawPages.map(({ pageid }) => pageid);
         const existingPages = new Map(
           (await database.pages.bulkGet(ids))
@@ -164,8 +164,9 @@ export async function syncTitles(
           { key: SEQUENCE_KEY, value: sequence },
           { key: TITLE_SYNC_KEY, value: nextState },
         ]);
-        state = nextState;
+        return nextState;
       });
+      state = committedState;
 
       await options.onBatch?.(storedBatch);
       report(state, options.onProgress);
@@ -174,28 +175,39 @@ export async function syncTitles(
       }
     }
 
-    await database.transaction('rw', database.pages, database.syncState, async () => {
-      const stalePages = await database.pages
-        .filter((page) => !page.deleted && page.seenInTitleSync !== state.generation)
-        .toArray();
-      const sequenceRecord = (await database.syncState.get(SEQUENCE_KEY)) as
-        | SyncStateRecord<number>
-        | undefined;
-      let sequence = sequenceRecord?.value ?? 0;
-      for (const page of stalePages) {
-        sequence += 1;
-        page.deleted = true;
-        page.content = undefined;
-        page.contentRevisionId = undefined;
-        page.localSeq = sequence;
-      }
-      await database.pages.bulkPut(stalePages);
-      state = { ...state, status: 'complete', completedAt: Date.now() };
-      await database.syncState.bulkPut([
-        { key: SEQUENCE_KEY, value: sequence },
-        { key: TITLE_SYNC_KEY, value: state },
-      ]);
-    });
+    const completedState = await database.transaction(
+      'rw',
+      database.pages,
+      database.syncState,
+      async () => {
+        const stalePages = await database.pages
+          .filter((page) => !page.deleted && page.seenInTitleSync !== state.generation)
+          .toArray();
+        const sequenceRecord = (await database.syncState.get(SEQUENCE_KEY)) as
+          | SyncStateRecord<number>
+          | undefined;
+        let sequence = sequenceRecord?.value ?? 0;
+        for (const page of stalePages) {
+          sequence += 1;
+          page.deleted = true;
+          page.content = undefined;
+          page.contentRevisionId = undefined;
+          page.localSeq = sequence;
+        }
+        await database.pages.bulkPut(stalePages);
+        const nextState: TitleSyncState = {
+          ...state,
+          status: 'complete',
+          completedAt: Date.now(),
+        };
+        await database.syncState.bulkPut([
+          { key: SEQUENCE_KEY, value: sequence },
+          { key: TITLE_SYNC_KEY, value: nextState },
+        ]);
+        return nextState;
+      },
+    );
+    state = completedState;
     report(state, options.onProgress);
     return state;
   } catch (error) {

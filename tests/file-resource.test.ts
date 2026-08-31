@@ -8,10 +8,139 @@ import { LinearTitleIndex } from '../src/search/title-index';
 import { WikiSearchDatabase } from '../src/storage/database';
 import { syncFileResources } from '../src/sync/file-resource-sync';
 import { WikiApi } from '../src/sync/wiki-api';
+import { abortTransactionAfterCallback } from './transaction-abort';
 
 const analyzer = new Analyzer({ cut, cutForSearch: cut_for_search });
 
 describe('file resource search', () => {
+  it('retries a file batch whose transaction aborts during commit', async () => {
+    const calls: URL[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      calls.push(url);
+      if (url.searchParams.get('gapcontinue') === '文件:第二批.png') {
+        return json({
+          query: {
+            pages: [
+              {
+                pageid: 6002,
+                ns: 6,
+                title: '文件:第二批.png',
+                lastrevid: 62,
+                contentmodel: 'wikitext',
+              },
+            ],
+          },
+        });
+      }
+      return json({
+        continue: { gapcontinue: '文件:第二批.png' },
+        query: {
+          pages: [
+            {
+              pageid: 6001,
+              ns: 6,
+              title: '文件:必须重试.png',
+              lastrevid: 61,
+              contentmodel: 'wikitext',
+            },
+          ],
+        },
+      });
+    });
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+    abortTransactionAfterCallback(database);
+
+    await expect(
+      syncFileResources(database, api, analyzer, { requestIntervalMs: 0 }),
+    ).rejects.toBeDefined();
+
+    expect(await database.fileResources.get(6001)).toBeUndefined();
+    expect((await database.syncState.get('file-resource-sync'))?.value).toMatchObject({
+      status: 'failed',
+      namespaceIndex: 0,
+      pagesFetched: 0,
+    });
+    expect((await database.syncState.get('file-resource-sync'))?.value).not.toHaveProperty(
+      'apcontinue',
+    );
+
+    const resumed = await syncFileResources(database, api, analyzer, {
+      requestIntervalMs: 0,
+    });
+
+    expect(resumed).toMatchObject({ status: 'complete', pagesFetched: 2 });
+    expect(await database.fileResources.get(6001)).toMatchObject({
+      title: '文件:必须重试.png',
+      deleted: false,
+      writerSeq: 2,
+    });
+    expect(await database.fileResources.get(6002)).toMatchObject({
+      title: '文件:第二批.png',
+      deleted: false,
+      writerSeq: 3,
+    });
+    expect(calls.filter((url) => !url.searchParams.has('gapcontinue'))).toHaveLength(2);
+
+    database.close();
+    await database.delete();
+  });
+
+  it('retries file pruning when the completion transaction aborts', async () => {
+    const fetcher = vi.fn(async () => json({ query: { pages: [] } }));
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.fileResources.put({
+      id: 6001,
+      title: '文件:远端已经删除.png',
+      normalizedTitle: analyzer.normalize('文件:远端已经删除.png'),
+      namespace: 6,
+      namespaceName: '文件',
+      isRedirect: false,
+      localSeq: 61,
+      writerSeq: 1,
+      seenInTitleSync: 1,
+      deleted: false,
+      revisionId: 61,
+      contentModel: 'wikitext',
+    });
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+    abortTransactionAfterCallback(database, 2);
+
+    await expect(
+      syncFileResources(database, api, analyzer, { requestIntervalMs: 0 }),
+    ).rejects.toBeDefined();
+
+    expect(await database.fileResources.get(6001)).toBeDefined();
+    expect((await database.syncState.get('local-sequence'))?.value).toBe(1);
+    expect((await database.syncState.get('file-resource-sync'))?.value).toMatchObject({
+      status: 'failed',
+      namespaceIndex: 1,
+      pagesFetched: 0,
+    });
+    expect(
+      (await database.syncState.get('file-resource-sync'))?.value,
+    ).not.toHaveProperty('completedAt');
+
+    const resumed = await syncFileResources(database, api, analyzer, {
+      requestIntervalMs: 0,
+    });
+
+    expect(resumed).toMatchObject({ status: 'complete', namespaceIndex: 1 });
+    expect(await database.fileResources.get(6001)).toBeUndefined();
+    expect((await database.syncState.get('local-sequence'))?.value).toBe(2);
+    expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
+      fileChangeSeq: 2,
+    });
+
+    database.close();
+    await database.delete();
+  });
+
   it('syncs namespace 6 separately, resumes from cache, and keeps normal titles clean', async () => {
     const calls: URL[] = [];
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {

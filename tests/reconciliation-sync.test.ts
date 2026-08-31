@@ -9,6 +9,7 @@ import { syncFileResources } from '../src/sync/file-resource-sync';
 import { reconcileWikiMirror } from '../src/sync/reconciliation-sync';
 import { WikiApi } from '../src/sync/wiki-api';
 import type { PageRecord, TitleSyncState } from '../src/types';
+import { abortTransactionAfterCallback } from './transaction-abort';
 
 const analyzer = new Analyzer({ cut, cutForSearch: cut_for_search });
 const now = Date.parse('2026-08-31T06:00:00Z');
@@ -240,6 +241,84 @@ describe('full mirror reconciliation', () => {
     expect(await database.pages.get(11)).toMatchObject({ title: '第二批页' });
     expect(calls.filter((url) => url.searchParams.get('meta') === 'siteinfo')).toHaveLength(1);
     expect(calls.filter((url) => !url.searchParams.has('gapcontinue'))).toHaveLength(2);
+
+    await destroy(database);
+  });
+
+  it('retries a reconciliation batch whose transaction aborts during commit', async () => {
+    const calls: URL[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      calls.push(url);
+      if (url.searchParams.get('meta') === 'siteinfo') {
+        return json({
+          curtimestamp: '2026-08-31T06:00:05Z',
+          query: { namespaces: { 0: { id: 0, name: '' } } },
+        });
+      }
+      if (url.searchParams.get('gapcontinue') === '第二批') {
+        return json({ query: { pages: [] } });
+      }
+      return json({
+        continue: { gapcontinue: '第二批' },
+        query: {
+          pages: [
+            {
+              pageid: 1,
+              ns: 0,
+              title: '事务重试后的新标题',
+              lastrevid: 2,
+              contentmodel: 'wikitext',
+            },
+          ],
+        },
+      });
+    });
+    const database = await databaseWithBaseline([
+      page({ id: 1, title: '事务前旧标题', revisionId: 1, localSeq: 2 }),
+    ]);
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+    abortTransactionAfterCallback(database);
+
+    await expect(
+      reconcileWikiMirror(database, api, analyzer, {
+        force: true,
+        now: () => now,
+        requestIntervalMs: 0,
+      }),
+    ).rejects.toBeDefined();
+
+    expect(await database.pages.get(1)).toMatchObject({
+      title: '事务前旧标题',
+      revisionId: 1,
+      deleted: false,
+    });
+    expect((await database.syncState.get('reconciliation-sync'))?.value).toMatchObject({
+      status: 'failed',
+      namespaceIndex: 0,
+      pagesFetched: 0,
+      throughLocalSeq: 2,
+    });
+    expect(
+      (await database.syncState.get('reconciliation-sync'))?.value,
+    ).not.toHaveProperty('gapcontinue');
+
+    const resumed = await reconcileWikiMirror(database, api, analyzer, {
+      now: () => now + 1,
+      requestIntervalMs: 0,
+    });
+
+    expect(resumed).toMatchObject({ status: 'complete', pagesFetched: 1 });
+    expect(await database.pages.get(1)).toMatchObject({
+      title: '事务重试后的新标题',
+      revisionId: 2,
+      deleted: false,
+    });
+    expect(
+      calls.filter(
+        (url) => url.searchParams.has('gapnamespace') && !url.searchParams.has('gapcontinue'),
+      ),
+    ).toHaveLength(2);
 
     await destroy(database);
   });

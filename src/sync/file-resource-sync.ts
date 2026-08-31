@@ -85,7 +85,7 @@ export async function syncFileResources(
       const nextContinue = response.continue?.gapcontinue;
       let storedBatch: PageRecord[] = [];
 
-      await database.transaction(
+      const committedState = await database.transaction(
         'rw',
         database.fileResources,
         database.pages,
@@ -161,16 +161,17 @@ export async function syncFileResources(
                   },
                 ]),
           ]);
-          state = nextState;
+          return nextState;
         },
       );
+      state = committedState;
 
       await options.onBatch?.(storedBatch);
       report(state, options.onProgress);
       if (state.namespaceIndex === 0) await delay(options.requestIntervalMs ?? 300);
     }
 
-    await database.transaction(
+    const completedState = await database.transaction(
       'rw',
       database.fileResources,
       database.pages,
@@ -191,9 +192,13 @@ export async function syncFileResources(
           ? await database.syncState.get(RECENT_CHANGES_SYNC_KEY)
           : undefined;
         await database.fileResources.bulkDelete(staleIds);
-        state = { ...state, status: 'complete', completedAt: Date.now() };
+        const nextState: TitleSyncState = {
+          ...state,
+          status: 'complete',
+          completedAt: Date.now(),
+        };
         await database.syncState.bulkPut([
-          { key: FILE_RESOURCE_SYNC_KEY, value: state },
+          { key: FILE_RESOURCE_SYNC_KEY, value: nextState },
           ...(staleIds.length
             ? [
                 { key: LOCAL_SEQUENCE_KEY, value: sequence },
@@ -204,8 +209,10 @@ export async function syncFileResources(
               ]
             : []),
         ]);
+        return nextState;
       },
     );
+    state = completedState;
     report(state, options.onProgress);
     return state;
   } catch (error) {
