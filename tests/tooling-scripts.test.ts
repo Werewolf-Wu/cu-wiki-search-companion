@@ -167,6 +167,23 @@ describe('browser tooling scripts', () => {
     expect(page.requestListenerAttached).toBe(false);
   });
 
+  it('aborts before deleting a probe changed after the before snapshot', async () => {
+    const reconcile = await loadRunCodeScript('test-reconciliation.playwright.js');
+    const page = await ReconciliationPage.create({ replaceProbeBeforeDelete: true });
+
+    await expect(reconcile(page)).rejects.toThrow('探针快照已变化');
+
+    expect(page.forceSyncCalls).toBe(0);
+    expect(page.cleanupRestores).toBe(0);
+    await expect(page.readProbePage()).resolves.toMatchObject({
+      id: 42,
+      revisionId: 421,
+      localSeq: 11,
+    });
+    await expect(page.readLocalSequence()).resolves.toBe(11);
+    expect(page.requestListenerAttached).toBe(false);
+  });
+
   it('waits for a terminal persistence result before maintenance acceptance completes', async () => {
     const inspectMaintenance = await loadRunCodeScript('test-maintenance.playwright.js');
     const page = new MaintenancePage();
@@ -333,6 +350,7 @@ interface ReconciliationPageOptions {
   advanceSequenceBeforeReject?: boolean;
   rejectAfterCommit?: boolean;
   rejectBeforeCommit?: boolean;
+  replaceProbeBeforeDelete?: boolean;
   replaceProbeBeforeReject?: boolean;
   resolveWithoutCommit?: boolean;
 }
@@ -341,6 +359,7 @@ class ReconciliationPage {
   forceSyncCalls = 0;
   cleanupRestores = 0;
   private cleanupPending = false;
+  private probeReplacedBeforeDelete = false;
   private requestListener?: (request: { url(): string }) => void;
 
   private constructor(private readonly options: ReconciliationPageOptions) {}
@@ -442,6 +461,17 @@ class ReconciliationPage {
       return undefined as T;
     }
 
+    if (
+      this.options.replaceProbeBeforeDelete &&
+      !this.probeReplacedBeforeDelete &&
+      source.includes("objectStore('pages')") &&
+      source.includes('.delete(') &&
+      source.includes("'readwrite'")
+    ) {
+      this.probeReplacedBeforeDelete = true;
+      await this.commitProbeAndReconciliation();
+    }
+
     const beforeCleanup = this.cleanupPending ? await this.readProbePage() : undefined;
     try {
       return await (
@@ -512,6 +542,36 @@ class ReconciliationPage {
         seenInTitleSync: 100,
       });
       await database.syncState.put({ key: 'local-sequence', value: 11 });
+    });
+    database.close();
+  }
+
+  private async commitProbeAndReconciliation(): Promise<void> {
+    const database = new WikiSearchDatabase();
+    await database.transaction('rw', database.pages, database.syncState, async () => {
+      await database.pages.put({
+        id: 42,
+        title: '地下水（删除前并发事实）',
+        normalizedTitle: '地下水（删除前并发事实）',
+        namespace: 0,
+        namespaceName: '',
+        revisionId: 421,
+        isRedirect: true,
+        deleted: false,
+        localSeq: 11,
+        seenInTitleSync: 200,
+      });
+      await database.syncState.bulkPut([
+        { key: 'local-sequence', value: 11 },
+        {
+          key: 'reconciliation-sync',
+          value: {
+            status: 'complete',
+            generation: 200,
+            completedAt: 2_000,
+          },
+        },
+      ]);
     });
     database.close();
   }

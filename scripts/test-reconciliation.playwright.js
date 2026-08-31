@@ -91,24 +91,13 @@ async page => {
   let completed = false;
   let reconciliationCommitted = false;
   try {
-    await page.evaluate(async pageId => {
+    await page.evaluate(async backup => {
       const database = await openDatabase();
-      await new Promise((resolve, reject) => {
-        const transaction = database.transaction(['pages', 'jobs'], 'readwrite');
-        transaction.objectStore('pages').delete(pageId);
-        const jobsRequest = transaction.objectStore('jobs').getAll();
-        jobsRequest.onsuccess = () => {
-          for (const job of jobsRequest.result) {
-            if (job.pageId === pageId && job.id !== undefined) {
-              transaction.objectStore('jobs').delete(job.id);
-            }
-          }
-        };
-        transaction.oncomplete = () => resolve();
-        transaction.onerror = () => reject(transaction.error);
-        transaction.onabort = () => reject(transaction.error);
-      });
-      database.close();
+      try {
+        await removeProbeIfUnchanged(database, backup);
+      } finally {
+        database.close();
+      }
 
       function openDatabase() {
         return new Promise((resolve, reject) => {
@@ -117,7 +106,73 @@ async page => {
           request.onerror = () => reject(request.error);
         });
       }
-    }, before.selected.id);
+
+      function removeProbeIfUnchanged(database, backup) {
+        return new Promise((resolve, reject) => {
+          const transaction = database.transaction(
+            ['pages', 'jobs', 'syncState'],
+            'readwrite',
+          );
+          const pages = transaction.objectStore('pages');
+          const jobs = transaction.objectStore('jobs');
+          const syncState = transaction.objectStore('syncState');
+          const pageRequest = pages.get(backup.selected.id);
+          const jobsRequest = jobs.getAll();
+          const reconciliationRequest = syncState.get('reconciliation-sync');
+          const sequenceRequest = syncState.get('local-sequence');
+          let readsRemaining = 4;
+          let validationError;
+          const finishRead = () => {
+            readsRemaining -= 1;
+            if (readsRemaining !== 0) return;
+            const currentJobs = jobsRequest.result.filter(
+              job => job.pageId === backup.selected.id,
+            );
+            const unchanged =
+              sameValue(pageRequest.result, backup.selected) &&
+              sameRecords(currentJobs, backup.selectedJobs) &&
+              sameReconciliationIdentity(
+                reconciliationRequest.result?.value,
+                backup.reconciliation,
+              ) &&
+              (sequenceRequest.result?.value ?? 0) === backup.sequence;
+            if (!unchanged) {
+              validationError = new Error('探针快照已变化，已在删除前中止验收');
+              transaction.abort();
+              return;
+            }
+            pages.delete(backup.selected.id);
+            for (const job of currentJobs) {
+              if (job.id !== undefined) jobs.delete(job.id);
+            }
+          };
+          pageRequest.onsuccess = finishRead;
+          jobsRequest.onsuccess = finishRead;
+          reconciliationRequest.onsuccess = finishRead;
+          sequenceRequest.onsuccess = finishRead;
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(validationError ?? transaction.error);
+          transaction.onabort = () => reject(validationError ?? transaction.error);
+        });
+      }
+
+      function sameValue(left, right) {
+        return JSON.stringify(left) === JSON.stringify(right);
+      }
+
+      function sameRecords(left, right) {
+        const byId = (first, second) => (first.id ?? 0) - (second.id ?? 0);
+        return sameValue([...left].sort(byId), [...right].sort(byId));
+      }
+
+      function sameReconciliationIdentity(left, right) {
+        return (
+          left?.status === right?.status &&
+          left?.generation === right?.generation &&
+          left?.completedAt === right?.completedAt
+        );
+      }
+    }, before);
 
     await page.evaluate(() => window.__CU_WIKI_SEARCH__.forceSync());
     const after = await page.evaluate(async pageId => {
