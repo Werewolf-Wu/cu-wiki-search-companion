@@ -14,6 +14,7 @@ async page => {
   page.on('request', onRequest);
 
   try {
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
     await waitForColdReady();
     await page.waitForTimeout(15_000);
     const cold = await readDebug();
@@ -26,9 +27,43 @@ async page => {
       throw new Error(`15 秒冷启动边界不符合预期：${JSON.stringify(cold)}`);
     }
 
+    let baselineJobs = await readContentJobCounts();
+    if (baselineJobs.pending || baselineJobs.running || baselineJobs.failed) {
+      await openSearch();
+      await activateMode('content');
+      await page.waitForFunction(
+        async () => {
+          const request = indexedDB.open('cu-wiki-local-search');
+          const database = await new Promise((resolve, reject) => {
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+          });
+          const jobs = await new Promise((resolve, reject) => {
+            const getAll = database.transaction('jobs', 'readonly')
+              .objectStore('jobs')
+              .getAll();
+            getAll.onsuccess = () => resolve(getAll.result);
+            getAll.onerror = () => reject(getAll.error);
+          });
+          database.close();
+          return jobs
+            .filter(job => job.type === 'wikitext-content')
+            .every(job => job.status === 'done');
+        },
+        undefined,
+        { timeout: 360_000 },
+      );
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await waitForColdReady();
+      baselineJobs = await readContentJobCounts();
+    }
+    if (baselineJobs.pending || baselineJobs.running || baselineJobs.failed) {
+      throw new Error(`无法建立稳定正文缓存基线：${JSON.stringify(baselineJobs)}`);
+    }
+
     const firstRequestOffset = contentRequestUrls.length;
     await openSearch();
-    await waitForEnhancedReady('首次本地构建并发布快照', 600_000);
+    await prepareAllSearchModes('首次本地构建并发布快照', 600_000);
     await activateFileMode();
     const expectedResults = await readSearchSignature();
     for (const [kind, results] of Object.entries(expectedResults)) {
@@ -37,7 +72,10 @@ async page => {
     const firstBuild = await readDebug();
     const firstBuildRequests = contentRequestUrls.length - firstRequestOffset;
     if (firstBuildRequests !== 0) {
-      throw new Error(`完整正文缓存首次构建仍发出 ${firstBuildRequests} 个 revisions 请求`);
+      throw new Error(
+        `稳定正文缓存首次构建仍发出 ${firstBuildRequests} 个 revisions 请求：` +
+          JSON.stringify(contentRequestUrls.slice(firstRequestOffset)),
+      );
     }
 
     const restoreRuns = [];
@@ -46,7 +84,7 @@ async page => {
       await waitForColdReady();
       const requestOffset = contentRequestUrls.length;
       await openSearch();
-      await waitForEnhancedReady(`第 ${run + 1} 次快照恢复`);
+      await prepareAllSearchModes(`第 ${run + 1} 次快照恢复`);
       await activateFileMode();
       const debug = await readDebug();
       const signature = await readSearchSignature();
@@ -61,7 +99,7 @@ async page => {
       }
       restoreRuns.push({
         run: run + 1,
-        jiebaToContentMs: debug.contentReadyMs - debug.jiebaReadyMs,
+        jiebaToContentMs: derivedReadyMs(debug) - debug.jiebaReadyMs,
         snapshots: debug.snapshots,
         signature,
       });
@@ -95,9 +133,9 @@ async page => {
     await waitForColdReady();
     const rebuildRequestOffset = contentRequestUrls.length;
     await openSearch();
-    await waitForEnhancedReady('清除快照后的本地全量重建');
+    await prepareAllSearchModes('清除快照后的本地全量重建');
     const rebuilt = await readDebug();
-    const rebuildMs = rebuilt.contentReadyMs - rebuilt.jiebaReadyMs;
+    const rebuildMs = derivedReadyMs(rebuilt) - rebuilt.jiebaReadyMs;
     const rebuildRequests = contentRequestUrls.length - rebuildRequestOffset;
     if (rebuildRequests !== 0) {
       throw new Error(`清快照后的本地重建发出 ${rebuildRequests} 个 revisions 请求`);
@@ -119,7 +157,7 @@ async page => {
     return {
       cold,
       firstBuild: {
-        jiebaToContentMs: firstBuild.contentReadyMs - firstBuild.jiebaReadyMs,
+        jiebaToContentMs: derivedReadyMs(firstBuild) - firstBuild.jiebaReadyMs,
         snapshots: firstBuild.snapshots,
         revisionsRequests: firstBuildRequests,
       },
@@ -154,14 +192,23 @@ async page => {
     });
   }
 
-  async function waitForEnhancedReady(description, timeout = 360_000) {
+  async function prepareAllSearchModes(description, timeout = 360_000) {
     try {
+      await activateMode('content');
+      await page.waitForFunction(
+        () => window.__CU_WIKI_SEARCH__?.indexedContentPages >= 1_500,
+        undefined,
+        { timeout },
+      );
+      await activateMode('lua');
       await page.waitForFunction(
         () => {
           const debug = window.__CU_WIKI_SEARCH__;
           return (
             debug?.indexedContentPages >= 1_500 &&
             debug?.indexedLuaModules >= 120 &&
+            Number.isFinite(debug.contentIndexReadyMs) &&
+            Number.isFinite(debug.luaIndexReadyMs) &&
             debug?.snapshots?.length === 3 &&
             debug.snapshots.every(snapshot => snapshot.status === 'available')
           );
@@ -172,6 +219,17 @@ async page => {
     } catch (error) {
       throw new Error(`${description}未完成：${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  async function activateMode(value) {
+    await page.evaluate((modeValue) => {
+      const mode = document
+        .querySelector('#cu-wiki-search-host')
+        ?.shadowRoot?.querySelector('.mode');
+      if (!(mode instanceof HTMLSelectElement)) throw new Error('找不到搜索模式选择器');
+      mode.value = modeValue;
+      mode.dispatchEvent(new Event('change'));
+    }, value);
   }
 
   async function activateFileMode() {
@@ -198,9 +256,36 @@ async page => {
       indexedContentPages: window.__CU_WIKI_SEARCH__?.indexedContentPages,
       indexedLuaModules: window.__CU_WIKI_SEARCH__?.indexedLuaModules,
       jiebaReadyMs: window.__CU_WIKI_SEARCH__?.jiebaReadyMs,
+      contentIndexReadyMs: window.__CU_WIKI_SEARCH__?.contentIndexReadyMs,
+      luaIndexReadyMs: window.__CU_WIKI_SEARCH__?.luaIndexReadyMs,
       contentReadyMs: window.__CU_WIKI_SEARCH__?.contentReadyMs,
       snapshots: window.__CU_WIKI_SEARCH__?.snapshots ?? [],
     }));
+  }
+
+  async function readContentJobCounts() {
+    return page.evaluate(async () => {
+      const request = indexedDB.open('cu-wiki-local-search');
+      const database = await new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const jobs = await new Promise((resolve, reject) => {
+        const getAll = database.transaction('jobs', 'readonly')
+          .objectStore('jobs')
+          .getAll();
+        getAll.onsuccess = () => resolve(getAll.result);
+        getAll.onerror = () => reject(getAll.error);
+      });
+      database.close();
+      const contentJobs = jobs.filter(job => job.type === 'wikitext-content');
+      return Object.fromEntries(
+        ['done', 'pending', 'running', 'failed'].map(status => [
+          status,
+          contentJobs.filter(job => job.status === status).length,
+        ]),
+      );
+    });
   }
 
   async function readSearchSignature() {
@@ -227,6 +312,14 @@ async page => {
         files: debug.searchFiles('morphine').slice(0, 5).map(result => result.title),
       };
     });
+  }
+
+  function derivedReadyMs(debug) {
+    const value = Math.max(debug.contentIndexReadyMs, debug.luaIndexReadyMs);
+    if (!Number.isFinite(value) || !Number.isFinite(debug.jiebaReadyMs)) {
+      throw new Error(`派生索引计时缺失：${JSON.stringify(debug)}`);
+    }
+    return value;
   }
 
   function queryParameter(value, name) {

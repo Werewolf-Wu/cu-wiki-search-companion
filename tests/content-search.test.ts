@@ -75,6 +75,18 @@ describe('wikitext content search', () => {
     expect(index.search('过时').map(({ id }) => id)).not.toContain(2);
   });
 
+  it('uses the cooperative scheduler between content rebuild batches', async () => {
+    const scheduler = { yield: vi.fn(async () => undefined) };
+    const index = new ContentIndex(analyzer, scheduler);
+
+    await index.rebuildAsync(
+      [page(1, '第一页', '正文一'), page(2, '第二页', '正文二')],
+      1,
+    );
+
+    expect(scheduler.yield).toHaveBeenCalledTimes(2);
+  });
+
   it('centers snippets on traditional and full-width query matches', () => {
     const index = new ContentIndex(analyzer);
     const distantPrefix = '无关前言'.repeat(30);

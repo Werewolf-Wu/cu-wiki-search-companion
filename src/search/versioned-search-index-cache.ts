@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { Analyzer } from '../analyzer/analyzer';
-import type { WikiSearchDatabase } from '../storage/database';
+import {
+  readActivePageHeaders,
+  readPageHeadersAfter,
+  type WikiSearchDatabase,
+} from '../storage/database';
 import {
   createCompatibilityKey,
   type SearchIndexKind,
@@ -165,7 +169,9 @@ export class VersionedSearchIndexCache {
 
     if (source === 'rebuild') {
       const rebuildPages = bundle.pagesAreDelta
-        ? await this.database.pages.toArray()
+        ? kind === 'title'
+          ? await readActivePageHeaders(this.database)
+          : await this.database.pages.toArray()
         : bundle.pages;
       await index.rebuildAsync(rebuildPages);
     }
@@ -425,11 +431,15 @@ export class VersionedSearchIndexCache {
             snapshot.throughLocalSeq <= currentSequence,
         );
         const pages = pagesAreDelta
-          ? await this.database.pages
-              .where('localSeq')
-              .above(snapshot!.throughLocalSeq)
-              .toArray()
-          : await this.database.pages.toArray();
+          ? kind === 'title'
+            ? await readPageHeadersAfter(this.database, snapshot!.throughLocalSeq)
+            : await this.database.pages
+                .where('localSeq')
+                .above(snapshot!.throughLocalSeq)
+                .toArray()
+          : kind === 'title'
+            ? await readActivePageHeaders(this.database)
+            : await this.database.pages.toArray();
         return { snapshot, currentSequence, pages, pagesAreDelta };
       },
     );

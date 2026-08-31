@@ -17,6 +17,8 @@ const MIRROR_REFRESH_HELP =
 const FILE_REFRESH_HELP =
   '重新同步文件资源（需要联网）：重新枚举文件命名空间并更新本地文件缓存与索引；不会影响普通页面、正文、Data 代码或 Lua，也不会修改 wiki 页面。';
 
+export type SearchPreparationKind = 'title' | 'content' | 'lua';
+
 type SearchPanelResult =
   | TitleSearchResult
   | DataCodeSearchResult
@@ -25,7 +27,7 @@ type SearchPanelResult =
 type WikiPageSearchResult = TitleSearchResult | ContentSearchResult | LuaModuleSearchResult;
 
 export interface SearchPanelCallbacks {
-  prepareSearch(): void;
+  prepareSearch(kind: SearchPreparationKind): void;
   prepareFiles(): void;
   search(query: string, namespace?: number): TitleSearchResult[];
   searchFiles(query: string): TitleSearchResult[];
@@ -133,8 +135,7 @@ export class SearchPanel {
 
   open(): void {
     if (!this.startupFailed) {
-      if (this.fileMode) this.callbacks.prepareFiles();
-      else this.callbacks.prepareSearch();
+      this.prepareCurrentMode();
     }
     this.panel.hidden = false;
     this.toggle.setAttribute('aria-expanded', 'true');
@@ -229,10 +230,7 @@ export class SearchPanel {
     });
     this.namespaceSelect.addEventListener('change', () => this.performSearch());
     this.modeSelect.addEventListener('change', () => {
-      if (!this.startupFailed) {
-        if (this.fileMode) this.callbacks.prepareFiles();
-        else this.callbacks.prepareSearch();
-      }
+      if (!this.startupFailed) this.prepareCurrentMode();
       this.updateModePresentation();
       this.performSearch();
     });
@@ -250,6 +248,14 @@ export class SearchPanel {
   private scheduleSearch(delay: number): void {
     if (this.searchTimer !== undefined) window.clearTimeout(this.searchTimer);
     this.searchTimer = window.setTimeout(() => this.performSearch(), delay);
+  }
+
+  private prepareCurrentMode(): void {
+    if (this.fileMode) this.callbacks.prepareFiles();
+    else if (this.codeMode) return;
+    else if (this.luaMode) this.callbacks.prepareSearch('lua');
+    else if (this.contentMode) this.callbacks.prepareSearch('content');
+    else this.callbacks.prepareSearch('title');
   }
 
   private performSearch(): void {

@@ -78,6 +78,54 @@ describe('runtime lifecycle coordinator', () => {
     expect(order).toEqual(['data-start', 'data-end', 'maintenance']);
   });
 
+  it('releases the shared writer lock before a content-derived refresh can pause', async () => {
+    const writer = new QueuedWriter();
+    const first = new RuntimeLifecycleCoordinator({
+      applyStorageInvalidation: vi.fn(async () => undefined),
+      writer,
+    });
+    const second = new RuntimeLifecycleCoordinator({
+      applyStorageInvalidation: vi.fn(async () => undefined),
+      writer,
+    });
+    let markRefreshStarted!: () => void;
+    const refreshStarted = new Promise<void>((resolve) => {
+      markRefreshStarted = resolve;
+    });
+    let releaseRefresh!: () => void;
+    const refreshHeld = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    const order: string[] = [];
+
+    const firstRun = first.runContentWriter(
+      async () => {
+        order.push('facts-committed');
+      },
+      async () => {
+        order.push('refresh-start');
+        markRefreshStarted();
+        await refreshHeld;
+        order.push('refresh-end');
+      },
+    );
+    await refreshStarted;
+    const secondRun = second.runContentWriter(async () => {
+      order.push('second-writer');
+    });
+    await secondRun;
+
+    expect(order).toEqual(['facts-committed', 'refresh-start', 'second-writer']);
+    releaseRefresh();
+    await firstRun;
+    expect(order).toEqual([
+      'facts-committed',
+      'refresh-start',
+      'second-writer',
+      'refresh-end',
+    ]);
+  });
+
   it('serializes refreshes and coalesces invalidations that arrive during a refresh', async () => {
     let finishFirst!: () => void;
     const firstHeld = new Promise<void>((resolve) => {

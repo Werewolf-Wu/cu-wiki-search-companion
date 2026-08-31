@@ -3,6 +3,10 @@ import MiniSearch, { type Options, type SearchResult } from 'minisearch';
 
 import type { Analyzer } from '../analyzer/analyzer';
 import { extractContent } from '../content/extract-content';
+import {
+  browserTaskScheduler,
+  type CooperativeTaskScheduler,
+} from '../runtime/cooperative-task-scheduler';
 import type { PageRecord } from '../types';
 
 interface IndexedContent {
@@ -34,7 +38,11 @@ export class ContentIndex {
   private rebuildGeneration = 0;
   private readonly pendingRebuilds = new Set<PendingContentRebuild>();
 
-  constructor(private readonly analyzer: Analyzer) {}
+  constructor(
+    private readonly analyzer: Analyzer,
+    private readonly taskScheduler: Pick<CooperativeTaskScheduler, 'yield'> =
+      browserTaskScheduler,
+  ) {}
 
   rebuild(pages: PageRecord[]): void {
     this.rebuildGeneration += 1;
@@ -58,7 +66,7 @@ export class ContentIndex {
           nextExtractedById,
           pages.slice(offset, offset + batchSize),
         );
-        await yieldToEventLoop();
+        await this.taskScheduler.yield();
       }
       for (const update of pending.updates) {
         this.applyPages(nextIndex, nextExtractedById, update);
@@ -100,7 +108,7 @@ export class ContentIndex {
   async updateAsync(pages: PageRecord[], batchSize = 2): Promise<void> {
     for (let offset = 0; offset < pages.length; offset += batchSize) {
       this.update(pages.slice(offset, offset + batchSize));
-      await yieldToEventLoop();
+      await this.taskScheduler.yield();
     }
   }
 
@@ -244,10 +252,6 @@ function isStringMapEntries(value: unknown): value is Array<[number, string]> {
         typeof entry[1] === 'string',
     )
   );
-}
-
-function yieldToEventLoop(): Promise<void> {
-  return new Promise((resolve) => globalThis.setTimeout(resolve, 0));
 }
 
 function makeSnippet(text: string, normalizedQuery: string, analyzer: Analyzer): string {

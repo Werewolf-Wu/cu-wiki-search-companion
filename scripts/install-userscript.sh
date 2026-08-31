@@ -15,6 +15,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$project_dir"
+build_id="${CU_WIKI_BUILD_ID:-install-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+export CU_WIKI_BUILD_ID="$build_id"
 npm run build
 
 if ! curl --fail --silent --show-error "$server_url" --output "$served_file" 2>/dev/null; then

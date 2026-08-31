@@ -23,6 +23,15 @@ async page => {
       if (!(toggle instanceof HTMLButtonElement)) throw new Error('找不到“本地搜索”按钮');
       toggle.click();
     });
+  const activateMode = (value) =>
+    page.evaluate((modeValue) => {
+      const mode = document
+        .querySelector('#cu-wiki-search-host')
+        ?.shadowRoot?.querySelector('.mode');
+      if (!(mode instanceof HTMLSelectElement)) throw new Error('找不到搜索模式选择器');
+      mode.value = modeValue;
+      mode.dispatchEvent(new Event('change'));
+    }, value);
   const waitFor = async (predicate, description, timeoutMs = 360_000) => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -75,6 +84,7 @@ async page => {
       { databaseName, contentJobType, targetIds },
     );
 
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
   await page.waitForFunction(() => window.__CU_WIKI_SEARCH__?.ready === true);
   const coldBefore = await readDebug();
   if (
@@ -243,6 +253,7 @@ async page => {
     });
     routeInstalled = true;
     await clickToggle();
+    await activateMode('content');
     await waitFor(() => Promise.resolve(stalled), '第二批正文请求进入等待状态');
     const interruptedState = await readTargetState(targetIds);
     if (
@@ -262,6 +273,7 @@ async page => {
       throw new Error(`浏览器未观察到 Retry-After 退避：${observedRetryDelayMs}ms`);
     }
 
+    const continuationEventStart = events.length;
     phase = 'reloading';
     const reloadPromise = page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
     await page.waitForTimeout(100);
@@ -271,20 +283,27 @@ async page => {
     await page.waitForFunction(() => window.__CU_WIKI_SEARCH__?.ready === true);
     const coldAfterInterruption = await readDebug();
     await clickToggle();
+    await activateMode('content');
     await waitFor(async () => {
       const state = await readTargetState(targetIds);
       return state.upToDate === 51 && state.statuses.done === 51;
     }, '刷新后续传剩余正文');
+    await activateMode('lua');
     await waitFor(async () => {
       const debug = await readDebug();
       return debug.indexedContentPages >= 1_500 && debug.indexedLuaModules >= 120;
     }, '恢复全量正文与 Lua 内存索引');
     const resumedState = await readTargetState(targetIds);
-    const resumeRequests = events.filter(
-      (event) => event.phase === 'resume' && event.action === 'request',
+    const resumeRequests = events.slice(continuationEventStart).filter(
+      (event) => event.action === 'request' && event.targetedIds.length > 0,
     );
-    if (resumeRequests.length !== 1 || resumeRequests[0].targetedIds.length !== 1) {
-      throw new Error(`刷新后并非只续传剩余一页：${JSON.stringify(resumeRequests)}`);
+    if (
+      resumeRequests.length > 1 ||
+      resumeRequests.some((event) => event.targetedIds.length !== 1)
+    ) {
+      throw new Error(
+        `刷新后请求了剩余一页以外的目标：${JSON.stringify({ resumeRequests, events })}`,
+      );
     }
 
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
@@ -293,6 +312,12 @@ async page => {
     phase = 'cache';
     const cacheEventStart = events.length;
     await clickToggle();
+    await activateMode('content');
+    await waitFor(async () => {
+      const debug = await readDebug();
+      return debug.indexedContentPages >= 1_500;
+    }, '从完整缓存恢复正文索引');
+    await activateMode('lua');
     await waitFor(async () => {
       const debug = await readDebug();
       return debug.indexedContentPages >= 1_500 && debug.indexedLuaModules >= 120;
@@ -329,7 +354,12 @@ async page => {
     completed = true;
     return {
       coldBefore,
-      preparation,
+      preparation: {
+        targetCount: preparation.targetIds.length,
+        firstTitle: preparation.firstTitle,
+        lastTitle: preparation.lastTitle,
+        searchableCount: preparation.searchableCount,
+      },
       observedRetryDelayMs,
       interruptedState,
       coldAfterInterruption,

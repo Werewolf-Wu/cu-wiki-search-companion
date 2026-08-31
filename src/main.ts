@@ -7,6 +7,8 @@ import {
 } from './data/data-field-rules';
 import { insertAtEditorSelection, wikiLink } from './editor';
 import { LocalDataMaintenance } from './maintenance/local-data-maintenance';
+import { browserTaskScheduler } from './runtime/cooperative-task-scheduler';
+import { InitialBackgroundRefreshCoordinator } from './runtime/initial-background-refresh';
 import {
   RuntimeLifecycleCoordinator,
   type StorageInvalidation,
@@ -28,7 +30,7 @@ import {
   type TitleSearchBackend,
   type TitleSearchResult,
 } from './search/title-index';
-import { WikiSearchDatabase } from './storage/database';
+import { readActivePageHeaders, WikiSearchDatabase } from './storage/database';
 import { dataRulesPreference } from './storage/data-rules-preference';
 import { initializeVersionContract } from './storage/version-contract';
 import { syncContent } from './sync/content-sync';
@@ -48,6 +50,8 @@ import { WikiApi } from './sync/wiki-api';
 import type { NamespaceInfo, PageRecord, TitleSyncProgress } from './types';
 import { SearchPanel } from './ui/search-panel';
 
+declare const __CU_WIKI_BUILD_ID__: string;
+
 interface MediaWikiWindow extends Window {
   mw?: {
     config?: { get(key: string): unknown };
@@ -58,6 +62,8 @@ interface MediaWikiWindow extends Window {
 
 interface DebugApi {
   ready: boolean;
+  scriptVersion: string;
+  buildId: string;
   engine?: AnalyzerLoadResult['engine'];
   indexedPages: number;
   indexedFiles: number;
@@ -66,6 +72,8 @@ interface DebugApi {
   indexedLuaModules: number;
   startupMs?: number;
   jiebaReadyMs?: number;
+  contentIndexReadyMs?: number;
+  luaIndexReadyMs?: number;
   contentReadyMs?: number;
   contentModel?: string;
   incrementalStatus: IncrementalRuntimeStatus;
@@ -172,6 +180,7 @@ async function start(): Promise<void> {
   let dataCodeRulesSource = DEFAULT_DATA_CODE_RULES;
   let engineReady: Promise<void> | undefined;
   let contentReady: Promise<void> | undefined;
+  let luaReady: Promise<void> | undefined;
   let fileReady: Promise<void> | undefined;
   let fileReadySettled = false;
   let resolveInitialCacheReady!: () => void;
@@ -183,10 +192,14 @@ async function start(): Promise<void> {
   const canInsertWikiText = typeof contentModel !== 'string' || contentModel === 'wikitext';
 
   const panel = new SearchPanel({
-    prepareSearch: () => {
-      void ensureEnhancedSearchStarted().catch((error: unknown) => {
+    prepareSearch: (kind) => {
+      const preparation =
+        kind === 'title'
+          ? ensureEnhancedTitleStarted()
+          : ensureDerivedSearchStarted(kind);
+      void preparation.catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
-        panel.setStatus(`增强搜索加载失败，标题缓存仍可用：${message}`, 'error');
+        panel.setStatus(`${searchKindLabel(kind)}加载失败，已有本地搜索仍可用：${message}`, 'error');
         console.error('[CU Wiki Search] enhanced search startup failed', error);
       });
     },
@@ -273,6 +286,8 @@ async function start(): Promise<void> {
 
   const debugApi: DebugApi = {
     ready: false,
+    scriptVersion: GM_info.script.version,
+    buildId: __CU_WIKI_BUILD_ID__,
     indexedPages: 0,
     indexedFiles: 0,
     indexedDataCodes: 0,
@@ -306,7 +321,7 @@ async function start(): Promise<void> {
     recentChangeState,
     reconciliationState,
   ] = await Promise.all([
-    database.pages.filter((page) => !page.deleted).toArray(),
+    readActivePageHeaders(database),
     database.dataCodes.toArray(),
     readDataCodeSyncState(database),
     readRecentChangeSyncState(database),
@@ -336,6 +351,12 @@ async function start(): Promise<void> {
   runtimeLifecycle = new RuntimeLifecycleCoordinator({
     applyStorageInvalidation: applyStorageInvalidation,
     writer: incrementalCoordinator,
+  });
+  const initialBackgroundRefresh = new InitialBackgroundRefreshCoordinator({
+    canRun: () => writesCompatible,
+    isVisible: () => document.visibilityState === 'visible',
+    syncIncremental: () => requestIncrementalSync(),
+    syncData: async () => (await requestDataCodeSync(false)).status === 'complete',
   });
   lastAppliedLocalSeq = pages.reduce(
     (maximum, page) => Math.max(maximum, page.localSeq),
@@ -368,7 +389,7 @@ async function start(): Promise<void> {
   debugApi.startupMs = Math.round(performance.now() - bootStartedAt);
   panel.setStatus(
     writesCompatible
-      ? `已恢复 ${searchBackend.size} 个标题 · ${dataCodeIndex.size} 个 Data 代码 · 点开后加载正文`
+      ? `已恢复 ${searchBackend.size} 个标题 · ${dataCodeIndex.size} 个 Data 代码 · 各模式按需加载`
       : `本地数据版本不兼容，已停止后台写入；可搜索现有数据或执行完整重置`,
     writesCompatible ? 'success' : 'error',
   );
@@ -394,6 +415,7 @@ async function start(): Promise<void> {
   const requestVisibleIncrementalSync = (): void => {
     if (document.visibilityState !== 'visible') return;
     void runtimeLifecycle?.resumeStorageRefresh();
+    void initialBackgroundRefresh.request();
     void requestIncrementalSync();
   };
   window.addEventListener('focus', requestVisibleIncrementalSync);
@@ -403,16 +425,16 @@ async function start(): Promise<void> {
   if (writesCompatible) {
     void (async () => {
       await whenPageIdle();
-      await requestIncrementalSync();
-      await requestDataCodeSync(false);
+      await initialBackgroundRefresh.request();
     })();
   }
 
-  function ensureEnhancedSearchStarted(): Promise<void> {
+  function ensureEnhancedTitleStarted(): Promise<void> {
     if (!engineReady) {
-      panel.setStatus('正在按需加载分词引擎与正文索引…');
-      engineReady = (async () => {
+      panel.setStatus('正在按需加载分词引擎与标题索引…');
+      const attempt = (async () => {
         await initialCacheReady;
+        await browserTaskScheduler.waitUntilVisible();
         const loadedAnalyzer = await loadAnalyzer();
         const restoredTitle = await indexCache.restoreOrRebuild(
           'title',
@@ -428,6 +450,7 @@ async function start(): Promise<void> {
         debugApi.indexedPages = upgradedIndex.size;
         debugApi.jiebaReadyMs = Math.round(performance.now() - bootStartedAt);
         await updateSnapshotDebug();
+        await runSync(false);
         if (loadedAnalyzer.warning) {
           panel.setStatus(
             `jieba 加载失败，已用 Intl.Segmenter · ${upgradedIndex.size} 标题`,
@@ -435,32 +458,79 @@ async function start(): Promise<void> {
           );
         } else {
           panel.setStatus(
-            `已恢复 ${upgradedIndex.size} 标题 · ${dataCodeIndex?.size ?? 0} 代码 · 正文恢复中`,
+            `标题索引已就绪 · ${upgradedIndex.size} 标题 · 正文与 Lua 按模式加载`,
             'success',
           );
         }
       })();
-      contentReady = (async () => {
-        await engineReady;
-        await runSync(false);
-        if (!analyzerResult) return;
-        const [restoredContent, restoredLua] = await Promise.all([
-          indexCache.restoreOrRebuild('content', analyzerResult.analyzer),
-          indexCache.restoreOrRebuild('lua', analyzerResult.analyzer),
-        ]);
-        contentHandle = restoredContent;
-        luaHandle = restoredLua;
-        contentIndex = restoredContent.index;
-        luaModuleIndex = restoredLua.index;
-        debugApi.indexedContentPages = restoredContent.index.size;
-        debugApi.indexedLuaModules = restoredLua.index.size;
-        debugApi.contentReadyMs = Math.round(performance.now() - bootStartedAt);
-        await updateSnapshotDebug();
-        panel.refreshResults();
-        await runContentSync(false);
-      })();
+      const tracked = attempt.catch((error: unknown) => {
+        if (engineReady === tracked) engineReady = undefined;
+        throw error;
+      });
+      engineReady = tracked;
     }
-    return contentReady ?? engineReady!;
+    return engineReady;
+  }
+
+  function ensureDerivedSearchStarted(kind: 'content' | 'lua'): Promise<void> {
+    const current = kind === 'content' ? contentReady : luaReady;
+    if (current) return current;
+
+    panel.setStatus(
+      kind === 'content' ? '正在按需恢复正文索引…' : '正在按需恢复 Lua 索引…',
+    );
+    const attempt = (async () => {
+      await ensureEnhancedTitleStarted();
+      await browserTaskScheduler.waitUntilVisible();
+      if (!analyzerResult || analyzerResult.engine === 'bootstrap') {
+        throw new Error('增强分词引擎尚未就绪');
+      }
+      if (kind === 'content') {
+        const restored = await indexCache.restoreOrRebuild(
+          'content',
+          analyzerResult.analyzer,
+        );
+        contentHandle = restored;
+        contentIndex = restored.index;
+        debugApi.indexedContentPages = restored.index.size;
+        await settleRestoredDerivedHandle(restored);
+      } else {
+        const restored = await indexCache.restoreOrRebuild(
+          'lua',
+          analyzerResult.analyzer,
+        );
+        luaHandle = restored;
+        luaModuleIndex = restored.index;
+        debugApi.indexedLuaModules = restored.index.size;
+        await settleRestoredDerivedHandle(restored);
+      }
+      const readyMs = Math.round(performance.now() - bootStartedAt);
+      if (kind === 'content') debugApi.contentIndexReadyMs = readyMs;
+      else debugApi.luaIndexReadyMs = readyMs;
+      debugApi.contentReadyMs = Math.max(
+        debugApi.contentIndexReadyMs ?? 0,
+        debugApi.luaIndexReadyMs ?? 0,
+      );
+      await updateSnapshotDebug();
+      panel.refreshResults();
+    })();
+    const tracked = attempt.catch((error: unknown) => {
+      if (kind === 'content' && contentReady === tracked) contentReady = undefined;
+      if (kind === 'lua' && luaReady === tracked) luaReady = undefined;
+      throw error;
+    });
+    if (kind === 'content') contentReady = tracked;
+    else luaReady = tracked;
+    return tracked;
+  }
+
+  async function settleRestoredDerivedHandle<K extends 'content' | 'lua'>(
+    handle: SearchIndexHandle<K>,
+  ): Promise<void> {
+    await runContentSync(false);
+    await indexCache.refresh(handle);
+    const warning = snapshotPublishWarning(await indexCache.publish(handle));
+    if (warning) panel.setStatus(warning, 'error');
   }
 
   function ensureFileSearchStarted(force: boolean): Promise<void> {
@@ -540,8 +610,7 @@ async function start(): Promise<void> {
   }
 
   async function requestSync(force: boolean): Promise<void> {
-    void ensureEnhancedSearchStarted();
-    await engineReady;
+    await ensureEnhancedTitleStarted();
     const result = await runSync(force);
     if (result.status === 'error') throw result.error;
   }
@@ -647,8 +716,7 @@ async function start(): Promise<void> {
   }
 
   async function requestContentSync(force: boolean): Promise<void> {
-    void ensureEnhancedSearchStarted();
-    await contentReady;
+    await ensureEnhancedTitleStarted();
     return runContentSync(force);
   }
 
@@ -708,7 +776,7 @@ async function start(): Promise<void> {
             if (reconciliationResult.dataCodesInvalidated) {
               await requestDataCodeSync(false);
             }
-            if (contentIndex && luaModuleIndex) {
+            if (contentIndex || luaModuleIndex) {
               await runContentSync(false);
             }
           } else if (reconciliationResult.status === 'login-required') {
@@ -761,7 +829,7 @@ async function start(): Promise<void> {
           if (committedReconciliation.dataCodesInvalidated) {
             await requestDataCodeSync(false);
           }
-          if (contentIndex && luaModuleIndex) {
+          if (contentIndex || luaModuleIndex) {
             await runContentSync(false);
           }
         } else if (debugApi.reconciliationStatus === 'running') {
@@ -897,7 +965,7 @@ async function start(): Promise<void> {
   async function requestManualReconciliation(): Promise<void> {
     const result = await requestReconciliationSync(true);
     if (result.status === 'complete') {
-      if (contentIndex && luaModuleIndex) await runContentSync(false);
+      if (contentIndex || luaModuleIndex) await runContentSync(false);
       return;
     }
     if ('error' in result && result.error) throw result.error;
@@ -959,7 +1027,7 @@ async function start(): Promise<void> {
         await luaModuleIndex.updateAsync(changedPages);
       }
       if (sequenceAdvanced) {
-        const allPages = await database.pages.filter((page) => !page.deleted).toArray();
+        const allPages = await readActivePageHeaders(database);
         bootstrapIndex = new LinearTitleIndex(fallbackAnalyzer, allPages);
         searchBackend = titleIndex
           ? new CombinedTitleIndex(titleIndex, bootstrapIndex)
@@ -1009,24 +1077,13 @@ async function start(): Promise<void> {
   async function runContentSync(force: boolean): Promise<void> {
     if (!ensureWritesAllowed()) return;
     if (contentSyncPromise) return contentSyncPromise;
-    if (!contentIndex || !luaModuleIndex) return;
-    const activeIndex = contentIndex;
-    const activeLuaIndex = luaModuleIndex;
     contentSyncPromise = (async () => {
       try {
         let finalProgress: Awaited<ReturnType<typeof syncContent>> | undefined;
         const writeContentFacts = async (): Promise<void> => {
           finalProgress = await syncContent(database, api, {
             force,
-            onBatch: async (batch) => {
-              if (contentHandle && luaHandle) await refreshIndexesFromStorage();
-              else {
-                await activeIndex.updateAsync(batch);
-                await activeLuaIndex.updateAsync(batch);
-              }
-              debugApi.indexedContentPages = activeIndex.size;
-              debugApi.indexedLuaModules = activeLuaIndex.size;
-              panel.refreshResults();
+            onBatch: () => {
               incrementalChannel?.postMessage({ type: 'content-committed' });
             },
             onProgress: (progress) => {
@@ -1037,9 +1094,23 @@ async function start(): Promise<void> {
             },
           });
         };
-        const coordinated = runtimeLifecycle
-          ? await runtimeLifecycle.runContentWriter(writeContentFacts)
-          : (await writeContentFacts(), 'ran' as const);
+        const refreshDerivedIndexes = async (): Promise<void> => {
+          await refreshIndexesFromStorage();
+          debugApi.indexedContentPages = contentIndex?.size ?? 0;
+          debugApi.indexedLuaModules = luaModuleIndex?.size ?? 0;
+          panel.refreshResults();
+        };
+        let coordinated: 'ran' | 'lock-unavailable';
+        if (runtimeLifecycle) {
+          coordinated = await runtimeLifecycle.runContentWriter(
+            writeContentFacts,
+            refreshDerivedIndexes,
+          );
+        } else {
+          await writeContentFacts();
+          await refreshDerivedIndexes();
+          coordinated = 'ran';
+        }
         if (coordinated === 'lock-unavailable') {
           panel.setStatus(
             '正文同步暂停：另一个标签页正在写入本地镜像，请稍后重试',
@@ -1048,10 +1119,10 @@ async function start(): Promise<void> {
           return;
         }
         if (!finalProgress) throw new Error('正文同步未返回进度');
-        if (force) {
+        if (force && (contentIndex || luaModuleIndex)) {
           const allPages = await database.pages.filter((page) => !page.deleted).toArray();
-          await activeIndex.rebuildAsync(allPages);
-          await activeLuaIndex.rebuildAsync(allPages);
+          await contentIndex?.rebuildAsync(allPages);
+          await luaModuleIndex?.rebuildAsync(allPages);
         }
         let snapshotWarning: string | undefined;
         if (contentHandle) {
@@ -1063,12 +1134,16 @@ async function start(): Promise<void> {
           snapshotWarning ??= snapshotPublishWarning(await indexCache.publish(luaHandle));
         }
         await updateSnapshotDebug();
-        debugApi.indexedContentPages = activeIndex.size;
-        debugApi.indexedLuaModules = activeLuaIndex.size;
+        debugApi.indexedContentPages = contentIndex?.size ?? 0;
+        debugApi.indexedLuaModules = luaModuleIndex?.size ?? 0;
         panel.refreshResults();
+        const loadedIndexes =
+          contentIndex || luaModuleIndex
+            ? ` · ${contentIndex?.size ?? 0} 正文 / ${luaModuleIndex?.size ?? 0} Lua`
+            : ' · 正文与 Lua 索引将在切换模式时按需恢复';
         panel.setStatus(
           snapshotWarning ??
-            `正文同步完成 · ${finalProgress.done}/${finalProgress.total} 页 · ${activeIndex.size} 正文 / ${activeLuaIndex.size} Lua`,
+            `正文同步完成 · ${finalProgress.done}/${finalProgress.total} 页${loadedIndexes}`,
           finalProgress.failed || snapshotWarning ? 'error' : 'success',
         );
       } catch (error) {
@@ -1116,7 +1191,7 @@ async function start(): Promise<void> {
           throw new Error('另一个标签页正在写入本地镜像，请稍后重试');
         }
         if (receivedBatch) {
-          const allPages = await database.pages.filter((page) => !page.deleted).toArray();
+          const allPages = await readActivePageHeaders(database);
           await activeIndex.rebuildAsync(allPages);
           bootstrapIndex = new LinearTitleIndex(activeAnalyzer, allPages);
           searchBackend = new CombinedTitleIndex(activeIndex, bootstrapIndex);
@@ -1148,7 +1223,11 @@ async function start(): Promise<void> {
 
   async function rebuildSearchIndexes(): Promise<void> {
     assertWritesAllowed();
-    await ensureEnhancedSearchStarted();
+    await Promise.all([
+      ensureEnhancedTitleStarted(),
+      ensureDerivedSearchStarted('content'),
+      ensureDerivedSearchStarted('lua'),
+    ]);
     if (!analyzerResult || analyzerResult.engine === 'bootstrap') {
       throw new Error('增强分词引擎尚未就绪');
     }
@@ -1163,7 +1242,7 @@ async function start(): Promise<void> {
     titleIndex = rebuilt.title.index;
     contentIndex = rebuilt.content.index;
     luaModuleIndex = rebuilt.lua.index;
-    const pages = await database.pages.filter((page) => !page.deleted).toArray();
+    const pages = await readActivePageHeaders(database);
     bootstrapIndex = new LinearTitleIndex(fallbackAnalyzer, pages);
     searchBackend = new CombinedTitleIndex(titleIndex, bootstrapIndex);
     lastAppliedLocalSeq = Math.max(
@@ -1245,6 +1324,12 @@ function progressMessage(progress: TitleSyncProgress): string {
   if (progress.status === 'failed') return `标题同步失败：${progress.error ?? '未知错误'}`;
   if (progress.status === 'complete') return `标题同步完成 · ${progress.pagesFetched} 页`;
   return `同步标题 ${progress.pagesFetched} 页 · ${progress.namespaceName ?? '命名空间'} (${Math.min(progress.namespaceIndex + 1, progress.namespaceCount)}/${progress.namespaceCount})`;
+}
+
+function searchKindLabel(kind: 'title' | 'content' | 'lua'): string {
+  if (kind === 'content') return '正文索引';
+  if (kind === 'lua') return 'Lua 索引';
+  return '标题索引';
 }
 
 function pageUrl(title: string): string {

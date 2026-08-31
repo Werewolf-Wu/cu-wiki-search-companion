@@ -11,6 +11,20 @@ async page => {
   const userscriptUrl = environment.CU_WIKI_USERSCRIPT_URL ??
     'http://127.0.0.1:8788/cu-wiki-local-search.user.js';
   const context = page.context();
+  const sourceResponse = await context.request.get(userscriptUrl);
+  if (!sourceResponse.ok()) {
+    throw new Error(`无法读取待安装 userscript：HTTP ${sourceResponse.status()}`);
+  }
+  const userscriptSource = await sourceResponse.text();
+  const expectedVersion = userscriptSource.match(
+    /^\/\/ @version\s+(\S+)$/m,
+  )?.[1];
+  const expectedBuildId = userscriptSource.match(
+    /CU_WIKI_BUILD_ID:[A-Za-z0-9._:-]+/,
+  )?.[0];
+  if (!expectedVersion || !expectedBuildId) {
+    throw new Error('无法从待安装 userscript 解析版本/build marker');
+  }
   const initialPages = new Set(context.pages());
   const wikiPage =
     context
@@ -67,14 +81,14 @@ async page => {
       const label =
         (await control.getAttribute('value')) ?? (await control.textContent()) ?? '';
       controlLabels.push(label.trim());
-      if (/^(重新安装|安装|Reinstall|Install)$/i.test(label.trim())) {
+      if (/^(重新安装|安装|更新|Reinstall|Install|Update)$/i.test(label.trim())) {
         installControl = control;
         break;
       }
     }
     if (!installControl) {
       throw new Error(
-        `Tampermonkey 确认页没有安装/重新安装按钮：${JSON.stringify(controlLabels)}`,
+        `Tampermonkey 确认页没有安装/重新安装/更新按钮：${JSON.stringify(controlLabels)}`,
       );
     }
 
@@ -93,8 +107,15 @@ async page => {
       await wikiPage.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
       try {
         await wikiPage.waitForFunction(
-          () => window.__CU_WIKI_SEARCH__?.ready === true,
-          undefined,
+          ({ version, buildId }) => {
+            const debug = window.__CU_WIKI_SEARCH__;
+            return (
+              debug?.ready === true &&
+              debug.scriptVersion === version &&
+              debug.buildId === buildId
+            );
+          },
+          { version: expectedVersion, buildId: expectedBuildId },
           { timeout: 60_000 },
         );
         readyError = undefined;
@@ -108,6 +129,10 @@ async page => {
       installed: true,
       wikiUrl: wikiPage.url(),
       engine: await wikiPage.evaluate(() => window.__CU_WIKI_SEARCH__?.engine),
+      version: await wikiPage.evaluate(
+        () => window.__CU_WIKI_SEARCH__?.scriptVersion,
+      ),
+      buildId: await wikiPage.evaluate(() => window.__CU_WIKI_SEARCH__?.buildId),
     };
   } finally {
     for (const candidate of [askPage, bridgePage]) {

@@ -44,3 +44,48 @@ export class WikiSearchDatabase extends Dexie {
     });
   }
 }
+
+/**
+ * Streams the cold-start title facts so full page bodies are never retained in
+ * the array shared with the lightweight title index.
+ */
+export async function readActivePageHeaders(
+  database: WikiSearchDatabase,
+): Promise<PageRecord[]> {
+  const headers: PageRecord[] = [];
+  await database.pages
+    .filter((page) => !page.deleted)
+    .each((page) => {
+      headers.push(toPageHeader(page));
+    });
+  return headers;
+}
+
+/** Streams lean title facts after a sequence, including deletion tombstones. */
+export async function readPageHeadersAfter(
+  database: WikiSearchDatabase,
+  localSeq: number,
+): Promise<PageRecord[]> {
+  const headers: PageRecord[] = [];
+  await database.pages
+    .where('localSeq')
+    .above(localSeq)
+    .each((page) => {
+      headers.push(toPageHeader(page));
+    });
+  return headers;
+}
+
+function toPageHeader(page: PageRecord): PageRecord {
+  return {
+    id: page.id,
+    title: page.title,
+    normalizedTitle: page.normalizedTitle,
+    namespace: page.namespace,
+    namespaceName: page.namespaceName,
+    isRedirect: page.isRedirect,
+    localSeq: page.localSeq,
+    seenInTitleSync: page.seenInTitleSync,
+    deleted: page.deleted,
+  };
+}

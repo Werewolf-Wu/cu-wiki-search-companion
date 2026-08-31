@@ -3,6 +3,10 @@ import MiniSearch, { type Options } from 'minisearch';
 
 import type { Analyzer } from '../analyzer/analyzer';
 import { extractLua, type LuaExtraction } from '../content/extract-lua';
+import {
+  browserTaskScheduler,
+  type CooperativeTaskScheduler,
+} from '../runtime/cooperative-task-scheduler';
 import type { PageRecord } from '../types';
 
 interface IndexedLuaModule {
@@ -55,7 +59,11 @@ export class LuaModuleIndex {
   private rebuildGeneration = 0;
   private readonly pendingRebuilds = new Set<PendingLuaRebuild>();
 
-  constructor(private readonly analyzer: Analyzer) {}
+  constructor(
+    private readonly analyzer: Analyzer,
+    private readonly taskScheduler: Pick<CooperativeTaskScheduler, 'yield'> =
+      browserTaskScheduler,
+  ) {}
 
   rebuild(pages: PageRecord[]): void {
     this.rebuildGeneration += 1;
@@ -79,7 +87,7 @@ export class LuaModuleIndex {
           nextSymbolsById,
           pages.slice(offset, offset + batchSize),
         );
-        await yieldToEventLoop();
+        await this.taskScheduler.yield();
       }
       for (const update of pending.updates) {
         this.applyPages(nextIndex, nextSymbolsById, update);
@@ -121,7 +129,7 @@ export class LuaModuleIndex {
   async updateAsync(pages: PageRecord[], batchSize = 2): Promise<void> {
     for (let offset = 0; offset < pages.length; offset += batchSize) {
       this.update(pages.slice(offset, offset + batchSize));
-      await yieldToEventLoop();
+      await this.taskScheduler.yield();
     }
   }
 
@@ -351,8 +359,4 @@ function isPreparedSymbolEntries(
         ),
     )
   );
-}
-
-function yieldToEventLoop(): Promise<void> {
-  return new Promise((resolve) => globalThis.setTimeout(resolve, 0));
 }

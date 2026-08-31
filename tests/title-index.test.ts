@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: MPL-2.0
+import 'fake-indexeddb/auto';
+
 import { cut, cut_for_search } from 'jieba-wasm/node';
 
 import { Analyzer } from '../src/analyzer/analyzer';
 import { TitleIndex } from '../src/search/title-index';
+import {
+  readActivePageHeaders,
+  readPageHeadersAfter,
+  WikiSearchDatabase,
+} from '../src/storage/database';
 import type { PageRecord } from '../src/types';
 
 const analyzer = new Analyzer({ cut, cutForSearch: cut_for_search });
@@ -80,5 +87,54 @@ describe('TitleIndex', () => {
     await expect(rebuilding).resolves.toBeUndefined();
     expect(index.search('最新标题')[0]?.id).toBe(2);
     expect(index.search('旧').map(({ id }) => id)).not.toContain(2);
+  });
+
+  it('uses the cooperative scheduler between title rebuild batches', async () => {
+    const scheduler = { yield: vi.fn(async () => undefined) };
+    const index = new TitleIndex(analyzer, scheduler);
+
+    await index.rebuildAsync([page(1, '一'), page(2, '二'), page(3, '三')], 2);
+
+    expect(scheduler.yield).toHaveBeenCalledTimes(2);
+  });
+
+  it('streams lean page headers for cold-start title search without retaining content', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.bulkPut([
+      { ...page(1, '带正文页面'), content: '很长的正文', contentModel: 'wikitext' },
+      { ...page(2, '已删除页面'), content: '删除页正文', deleted: true },
+    ]);
+
+    const headers = await readActivePageHeaders(database);
+
+    expect(headers).toEqual([
+      expect.objectContaining({ id: 1, title: '带正文页面', localSeq: 1 }),
+    ]);
+    expect(headers[0]).not.toHaveProperty('content');
+    expect(headers[0]).not.toHaveProperty('contentModel');
+    expect(headers[0]).not.toHaveProperty('revisionId');
+
+    database.close();
+    await database.delete();
+  });
+
+  it('streams lean changed title headers while preserving tombstones', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.bulkPut([
+      { ...page(1, '未变化'), content: '旧正文', localSeq: 1 },
+      { ...page(2, '已更新'), content: '新正文', localSeq: 2 },
+      { ...page(3, '已删除'), content: '删除页正文', localSeq: 3, deleted: true },
+    ]);
+
+    const headers = await readPageHeadersAfter(database, 1);
+
+    expect(headers.map(({ id }) => id)).toEqual([2, 3]);
+    expect(headers[1]).toMatchObject({ id: 3, deleted: true, localSeq: 3 });
+    expect(headers.every((header) => !('content' in header))).toBe(true);
+
+    database.close();
+    await database.delete();
   });
 });

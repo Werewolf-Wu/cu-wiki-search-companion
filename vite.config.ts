@@ -2,7 +2,18 @@
 import { defineConfig } from 'vite';
 import monkey from 'vite-plugin-monkey';
 
+const environment =
+  (globalThis as typeof globalThis & {
+    process?: { env?: Record<string, string | undefined> };
+  }).process?.env ?? {};
+const buildId =
+  environment.CU_WIKI_BUILD_ID ?? environment.GITHUB_SHA ?? 'development';
+const buildMarker = `CU_WIKI_BUILD_ID:${buildId}`;
+
 export default defineConfig({
+  define: {
+    __CU_WIKI_BUILD_ID__: JSON.stringify(buildMarker),
+  },
   build: {
     license: {
       fileName: 'THIRD_PARTY_NOTICES.md',

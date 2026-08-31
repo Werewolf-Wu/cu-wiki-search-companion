@@ -95,6 +95,7 @@ describe('SearchPanel Lua module mode', () => {
     mode.dispatchEvent(new Event('change'));
 
     expect(callbacks.prepareSearch).toHaveBeenCalledOnce();
+    expect(callbacks.prepareSearch).toHaveBeenCalledWith('lua');
     expect(callbacks.searchLua).toHaveBeenCalledWith('main');
     expect(callbacks.searchContent).not.toHaveBeenCalled();
     expect(root.querySelector('.heading')?.textContent).toBe('查找 Lua 模块');
@@ -104,6 +105,32 @@ describe('SearchPanel Lua module mode', () => {
     root.querySelector<HTMLButtonElement>('.insert')?.click();
     expect(callbacks.open).toHaveBeenCalledWith(luaResult);
     expect(callbacks.insert).not.toHaveBeenCalled();
+  });
+});
+
+describe('SearchPanel lazy search preparation', () => {
+  it('prepares only the selected heavy mode and leaves Data code mode lightweight', () => {
+    const callbacks = maintenanceCallbacks();
+    const panel = new SearchPanel(callbacks);
+    const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    const mode = root?.querySelector<HTMLSelectElement>('.mode');
+    if (!root || !mode) throw new Error('搜索面板没有挂载');
+
+    panel.open();
+    expect(callbacks.prepareSearch).toHaveBeenLastCalledWith('title');
+
+    mode.value = 'content';
+    mode.dispatchEvent(new Event('change'));
+    expect(callbacks.prepareSearch).toHaveBeenLastCalledWith('content');
+
+    mode.value = 'data-code';
+    mode.dispatchEvent(new Event('change'));
+    expect(callbacks.prepareSearch).toHaveBeenCalledTimes(2);
+
+    mode.value = 'files';
+    mode.dispatchEvent(new Event('change'));
+    expect(callbacks.prepareFiles).toHaveBeenCalledOnce();
+    expect(callbacks.prepareSearch).toHaveBeenCalledTimes(2);
   });
 });
 

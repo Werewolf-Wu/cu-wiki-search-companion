@@ -38,6 +38,23 @@ describe('LinearTitleIndex', () => {
 
     expect(index.search('鹿弹')[0]?.title).toBe('鹿弹');
   });
+
+  it('copies only stable title fields instead of retaining mutable page facts', () => {
+    const source = {
+      ...page(5, '医疗指南', 0, ''),
+      content: '不应被轻量标题索引保留的长正文',
+    };
+    const index = new LinearTitleIndex(analyzer, [source]);
+
+    source.title = '已被外部修改';
+    source.namespaceName = '已被外部修改';
+
+    expect(index.search('医疗')[0]).toMatchObject({
+      id: 5,
+      title: '医疗指南',
+      namespaceName: '',
+    });
+  });
 });
 
 function page(id: number, title: string, namespace: number, namespaceName: string): PageRecord {

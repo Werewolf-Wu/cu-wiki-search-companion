@@ -20,7 +20,15 @@ if [[ ! -f "$script_path" ]]; then
   exit 2
 fi
 
-if ! curl --fail --silent --show-error "$cdp_endpoint/json/version" >/dev/null; then
+cdp_ready=false
+for _ in {1..20}; do
+  if curl -fsS "$cdp_endpoint/json/version" --output /dev/null; then
+    cdp_ready=true
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$cdp_ready" != true ]]; then
   echo "Windows Edge CDP 不可达：$cdp_endpoint；请在 Windows 侧启动 9222 Edge。" >&2
   exit 1
 fi

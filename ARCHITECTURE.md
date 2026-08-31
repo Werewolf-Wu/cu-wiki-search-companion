@@ -84,28 +84,40 @@ sequenceDiagram
 
   Page->>Main: userscript 激活
   Main->>DB: open + initializeVersionContract
-  DB-->>Main: pages / dataCodes / sync states
+  DB-->>Main: 活动页面标题头 / dataCodes / sync states
   Main->>Main: bootstrap Analyzer
   Main->>Main: LinearTitleIndex + DataCodeIndex
   Main->>UI: ready，标题与 Data 可用
-  Main->>BG: 页面 idle 后检查 RC 与 Data freshness
+  Main->>BG: 页面可见且 idle 后检查 RC 与 Data freshness
   Note over Main,DB: 不读快照，不加载 WASM，不建正文/Lua/文件索引
 ~~~
 
-bootstrap analyzer 使用 OpenCC 归一和一个极轻的整串 segmenter。此时标题通过线性 compact substring 查询；Data 代码也可从已缓存记录恢复。
+bootstrap analyzer 使用 OpenCC 归一和一个极轻的整串 segmenter。冷启动以游标方式只物化 id、标题、命名空间和 localSeq 等标题头，LinearTitleIndex 再复制自己需要的稳定字段，不保留 PageRecord 或正文引用。此时标题通过线性 compact substring 查询；Data 代码也可从已缓存记录恢复。
 
 ### 3.3 用户打开搜索后的增强启动
 
-SearchPanel.open() 触发 ensureEnhancedSearchStarted()，单例 Promise 防止重复点击产生并发初始化：
+SearchPanel 按当前模式触发准备函数，单例 Promise 防止重复点击产生并发初始化：
 
 1. 从 Tampermonkey resource 获取 jieba glue 与 WASM。
 2. glue 以 blob module 动态导入，WASM 直接以字节初始化。
 3. 加载失败时退化为 Intl.Segmenter，搜索仍继续。
-4. 恢复或本地重建标题快照，并与 bootstrap 线性索引组合，避免 MiniSearch 漏掉直接中缀结果。
-5. 完成初始标题同步后，再并行恢复正文与 Lua 快照。
-6. 恢复完成后修复或续传正文 jobs；完整缓存不会重复请求 revisions。
+4. 标题模式只恢复或本地重建标题快照，并与 bootstrap 线性索引组合，避免 MiniSearch 漏掉直接中缀结果。
+5. 只有切到正文模式才恢复 ContentIndex；只有切到 Lua 模式才恢复 LuaModuleIndex。两者可以先后独立恢复，各自维护 throughLocalSeq。
+6. Data 代码模式继续使用冷启动缓存；文件模式只按需读取 fileResources，二者都不加载 jieba 或三类 MiniSearch。
+7. 正文或 Lua 模式就绪后修复或续传共享正文 jobs；完整缓存不会重复请求 revisions，未加载的另一类索引日后从事实与快照追平。
 
-标题、正文和 Lua 快照绝不能在面板尚未打开时读取。文件表也只在首次切换到“文件资源”模式时读取。
+标题、正文和 Lua 快照绝不能在对应模式尚未打开时读取。文件表也只在首次切换到“文件资源”模式时读取。
+
+### 3.4 后台页面与协作式调度
+
+浏览器不保证后台 timer 按时运行，冻结或卸载时任何页面内任务都可能暂停或消失。因此后台行为不是完成保证：
+
+- CooperativeTaskScheduler 在每个索引小批次前后检查 Page Visibility。让步期间转为 hidden 时也不会开始下一片，visible 后才继续；AbortSignal 会同时取消可见性等待和正在等待的让步。
+- 可运行时优先使用 scheduler.yield()，再降级到 MessageChannel，最后才使用 setTimeout(0)；某一级在 userscript realm 中存在但调用失败时继续降级。这些机制只负责让出主线程，不能穿透冻结或 tab unload。
+- 初次 RC/Data freshness 检查只从可见页面启动；Data 刷新失败或中途转入 hidden 时保留待办，下一次可见事件重试。隐藏标签收到 BroadcastChannel 时只合并失效标记。
+- 所有远端事实、jobs、游标和 localSeq 仍逐批提交到 IndexedDB。页面被丢弃后，新实例按普通冷启动从持久状态恢复。
+
+每个顶层标签有独立 JS heap，不能假定 MiniSearch 或 jieba WASM 自动跨标签共享。当前策略是让未使用搜索的标签保持标题头级别的冷状态，并把 title/content/lua 拆成按模式加载；没有引入生命周期不稳定的 Service Worker 常驻索引，也没有在未经 userscript 沙箱实测前依赖 SharedWorker。
 
 ## 4. 数据所有权：事实与派生
 
@@ -265,7 +277,7 @@ Data 代码：
 1. Web Lock cu-wiki-local-search:incremental-sync:v1 提供浏览器级互斥。
 2. incremental-sync-schedule 在 IndexedDB 中共享下次到期时间，默认间隔 5 分钟并增加最多 1 分钟 jitter。
 
-标题、正文、Data、文件同步、手动对账与维护重建共用同一写入缝隙。没有 Web Locks 时，周期和显式写入都返回 lock-unavailable，不在当前标签绕过互斥；已有本地镜像仍可只读搜索。
+标题、正文、Data、文件同步、手动对账与维护重建共用同一写入缝隙。没有 Web Locks 时，周期和显式写入都返回 lock-unavailable，不在当前标签绕过互斥；已有本地镜像仍可只读搜索。正文批次在锁内只提交事实并广播失效，可能受 Page Visibility 暂停的内存索引刷新在锁释放后执行，因此隐藏标签不会仅因派生重建而长期占住跨标签写锁。
 
 BroadcastChannel cu-wiki-local-search:changes:v1 只做失效通知：
 
@@ -366,7 +378,7 @@ VersionedSearchIndexCache 是 title/content/lua 三类快照的唯一入口：
 - JSON 对象结构。
 - MiniSearch 文档数与附属 map/symbol 数量。
 
-通过后异步载入 MiniSearch，再按 localSeq 重放新增、修改、正文变化和 tombstone。corrupt 快照会被删除并从当前 pages 全量重建；compatibility key 不匹配的 outdated 快照只会被忽略并本地重建，之后由新兼容版本发布覆盖。两种恢复路径都没有 Wiki API 依赖。
+通过后异步载入 MiniSearch，再按 localSeq 重放新增、修改、正文变化和 tombstone。标题索引的全量读取、增量读取以及 corrupt 回退都只保留轻量标题头；正文与 Lua 才物化完整页面事实。corrupt 快照会被删除并从当前 pages 全量重建；compatibility key 不匹配的 outdated 快照只会被忽略并本地重建，之后由新兼容版本发布覆盖。两种恢复路径都没有 Wiki API 依赖。
 
 ### 10.3 发布协议
 
@@ -427,7 +439,7 @@ SearchPanel 挂在开放 Shadow DOM 中，隔离站点 CSS。快捷键为 Alt+K�
 - 纯逻辑：Analyzer、抽取器、编辑器格式、Data 规则。
 - fake-indexeddb：同步事务、游标、快照、跨实例旧候选保护、完整重置。
 - jsdom：SearchPanel 路由、提示、维护入口、行内二次确认和 preference 语义。
-- Playwright 辅助脚本：真实 userscript 安装、冷启动、快照签名、维护 UI、对账与故障恢复。
+- Playwright 辅助脚本：真实 userscript 安装、冷启动、快照签名、维护 UI、对账与故障恢复。安装成功必须同时匹配待安装脚本的版本和唯一 build marker，不能只检查旧版同样具备的 ready 标志。
 
 修改后的最低验证：
 
@@ -467,7 +479,7 @@ SearchPanel 挂在开放 Shadow DOM 中，隔离站点 CSS。快捷键为 Alt+K�
 
 ## 15. 当前边界与未来候选
 
-现有快照恢复已显著快于本地全量重建，没有引入 Worker 的性能依据。下一步应由真实使用痛点驱动，可独立考虑：
+现有快照恢复和按模式加载已显著降低等待与单标签常驻范围，当前没有引入 Worker 的充分依据。若未来多标签实测仍证明重索引复制是主要内存来源，可先研究具备握手、重启重建和无 SharedWorker 降级路径的单索引拥有者；Service Worker 不能作为常驻内存索引。其他候选仍应由真实使用痛点驱动：
 
 - 拼音与首字母标题召回。
 - 领域词典管理。

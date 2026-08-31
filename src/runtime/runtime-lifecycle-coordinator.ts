@@ -34,20 +34,26 @@ export class RuntimeLifecycleCoordinator {
 
   constructor(private readonly options: RuntimeLifecycleCoordinatorOptions) {}
 
-  runContentWriter(task: () => Promise<void>): Promise<'ran' | 'lock-unavailable'> {
-    return this.runWriter('content', task);
+  runContentWriter(
+    task: () => Promise<void>,
+    afterRelease?: () => Promise<void>,
+  ): Promise<'ran' | 'lock-unavailable'> {
+    return this.runWriter('content', task, afterRelease);
   }
 
   runWriter(
     key: string,
     task: () => Promise<void>,
+    afterRelease?: () => Promise<void>,
   ): Promise<'ran' | 'lock-unavailable'> {
     const active = this.writerPromises.get(key);
     if (active) return active;
     const request = Promise.resolve().then(async () => {
-      if (this.options.writer) return this.options.writer.runExclusive(task);
-      await task();
-      return 'ran' as const;
+      const result = this.options.writer
+        ? await this.options.writer.runExclusive(task)
+        : (await task(), 'ran' as const);
+      if (result === 'ran') await afterRelease?.();
+      return result;
     });
     const tracked = request.finally(() => {
       if (this.writerPromises.get(key) === tracked) this.writerPromises.delete(key);

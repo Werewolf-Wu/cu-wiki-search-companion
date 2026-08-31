@@ -17,6 +17,28 @@ const analyzer = new Analyzer(
 );
 
 describe('VersionedSearchIndexCache', () => {
+  it('rebuilds a missing title snapshot without bulk-loading page bodies', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '轻量标题', '不应随标题数组保留的长正文', 'wikitext', 1));
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const bulkRead = vi
+      .spyOn(database.pages, 'toArray')
+      .mockRejectedValue(new Error('禁止批量物化完整页面记录'));
+    const cache = new VersionedSearchIndexCache(database, {
+      storage: unlimitedStorage(),
+    });
+
+    const rebuilt = await cache.restoreOrRebuild('title', analyzer);
+
+    expect(rebuilt.source).toBe('rebuild');
+    expect(rebuilt.index.search('轻量标题')[0]?.title).toBe('轻量标题');
+    expect(bulkRead).not.toHaveBeenCalled();
+    bulkRead.mockRestore();
+    database.close();
+    await database.delete();
+  });
+
   it('publishes the snapshot format for the corrected analyzer and extractors', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();
@@ -60,6 +82,37 @@ describe('VersionedSearchIndexCache', () => {
       message: undefined,
     });
 
+    database.close();
+    await database.delete();
+  });
+
+  it('rebuilds a corrupt title snapshot without bulk-loading page bodies', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '损坏后轻量重建', '不应保留的正文', 'wikitext', 1));
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const firstCache = new VersionedSearchIndexCache(database, {
+      storage: unlimitedStorage(),
+    });
+    await firstCache.publish(await firstCache.restoreOrRebuild('title', analyzer));
+    const corrupt = await database.indexSnapshots.get(snapshotKey('title'));
+    if (!corrupt) throw new Error('测试快照未发布');
+    corrupt.json = '{invalid';
+    corrupt.payloadBytes = new TextEncoder().encode(corrupt.json).byteLength;
+    corrupt.sha256 = await digest(corrupt.json);
+    await database.indexSnapshots.put(corrupt);
+    const bulkRead = vi
+      .spyOn(database.pages, 'toArray')
+      .mockRejectedValue(new Error('禁止批量物化完整页面记录'));
+
+    const rebuilt = await new VersionedSearchIndexCache(database, {
+      storage: unlimitedStorage(),
+    }).restoreOrRebuild('title', analyzer);
+
+    expect(rebuilt.source).toBe('rebuild');
+    expect(rebuilt.index.search('损坏后轻量重建')[0]?.title).toBe('损坏后轻量重建');
+    expect(bulkRead).not.toHaveBeenCalled();
+    bulkRead.mockRestore();
     database.close();
     await database.delete();
   });

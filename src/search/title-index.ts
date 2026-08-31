@@ -2,6 +2,10 @@
 import MiniSearch, { type Options, type SearchResult } from 'minisearch';
 
 import type { Analyzer } from '../analyzer/analyzer';
+import {
+  browserTaskScheduler,
+  type CooperativeTaskScheduler,
+} from '../runtime/cooperative-task-scheduler';
 import type { PageRecord } from '../types';
 
 interface IndexedTitle {
@@ -27,7 +31,10 @@ export interface TitleSearchBackend {
 }
 
 interface LinearTitle {
-  page: PageRecord;
+  id: number;
+  title: string;
+  namespace: number;
+  namespaceName: string;
   compactTitle: string;
 }
 
@@ -51,7 +58,10 @@ export class LinearTitleIndex implements TitleSearchBackend {
     this.titles = pages
       .filter((page) => !page.deleted)
       .map((page) => ({
-        page,
+        id: page.id,
+        title: page.title,
+        namespace: page.namespace,
+        namespaceName: page.namespaceName,
         compactTitle: analyzer.compactNormalized(page.normalizedTitle),
       }));
   }
@@ -63,8 +73,14 @@ export class LinearTitleIndex implements TitleSearchBackend {
     if (!compactQuery) return [];
 
     const matches: TitleSearchResult[] = [];
-    for (const { page, compactTitle } of this.titles) {
-      if (namespace !== undefined && page.namespace !== namespace) continue;
+    for (const {
+      id,
+      title,
+      namespace: pageNamespace,
+      namespaceName,
+      compactTitle,
+    } of this.titles) {
+      if (namespace !== undefined && pageNamespace !== namespace) continue;
       const position = compactTitle.indexOf(compactQuery);
       if (position < 0) continue;
 
@@ -72,10 +88,10 @@ export class LinearTitleIndex implements TitleSearchBackend {
       if (compactTitle === compactQuery) score += 1_000_000;
       else if (position === 0) score += 100_000;
       matches.push({
-        id: page.id,
-        title: page.title,
-        namespace: page.namespace,
-        namespaceName: page.namespaceName,
+        id,
+        title,
+        namespace: pageNamespace,
+        namespaceName,
         score,
       });
     }
@@ -119,7 +135,11 @@ export class TitleIndex implements TitleSearchBackend {
   private rebuildGeneration = 0;
   private readonly pendingRebuilds = new Set<PendingTitleRebuild>();
 
-  constructor(private readonly analyzer: Analyzer) {}
+  constructor(
+    private readonly analyzer: Analyzer,
+    private readonly taskScheduler: Pick<CooperativeTaskScheduler, 'yield'> =
+      browserTaskScheduler,
+  ) {}
 
   rebuild(pages: PageRecord[]): void {
     this.rebuildGeneration += 1;
@@ -137,7 +157,7 @@ export class TitleIndex implements TitleSearchBackend {
     try {
       for (let offset = 0; offset < activePages.length; offset += batchSize) {
         this.applyPages(nextIndex, activePages.slice(offset, offset + batchSize));
-        await yieldToEventLoop();
+        await this.taskScheduler.yield();
       }
       for (const update of pending.updates) this.applyPages(nextIndex, update);
       if (generation === this.rebuildGeneration) this.index = nextIndex;
@@ -168,7 +188,7 @@ export class TitleIndex implements TitleSearchBackend {
   async updateAsync(pages: PageRecord[], batchSize = 5): Promise<void> {
     for (let offset = 0; offset < pages.length; offset += batchSize) {
       this.update(pages.slice(offset, offset + batchSize));
-      await yieldToEventLoop();
+      await this.taskScheduler.yield();
     }
   }
 
@@ -267,8 +287,4 @@ export class TitleIndex implements TitleSearchBackend {
       tokens: this.analyzer.documentTokens(page.title).join(' '),
     };
   }
-}
-
-function yieldToEventLoop(): Promise<void> {
-  return new Promise((resolve) => globalThis.setTimeout(resolve, 0));
 }

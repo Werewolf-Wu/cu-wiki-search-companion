@@ -202,6 +202,21 @@ describe('Lua module search', () => {
     expect(index.search('过时').map(({ id }) => id)).not.toContain(836);
   });
 
+  it('uses the cooperative scheduler between Lua rebuild batches', async () => {
+    const scheduler = { yield: vi.fn(async () => undefined) };
+    const index = new LuaModuleIndex(analyzer, scheduler);
+
+    await index.rebuildAsync(
+      [
+        page(837, '模块:One', `return { one = '一' }`, 'Scribunto'),
+        page(838, '模块:Two', `return { two = '二' }`, 'Scribunto'),
+      ],
+      1,
+    );
+
+    expect(scheduler.yield).toHaveBeenCalledTimes(2);
+  });
+
   it('indexes the final entry in a large generated return table', () => {
     const generatedSource = `return { ${Array.from(
       { length: 3_000 },
