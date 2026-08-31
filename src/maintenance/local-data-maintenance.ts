@@ -2,6 +2,8 @@
 import type { Analyzer } from '../analyzer/analyzer';
 import {
   type SearchIndexHandle,
+  type SnapshotPublishSkipReason,
+  type SnapshotPublishResult,
   type SnapshotInspection,
   VersionedSearchIndexCache,
 } from '../search/versioned-search-index-cache';
@@ -57,6 +59,24 @@ export type PersistenceRequestResult =
   | { status: 'denied' }
   | { status: 'unsupported' }
   | { status: 'error'; message: string };
+
+export interface SearchIndexRebuildResult {
+  title: SearchIndexHandle<'title'>;
+  content: SearchIndexHandle<'content'>;
+  lua: SearchIndexHandle<'lua'>;
+  publishResults: {
+    title: SnapshotPublishResult;
+    content: SnapshotPublishResult;
+    lua: SnapshotPublishResult;
+  };
+  warnings: SearchIndexRebuildWarning[];
+}
+
+export interface SearchIndexRebuildWarning {
+  kind: 'title' | 'content' | 'lua';
+  reason: SnapshotPublishSkipReason;
+  message: string;
+}
 
 export class LocalDataMaintenance {
   private readonly storage: MaintenanceStorage | undefined;
@@ -127,20 +147,21 @@ export class LocalDataMaintenance {
     };
   }
 
-  async rebuildSearchIndexes(analyzer: Analyzer): Promise<{
-    title: SearchIndexHandle<'title'>;
-    content: SearchIndexHandle<'content'>;
-    lua: SearchIndexHandle<'lua'>;
-  }> {
+  async rebuildSearchIndexes(analyzer: Analyzer): Promise<SearchIndexRebuildResult> {
     await this.indexCache.clear();
     this.indexCache.allowPublishing();
     const title = await this.indexCache.restoreOrRebuild('title', analyzer);
     const content = await this.indexCache.restoreOrRebuild('content', analyzer);
     const lua = await this.indexCache.restoreOrRebuild('lua', analyzer);
-    await this.indexCache.publish(title);
-    await this.indexCache.publish(content);
-    await this.indexCache.publish(lua);
-    return { title, content, lua };
+    const publishResults = {
+      title: await this.publishRebuiltHandle(title),
+      content: await this.publishRebuiltHandle(content),
+      lua: await this.publishRebuiltHandle(lua),
+    };
+    const warnings = (Object.entries(publishResults) as Array<
+      ['title' | 'content' | 'lua', SnapshotPublishResult]
+    >).flatMap(([kind, result]) => publicationWarning(kind, result));
+    return { title, content, lua, publishResults, warnings };
   }
 
   async rebuildContentQueue(): Promise<void> {
@@ -174,6 +195,17 @@ export class LocalDataMaintenance {
     this.reload();
   }
 
+  private async publishRebuiltHandle<K extends 'title' | 'content' | 'lua'>(
+    handle: SearchIndexHandle<K>,
+  ): Promise<SnapshotPublishResult> {
+    const initial = await this.indexCache.publish(handle);
+    if (initial.status !== 'skipped' || initial.reason !== 'sequence-changed') {
+      return initial;
+    }
+    await this.indexCache.refresh(handle);
+    return this.indexCache.publish(handle);
+  }
+
   private async inspectStorage(): Promise<{
     usage?: number;
     quota?: number;
@@ -198,4 +230,21 @@ export class LocalDataMaintenance {
     }
     return result;
   }
+}
+
+function publicationWarning(
+  kind: 'title' | 'content' | 'lua',
+  result: SnapshotPublishResult,
+): SearchIndexRebuildWarning[] {
+  if (result.status === 'published' || result.reason === 'not-newer') return [];
+  const label = kind === 'title' ? '标题' : kind === 'content' ? '正文' : 'Lua';
+  const detail =
+    result.reason === 'quota'
+      ? '浏览器剩余配额不足'
+      : result.reason === 'too-large'
+        ? '快照超过 64 MiB'
+        : result.reason === 'sequence-changed'
+          ? '页面事实序列持续变化'
+          : '重建期间快照 generation 已变化';
+  return [{ kind, reason: result.reason, message: `${label}快照未保存：${detail}` }];
 }

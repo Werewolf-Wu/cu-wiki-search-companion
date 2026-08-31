@@ -504,6 +504,9 @@ describe('VersionedSearchIndexCache', () => {
     });
     const handle = await cache.restoreOrRebuild('title', analyzer);
     expect(handle.source).toBe('snapshot');
+    await database.pages.put(page(1, '清除后仍可搜索', '更新正文', 'wikitext', 2));
+    await database.syncState.put({ key: 'local-sequence', value: 2 });
+    await cache.refresh(handle);
 
     const publishing = cache.publish(handle);
     await estimateCalled;
@@ -521,6 +524,116 @@ describe('VersionedSearchIndexCache', () => {
       { kind: 'lua', status: 'missing' },
     ]);
     expect(handle.index.search('清除后仍可搜索')[0]?.title).toBe('清除后仍可搜索');
+
+    database.close();
+    await database.delete();
+  });
+
+  it('fences an already-started publish from another cache instance after clear', async () => {
+    const name = `test-${crypto.randomUUID()}`;
+    const clearingDatabase = new WikiSearchDatabase(name);
+    const publishingDatabase = new WikiSearchDatabase(name);
+    await clearingDatabase.open();
+    await publishingDatabase.open();
+    await clearingDatabase.pages.put(page(1, '跨标签清理', '正文', 'wikitext', 1));
+    await clearingDatabase.syncState.put({ key: 'local-sequence', value: 1 });
+    let releaseEstimate!: () => void;
+    const estimateBlocked = new Promise<void>((resolve) => {
+      releaseEstimate = resolve;
+    });
+    let estimateStarted!: () => void;
+    const estimateCalled = new Promise<void>((resolve) => {
+      estimateStarted = resolve;
+    });
+    const clearingCache = new VersionedSearchIndexCache(clearingDatabase, {
+      storage: unlimitedStorage(),
+    });
+    const publishingCache = new VersionedSearchIndexCache(publishingDatabase, {
+      storage: {
+        estimate: async () => {
+          estimateStarted();
+          await estimateBlocked;
+          return { usage: 1_000, quota: 1024 * 1024 * 1024 };
+        },
+      },
+    });
+    const staleHandle = await publishingCache.restoreOrRebuild('title', analyzer);
+
+    const publishing = publishingCache.publish(staleHandle);
+    await estimateCalled;
+    await clearingCache.clear();
+    releaseEstimate();
+
+    expect(await publishing).toEqual({
+      status: 'skipped',
+      reason: 'cleared-this-session',
+    });
+    expect(await clearingDatabase.indexSnapshots.count()).toBe(0);
+
+    clearingDatabase.close();
+    publishingDatabase.close();
+    await clearingDatabase.delete();
+  });
+
+  it('lets rebuilt handles publish after clear while rejecting old handles at the same sequence', async () => {
+    const name = `test-${crypto.randomUUID()}`;
+    const rebuildingDatabase = new WikiSearchDatabase(name);
+    const staleDatabase = new WikiSearchDatabase(name);
+    await rebuildingDatabase.open();
+    await staleDatabase.open();
+    await rebuildingDatabase.pages.put(page(1, '代际重建', '正文', 'wikitext', 1));
+    await rebuildingDatabase.syncState.put({ key: 'local-sequence', value: 1 });
+    const rebuildingCache = new VersionedSearchIndexCache(rebuildingDatabase, {
+      storage: unlimitedStorage(),
+      now: () => 222,
+    });
+    const staleCache = new VersionedSearchIndexCache(staleDatabase, {
+      storage: unlimitedStorage(),
+      now: () => 111,
+    });
+    const staleHandle = await staleCache.restoreOrRebuild('title', analyzer);
+
+    await rebuildingCache.clear();
+    rebuildingCache.allowPublishing();
+    const rebuiltHandle = await rebuildingCache.restoreOrRebuild('title', analyzer);
+
+    expect(await staleCache.publish(staleHandle)).toEqual({
+      status: 'skipped',
+      reason: 'cleared-this-session',
+    });
+    expect(await rebuildingCache.publish(rebuiltHandle)).toMatchObject({
+      status: 'published',
+      record: { createdAt: 222 },
+    });
+    expect(await rebuildingDatabase.indexSnapshots.get(snapshotKey('title'))).toMatchObject({
+      createdAt: 222,
+    });
+
+    rebuildingDatabase.close();
+    staleDatabase.close();
+    await rebuildingDatabase.delete();
+  });
+
+  it('returns not-newer before checking quota for an already-current snapshot', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '无需重写', '正文', 'wikitext', 1));
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const initialCache = new VersionedSearchIndexCache(database, {
+      storage: unlimitedStorage(),
+    });
+    await initialCache.publish(await initialCache.restoreOrRebuild('title', analyzer));
+    const estimate = vi.fn(async () => ({ usage: 1_000, quota: 1_000 }));
+    const restoredCache = new VersionedSearchIndexCache(database, {
+      storage: { estimate },
+    });
+    const restored = await restoredCache.restoreOrRebuild('title', analyzer);
+
+    expect(await restoredCache.publish(restored)).toEqual({
+      status: 'skipped',
+      reason: 'not-newer',
+    });
+    expect(estimate).not.toHaveBeenCalled();
 
     database.close();
     await database.delete();

@@ -9,6 +9,13 @@ const environment =
 const buildId =
   environment.CU_WIKI_BUILD_ID ?? environment.GITHUB_SHA ?? 'development';
 const buildMarker = `CU_WIKI_BUILD_ID:${buildId}`;
+const wikiOrigin = 'https://casualtiesunknown.huijiwiki.com';
+const userscriptMatches = (['edit', 'submit'] as const).flatMap((action) => [
+  `${wikiOrigin}/*?action=${action}`,
+  `${wikiOrigin}/*?action=${action}&*`,
+  `${wikiOrigin}/*?*&action=${action}`,
+  `${wikiOrigin}/*?*&action=${action}&*`,
+]);
 
 export default defineConfig({
   define: {
@@ -30,7 +37,7 @@ export default defineConfig({
         author: 'Werewolf-Wu and contributors',
         homepageURL: 'https://github.com/Werewolf-Wu/cu-wiki-search-companion',
         license: 'MPL-2.0',
-        match: ['https://casualtiesunknown.huijiwiki.com/*'],
+        match: userscriptMatches,
         'run-at': 'document-end',
         noframes: true,
         resource: {

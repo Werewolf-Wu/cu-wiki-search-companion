@@ -35,10 +35,24 @@ async page => {
   });
   await page.waitForFunction(() => {
     const root = document.querySelector('#cu-wiki-search-host')?.shadowRoot;
-    return root?.querySelector('.status')?.textContent?.includes('持久保存');
-  });
+    const persistence = root?.querySelector('.request-persistence');
+    const status = root?.querySelector('.status')?.textContent ?? '';
+    return (
+      persistence instanceof HTMLButtonElement &&
+      !persistence.disabled &&
+      /已允许持久保存|未授予持久保存|不支持申请持久保存|申请持久保存失败/.test(status)
+    );
+  }, undefined, { timeout: 60_000 });
 
-  return { before, after: await readState() };
+  const after = await readState();
+  if (
+    !/已允许持久保存|未授予持久保存|不支持申请持久保存|申请持久保存失败/.test(
+      after.status,
+    )
+  ) {
+    throw new Error(`持久保存没有进入明确终态：${after.status}`);
+  }
+  return { before, after };
 
   async function readState() {
     return page.evaluate(() => {

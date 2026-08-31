@@ -98,6 +98,81 @@ describe('LocalDataMaintenance', () => {
     await database.delete();
   });
 
+  it('refreshes rebuilt handles and reports their final publication results', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '重建前标题', '重建前正文', 'wikitext'));
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    let advanced = false;
+    const cache = new VersionedSearchIndexCache(database, {
+      storage: {
+        estimate: async () => {
+          if (!advanced) {
+            advanced = true;
+            await database.transaction('rw', database.pages, database.syncState, async () => {
+              await database.pages.put({
+                ...page(1, '重建后标题', '重建后正文', 'wikitext'),
+                localSeq: 2,
+                revisionId: 20,
+                contentRevisionId: 20,
+              });
+              await database.syncState.put({ key: 'local-sequence', value: 2 });
+            });
+          }
+          return { usage: 1_000, quota: 1024 * 1024 * 1024 };
+        },
+      },
+    });
+    const maintenance = new LocalDataMaintenance(database, cache);
+
+    const rebuilt = await maintenance.rebuildSearchIndexes(analyzer);
+
+    expect(rebuilt.publishResults).toMatchObject({
+      title: { status: 'published' },
+      content: { status: 'published' },
+      lua: { status: 'published' },
+    });
+    expect(rebuilt.title.throughLocalSeq).toBe(2);
+    expect(rebuilt.content.throughLocalSeq).toBe(2);
+    expect(rebuilt.lua.throughLocalSeq).toBe(2);
+    expect(rebuilt.title.index.search('重建后')[0]?.title).toBe('重建后标题');
+    expect(await database.indexSnapshots.count()).toBe(3);
+
+    database.close();
+    await database.delete();
+  });
+
+  it('keeps rebuilt handles usable and exposes warnings when snapshots cannot be saved', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '配额受限页面', '仍可搜索的正文', 'wikitext'));
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const cache = new VersionedSearchIndexCache(database, {
+      storage: { estimate: async () => ({ usage: 1_000, quota: 1_000 }) },
+    });
+    const maintenance = new LocalDataMaintenance(database, cache);
+
+    const rebuilt = await maintenance.rebuildSearchIndexes(analyzer);
+
+    expect(rebuilt.publishResults).toEqual({
+      title: { status: 'skipped', reason: 'quota' },
+      content: { status: 'skipped', reason: 'quota' },
+      lua: { status: 'skipped', reason: 'quota' },
+    });
+    expect(rebuilt.warnings).toEqual([
+      expect.objectContaining({ kind: 'title', reason: 'quota' }),
+      expect.objectContaining({ kind: 'content', reason: 'quota' }),
+      expect.objectContaining({ kind: 'lua', reason: 'quota' }),
+    ]);
+    expect(rebuilt.warnings.every(({ message }) => message.includes('配额'))).toBe(true);
+    expect(rebuilt.title.index.search('配额受限')[0]?.title).toBe('配额受限页面');
+    expect(rebuilt.content.index.search('仍可搜索')[0]?.title).toBe('配额受限页面');
+    expect(await database.indexSnapshots.count()).toBe(0);
+
+    database.close();
+    await database.delete();
+  });
+
   it.each([
     ['denied', { persist: async () => false }, { status: 'denied' }],
     ['error', { persist: async () => { throw new Error('blocked'); } }, { status: 'error', message: 'blocked' }],

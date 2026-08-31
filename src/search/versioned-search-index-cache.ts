@@ -15,6 +15,7 @@ import { LuaModuleIndex } from './lua-module-index';
 import { TitleIndex } from './title-index';
 
 const LOCAL_SEQUENCE_KEY = 'local-sequence';
+const SNAPSHOT_GENERATION_KEY = 'search-index-generation';
 const SNAPSHOT_FORMAT_VERSION = 2;
 const MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
 const DEFAULT_PUBLISH_DELAY_MS = 5_000;
@@ -35,18 +36,21 @@ export interface SearchIndexHandle<K extends SearchIndexKind = SearchIndexKind> 
   replayedPages: number;
   restoreMs: number;
   compatibilityKey: string;
+  snapshotGeneration: number;
 }
+
+export type SnapshotPublishSkipReason =
+  | 'cleared-this-session'
+  | 'too-large'
+  | 'quota'
+  | 'sequence-changed'
+  | 'not-newer';
 
 export type SnapshotPublishResult =
   | { status: 'published'; record: IndexSnapshotRecord }
   | {
       status: 'skipped';
-      reason:
-        | 'cleared-this-session'
-        | 'too-large'
-        | 'quota'
-        | 'sequence-changed'
-        | 'not-newer';
+      reason: SnapshotPublishSkipReason;
     };
 
 export type SnapshotInspectionStatus =
@@ -83,8 +87,15 @@ export interface VersionedSearchIndexCacheOptions {
 interface ReadBundle {
   snapshot?: IndexSnapshotRecord;
   currentSequence: number;
+  snapshotGeneration: number;
   pages: PageRecord[];
   pagesAreDelta: boolean;
+}
+
+interface PublishState {
+  snapshot?: IndexSnapshotRecord;
+  currentSequence: number;
+  snapshotGeneration: number;
 }
 
 interface RuntimeState {
@@ -107,7 +118,6 @@ export class VersionedSearchIndexCache {
   private readonly refreshQueues = new WeakMap<object, Promise<void>>();
   private publishQueue: Promise<void> = Promise.resolve();
   private publishingSuppressed = false;
-  private publishEpoch = 0;
 
   constructor(
     private readonly database: WikiSearchDatabase,
@@ -162,7 +172,10 @@ export class VersionedSearchIndexCache {
         } catch (error) {
           runtimeStatus = 'corrupt';
           runtimeMessage = error instanceof Error ? error.message : String(error);
-          await this.deleteSnapshotIfUnchanged(bundle.snapshot);
+          await this.deleteSnapshotIfUnchanged(
+            bundle.snapshot,
+            bundle.snapshotGeneration,
+          );
         }
       }
     }
@@ -190,6 +203,7 @@ export class VersionedSearchIndexCache {
       replayedPages,
       restoreMs,
       compatibilityKey,
+      snapshotGeneration: bundle.snapshotGeneration,
     };
   }
 
@@ -251,7 +265,20 @@ export class VersionedSearchIndexCache {
     if (this.publishingSuppressed) {
       return { status: 'skipped', reason: 'cleared-this-session' };
     }
-    const candidateEpoch = this.publishEpoch;
+    const initialState = await this.readPublishState(handle.kind);
+    if (initialState.snapshotGeneration !== handle.snapshotGeneration) {
+      return { status: 'skipped', reason: 'cleared-this-session' };
+    }
+    if (initialState.currentSequence !== handle.throughLocalSeq) {
+      return { status: 'skipped', reason: 'sequence-changed' };
+    }
+    if (
+      initialState.snapshot?.compatibilityKey === handle.compatibilityKey &&
+      initialState.snapshot.throughLocalSeq >= handle.throughLocalSeq
+    ) {
+      return { status: 'skipped', reason: 'not-newer' };
+    }
+    const candidateGeneration = handle.snapshotGeneration;
     const serializationStartedAt = this.clock();
     const candidateThroughLocalSeq = handle.throughLocalSeq;
     const json = JSON.stringify(handle.index.exportSnapshot());
@@ -282,12 +309,20 @@ export class VersionedSearchIndexCache {
       this.database.indexSnapshots,
       this.database.syncState,
       async (): Promise<SnapshotPublishResult> => {
-        if (this.publishingSuppressed || candidateEpoch !== this.publishEpoch) {
+        if (this.publishingSuppressed) {
           return { status: 'skipped', reason: 'cleared-this-session' };
         }
-        const sequenceRecord = (await this.database.syncState.get(
-          LOCAL_SEQUENCE_KEY,
-        )) as SyncStateRecord<number> | undefined;
+        const [sequenceRecord, generationRecord] = await Promise.all([
+          this.database.syncState.get(LOCAL_SEQUENCE_KEY) as Promise<
+            SyncStateRecord<number> | undefined
+          >,
+          this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
+            SyncStateRecord<number> | undefined
+          >,
+        ]);
+        if (snapshotGenerationOf(generationRecord) !== candidateGeneration) {
+          return { status: 'skipped', reason: 'cleared-this-session' };
+        }
         const currentSequence = sequenceRecord?.value ?? 0;
         if (currentSequence !== record.throughLocalSeq) {
           return { status: 'skipped', reason: 'sequence-changed' };
@@ -388,9 +423,26 @@ export class VersionedSearchIndexCache {
     for (const timer of this.pendingPublishes.values()) clearTimeout(timer);
     this.pendingPublishes.clear();
     this.publishingSuppressed = true;
-    this.publishEpoch += 1;
-    await this.database.indexSnapshots.bulkDelete(
-      (['title', 'content', 'lua'] as const).map(snapshotKey),
+    await this.database.transaction(
+      'rw',
+      this.database.indexSnapshots,
+      this.database.syncState,
+      async () => {
+        const generationRecord = (await this.database.syncState.get(
+          SNAPSHOT_GENERATION_KEY,
+        )) as SyncStateRecord<number> | undefined;
+        const currentGeneration = snapshotGenerationOf(generationRecord);
+        if (currentGeneration >= Number.MAX_SAFE_INTEGER) {
+          throw new Error('索引快照 generation 已达到安全整数上限');
+        }
+        await this.database.syncState.put({
+          key: SNAPSHOT_GENERATION_KEY,
+          value: currentGeneration + 1,
+        });
+        await this.database.indexSnapshots.bulkDelete(
+          (['title', 'content', 'lua'] as const).map(snapshotKey),
+        );
+      },
     );
     for (const kind of ['title', 'content', 'lua'] as const) {
       this.runtime.set(kind, {
@@ -415,9 +467,12 @@ export class VersionedSearchIndexCache {
       this.database.syncState,
       this.database.pages,
       async () => {
-        const [snapshot, sequenceRecord] = await Promise.all([
+        const [snapshot, sequenceRecord, generationRecord] = await Promise.all([
           this.database.indexSnapshots.get(snapshotKey(kind)),
           this.database.syncState.get(LOCAL_SEQUENCE_KEY) as Promise<
+            SyncStateRecord<number> | undefined
+          >,
+          this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
             SyncStateRecord<number> | undefined
           >,
         ]);
@@ -440,7 +495,37 @@ export class VersionedSearchIndexCache {
           : kind === 'title'
             ? await readActivePageHeaders(this.database)
             : await this.database.pages.toArray();
-        return { snapshot, currentSequence, pages, pagesAreDelta };
+        return {
+          snapshot,
+          currentSequence,
+          snapshotGeneration: snapshotGenerationOf(generationRecord),
+          pages,
+          pagesAreDelta,
+        };
+      },
+    );
+  }
+
+  private async readPublishState(kind: SearchIndexKind): Promise<PublishState> {
+    return this.database.transaction(
+      'r',
+      this.database.indexSnapshots,
+      this.database.syncState,
+      async () => {
+        const [snapshot, sequenceRecord, generationRecord] = await Promise.all([
+          this.database.indexSnapshots.get(snapshotKey(kind)),
+          this.database.syncState.get(LOCAL_SEQUENCE_KEY) as Promise<
+            SyncStateRecord<number> | undefined
+          >,
+          this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
+            SyncStateRecord<number> | undefined
+          >,
+        ]);
+        return {
+          snapshot,
+          currentSequence: sequenceRecord?.value ?? 0,
+          snapshotGeneration: snapshotGenerationOf(generationRecord),
+        };
       },
     );
   }
@@ -456,13 +541,30 @@ export class VersionedSearchIndexCache {
     }
   }
 
-  private async deleteSnapshotIfUnchanged(snapshot: IndexSnapshotRecord): Promise<void> {
-    await this.database.transaction('rw', this.database.indexSnapshots, async () => {
-      const current = await this.database.indexSnapshots.get(snapshot.key);
-      if (current && isSameSnapshot(current, snapshot)) {
-        await this.database.indexSnapshots.delete(snapshot.key);
-      }
-    });
+  private async deleteSnapshotIfUnchanged(
+    snapshot: IndexSnapshotRecord,
+    snapshotGeneration: number,
+  ): Promise<void> {
+    await this.database.transaction(
+      'rw',
+      this.database.indexSnapshots,
+      this.database.syncState,
+      async () => {
+        const [current, generationRecord] = await Promise.all([
+          this.database.indexSnapshots.get(snapshot.key),
+          this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
+            SyncStateRecord<number> | undefined
+          >,
+        ]);
+        if (
+          snapshotGenerationOf(generationRecord) === snapshotGeneration &&
+          current &&
+          isSameSnapshot(current, snapshot)
+        ) {
+          await this.database.indexSnapshots.delete(snapshot.key);
+        }
+      },
+    );
   }
 }
 
@@ -548,4 +650,11 @@ function isSameSnapshot(
     left.json === right.json &&
     left.serializationMs === right.serializationMs
   );
+}
+
+function snapshotGenerationOf(
+  record: SyncStateRecord<number> | undefined,
+): number {
+  const value = record?.value;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }

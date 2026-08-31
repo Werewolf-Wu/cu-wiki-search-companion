@@ -106,8 +106,6 @@ async page => {
       }
     }, before.selected.id);
 
-    reconciliationCommitted = after.reconciliation?.status === 'complete';
-
     await page.evaluate(() => window.__CU_WIKI_SEARCH__.forceSync());
     const after = await page.evaluate(async pageId => {
       const database = await openDatabase();
@@ -168,6 +166,7 @@ async page => {
         };
       }
     }, before.selected.id);
+    reconciliationCommitted = after.reconciliation?.status === 'complete';
 
     if (!after.page || after.page.deleted) throw new Error('对账没有补回本地缺页');
     if (after.page.revisionId !== before.selected.revisionId) {

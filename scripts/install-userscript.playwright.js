@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 async page => {
   const environment = globalThis.process?.env ?? {};
-  const wikiOrigin = environment.CU_WIKI_ORIGIN ??
-    'https://casualtiesunknown.huijiwiki.com';
+  const wikiOrigin = (
+    environment.CU_WIKI_ORIGIN ?? 'https://casualtiesunknown.huijiwiki.com'
+  ).replace(/\/+$/, '');
   const editTarget =
     environment.CU_WIKI_INSTALL_EDIT_PATH ?? '/wiki/首页?action=edit';
   const editUrl = /^https?:\/\//i.test(editTarget)
@@ -26,23 +27,15 @@ async page => {
     throw new Error('无法从待安装 userscript 解析版本/build marker');
   }
   const initialPages = new Set(context.pages());
-  const wikiPage =
-    context
-      .pages()
-      .find((candidate) => candidate.url().startsWith(`${wikiOrigin}/`)) ??
-    page;
-
+  let wikiPage;
   for (const candidate of context.pages()) {
-    if (
-      candidate !== wikiPage &&
-      (candidate.url().includes('tampermonkey.net/script_installation.php') ||
-        candidate.url().includes('/ask.html'))
-    ) {
-      await candidate.close();
+    if (await isActivatedWikiPage(candidate)) {
+      wikiPage = candidate;
+      break;
     }
   }
-
-  if (!wikiPage.url().startsWith(`${wikiOrigin}/`)) {
+  if (!wikiPage) {
+    wikiPage = await context.newPage();
     await wikiPage.goto(
       editUrl,
       { waitUntil: 'domcontentloaded', timeout: 30_000 },
@@ -139,6 +132,24 @@ async page => {
       if (candidate && !candidate.isClosed() && !initialPages.has(candidate)) {
         await candidate.close().catch(() => undefined);
       }
+    }
+  }
+
+  async function isActivatedWikiPage(candidate) {
+    if (!candidate.url().startsWith(`${wikiOrigin}/`)) return false;
+    try {
+      return await candidate.evaluate(() => {
+        const urlAction = new URLSearchParams(location.search).get('action');
+        const configuredAction = window.mw?.config?.get('wgAction');
+        return (
+          urlAction === 'edit' ||
+          urlAction === 'submit' ||
+          configuredAction === 'edit' ||
+          configuredAction === 'submit'
+        );
+      });
+    } catch {
+      return false;
     }
   }
 }
