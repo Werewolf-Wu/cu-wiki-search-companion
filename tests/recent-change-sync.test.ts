@@ -117,6 +117,93 @@ describe('RecentChanges incremental sync', () => {
     await destroy(database);
   });
 
+  it('allocates page sequences after concurrent facts written while the API is in flight', async () => {
+    const database = await databaseWithBaseline([
+      page({ revisionId: 11, contentRevisionId: 11, content: '旧正文' }),
+    ]);
+    let concurrentFactWritten = false;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      const parameters = url.searchParams;
+      if (parameters.get('curtimestamp') === '1') {
+        return json({ curtimestamp: '2026-08-31T03:10:00Z', query: { general: {} } });
+      }
+      if (parameters.get('list') === 'recentchanges') {
+        return json({
+          query: {
+            recentchanges: [
+              {
+                type: 'edit',
+                ns: 0,
+                title: '12号鹿弹',
+                pageid: 1,
+                revid: 12,
+                old_revid: 11,
+                rcid: 102,
+                timestamp: '2026-08-31T03:06:00Z',
+              },
+            ],
+          },
+        });
+      }
+      if (parameters.get('prop') === 'info') {
+        return json({
+          query: {
+            pages: [
+              {
+                pageid: 1,
+                ns: 0,
+                title: '12号鹿弹',
+                contentmodel: 'wikitext',
+                lastrevid: 12,
+              },
+            ],
+          },
+        });
+      }
+      if (!concurrentFactWritten) {
+        concurrentFactWritten = true;
+        await database.transaction('rw', database.pages, database.syncState, async () => {
+          await database.pages.put(page({ id: 2, title: '并发事实', localSeq: 2 }));
+          await database.syncState.bulkPut([
+            { key: 'local-sequence', value: 2 },
+            { key: 'recent-changes-sync', value: { fileChangeSeq: 2 } },
+          ]);
+        });
+      }
+      return json({
+        query: {
+          pages: [
+            {
+              pageid: 1,
+              revisions: [
+                {
+                  revid: 12,
+                  slots: { main: { contentmodel: 'wikitext', content: '最新正文' } },
+                },
+              ],
+            },
+          ],
+        },
+      });
+    });
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+    const result = await syncRecentChanges(database, api, analyzer, {
+      requestIntervalMs: 0,
+    });
+
+    expect(result).toMatchObject({ status: 'complete', throughLocalSeq: 3 });
+    expect((await database.pages.get(1))?.localSeq).toBe(3);
+    expect((await database.pages.get(2))?.localSeq).toBe(2);
+    expect((await database.syncState.get('local-sequence'))?.value).toBe(3);
+    expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
+      fileChangeSeq: 2,
+    });
+
+    await destroy(database);
+  });
+
   it('consumes a bot-heavy continuation chain and coalesces repeated page edits', async () => {
     const requests: URL[] = [];
     const botEvents = Array.from({ length: 1_000 }, (_, offset) => ({
@@ -509,6 +596,86 @@ describe('RecentChanges incremental sync', () => {
     await destroy(database);
   });
 
+  it.each(['page-info', 'content'] as const)(
+    'pauses without advancing the cursor when %s requires login',
+    async (loginStage) => {
+      const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+        const parameters = url.searchParams;
+        if (parameters.get('curtimestamp') === '1') {
+          return json({ curtimestamp: '2026-08-31T03:10:00Z', query: { general: {} } });
+        }
+        if (parameters.get('list') === 'recentchanges') {
+          return json({
+            query: {
+              recentchanges: [
+                {
+                  type: 'edit',
+                  ns: 0,
+                  title: '登录中断页',
+                  pageid: 1,
+                  revid: 12,
+                  old_revid: 11,
+                  rcid: 302,
+                  timestamp: '2026-08-31T03:06:00Z',
+                },
+              ],
+            },
+          });
+        }
+        if (parameters.get('prop') === 'info') {
+          if (loginStage === 'page-info') return loginRequired();
+          return json({
+            query: {
+              pages: [
+                {
+                  pageid: 1,
+                  ns: 0,
+                  title: '登录中断页',
+                  contentmodel: 'wikitext',
+                  lastrevid: 12,
+                },
+              ],
+            },
+          });
+        }
+        return loginRequired();
+      });
+      const database = await databaseWithBaseline([
+        page({
+          title: '登录中断页',
+          normalizedTitle: analyzer.normalize('登录中断页'),
+          revisionId: 11,
+          contentRevisionId: 11,
+          content: '仍可搜索的缓存',
+        }),
+      ]);
+      const priorState = {
+        through: '2026-08-31T03:05:00Z',
+        completedAt: Date.parse('2026-08-31T03:05:01Z'),
+        recentChanges: [{ rcid: 300, timestamp: '2026-08-31T03:04:00Z' }],
+      };
+      await database.syncState.put({ key: 'recent-changes-sync', value: priorState });
+      const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+      const result = await syncRecentChanges(database, api, analyzer, {
+        requestIntervalMs: 0,
+      });
+
+      expect(result).toMatchObject({ status: 'login-required' });
+      expect((await database.syncState.get('recent-changes-sync'))?.value).toEqual(
+        priorState,
+      );
+      expect(await database.pages.get(1)).toMatchObject({
+        revisionId: 11,
+        contentRevisionId: 11,
+        content: '仍可搜索的缓存',
+      });
+
+      await destroy(database);
+    },
+  );
+
   it('updates an initialized file cache without leaking files into ordinary pages', async () => {
     const requests: URL[] = [];
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
@@ -845,5 +1012,14 @@ function json(value: unknown): Response {
   return new Response(JSON.stringify(value), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function loginRequired(): Response {
+  return json({
+    error: {
+      code: 'assertuserfailed',
+      info: 'Assertion that the user is logged in failed',
+    },
   });
 }

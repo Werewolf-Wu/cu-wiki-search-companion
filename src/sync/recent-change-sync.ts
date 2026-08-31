@@ -136,14 +136,20 @@ export async function syncRecentChanges(
     incrementalState?.recentChanges ?? [],
   );
   const candidates = collectPageCandidates(events);
-  const infoPages = deduplicatePageInfo(
-    await fetchPageInfo(
-      api,
-      [...candidates.byPageId.keys()],
-      [...candidates.titles],
-      options.requestIntervalMs ?? 300,
-    ),
-  );
+  let infoPages: RawPageInfo[];
+  try {
+    infoPages = deduplicatePageInfo(
+      await fetchPageInfo(
+        api,
+        [...candidates.byPageId.keys()],
+        [...candidates.titles],
+        options.requestIntervalMs ?? 300,
+      ),
+    );
+  } catch (error) {
+    if (isLoginRequired(error)) return inactiveResult('login-required', initialSequence);
+    throw error;
+  }
   const regularInfoPages = infoPages.filter(
     (page) => pageNamespace(page, candidates) !== 6,
   );
@@ -171,11 +177,17 @@ export async function syncRecentChanges(
         storedPages.get(page.pageid)?.contentRevisionId !== page.lastrevid,
     )
     .map((page) => page.pageid);
-  const revisions = await fetchContent(
-    api,
-    contentPageIds,
-    options.requestIntervalMs ?? 300,
-  );
+  let revisions: Awaited<ReturnType<typeof fetchContent>>;
+  try {
+    revisions = await fetchContent(
+      api,
+      contentPageIds,
+      options.requestIntervalMs ?? 300,
+    );
+  } catch (error) {
+    if (isLoginRequired(error)) return inactiveResult('login-required', initialSequence);
+    throw error;
+  }
   const contentPageIdSet = new Set(contentPageIds);
   const expectedRevisionByPageId = new Map(
     activeInfoPages.flatMap((page) =>
@@ -208,6 +220,10 @@ export async function syncRecentChanges(
     database.jobs,
     database.syncState,
     async () => {
+    const currentSequenceRecord = (await database.syncState.get(
+      LOCAL_SEQUENCE_KEY,
+    )) as SyncStateRecord<number> | undefined;
+    sequence = currentSequenceRecord?.value ?? initialSequence;
     const missingTitles = regularInfoPages
       .filter((page) => page.missing && typeof page.title === 'string')
       .map((page) => page.title as string);
@@ -441,13 +457,19 @@ export async function syncRecentChanges(
       }
       if (filesToPut.length) await database.fileResources.bulkPut(filesToPut);
     }
+    const currentRecentState = (await database.syncState.get(
+      RECENT_CHANGES_SYNC_KEY,
+    ))?.value as Partial<RecentChangeSyncState> | undefined;
     const state: RecentChangeSyncState = {
       through,
       completedAt: Date.now(),
       recentChanges,
       fileChangeSeq: filesChanged
         ? sequence
-        : incrementalState?.fileChangeSeq,
+        : maximumSequence(
+            incrementalState?.fileChangeSeq,
+            currentRecentState?.fileChangeSeq,
+          ),
     };
     await database.syncState.bulkPut([
       { key: LOCAL_SEQUENCE_KEY, value: sequence },
@@ -622,6 +644,11 @@ function retainedMarkers(
     }
   }
   return [...unique.values()];
+}
+
+function maximumSequence(...values: Array<number | undefined>): number | undefined {
+  const sequences = values.filter((value): value is number => typeof value === 'number');
+  return sequences.length ? Math.max(...sequences) : undefined;
 }
 
 function chunks<T>(values: T[], size: number): T[][] {

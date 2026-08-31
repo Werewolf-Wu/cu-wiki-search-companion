@@ -40,6 +40,7 @@ export async function syncContent(
 ): Promise<ContentSyncProgress> {
   await prepareContentJobs(database, options.force ?? false);
   reportProgress(await progress(database), options.onProgress);
+  const claimedJobs = new Map<number, number>();
 
   try {
     while (true) {
@@ -60,6 +61,9 @@ export async function syncContent(
         }
         await database.jobs.bulkPut(batch);
       });
+      for (const job of batch) {
+        if (job.id !== undefined) claimedJobs.set(job.id, now);
+      }
 
       const response = await api.query<ContentResponse>({
         prop: 'revisions',
@@ -168,11 +172,14 @@ export async function syncContent(
     }
   } catch (error) {
     await database.transaction('rw', database.jobs, async () => {
-      const running = await database.jobs
-        .where('status')
-        .equals('running')
-        .filter((job) => job.type === CONTENT_JOB_TYPE)
-        .toArray();
+      const running = (await database.jobs.bulkGet([...claimedJobs.keys()])).filter(
+        (job): job is JobRecord =>
+          job !== undefined &&
+          job.type === CONTENT_JOB_TYPE &&
+          job.status === 'running' &&
+          job.id !== undefined &&
+          job.updatedAt === claimedJobs.get(job.id),
+      );
       for (const job of running) {
         job.status = 'pending';
         job.updatedAt = Date.now();
@@ -191,38 +198,38 @@ export async function prepareContentJobs(
   database: WikiSearchDatabase,
   force: boolean,
 ): Promise<void> {
-  const [pages, existingJobs] = await Promise.all([
-    database.pages
-      .filter(
-        (page) =>
-          !page.deleted && !page.isRedirect && isSearchableContentModel(page.contentModel),
-      )
-      .toArray(),
-    database.jobs.filter((job) => job.type === CONTENT_JOB_TYPE).toArray(),
-  ]);
-  const existingByPage = new Map(existingJobs.map((job) => [job.pageId, job]));
-  const eligiblePageIds = new Set(pages.map((page) => page.id));
-  const now = Date.now();
-  const jobs = pages.map((page) => {
-    const existing = existingByPage.get(page.id);
-    const upToDate =
-      !force &&
-      typeof page.content === 'string' &&
-      page.contentRevisionId === page.revisionId;
-    return {
-      ...existing,
-      type: CONTENT_JOB_TYPE,
-      pageId: page.id,
-      status: upToDate ? 'done' : 'pending',
-      targetRevisionId: page.revisionId,
-      error: undefined,
-      updatedAt: now,
-    } satisfies JobRecord;
-  });
-  const staleJobIds = existingJobs
-    .filter((job) => !eligiblePageIds.has(job.pageId) && job.id !== undefined)
-    .map((job) => job.id as number);
-  await database.transaction('rw', database.jobs, async () => {
+  await database.transaction('rw', database.pages, database.jobs, async () => {
+    const [pages, existingJobs] = await Promise.all([
+      database.pages
+        .filter(
+          (page) =>
+            !page.deleted && !page.isRedirect && isSearchableContentModel(page.contentModel),
+        )
+        .toArray(),
+      database.jobs.filter((job) => job.type === CONTENT_JOB_TYPE).toArray(),
+    ]);
+    const existingByPage = new Map(existingJobs.map((job) => [job.pageId, job]));
+    const eligiblePageIds = new Set(pages.map((page) => page.id));
+    const now = Date.now();
+    const jobs = pages.map((page) => {
+      const existing = existingByPage.get(page.id);
+      const upToDate =
+        !force &&
+        typeof page.content === 'string' &&
+        page.contentRevisionId === page.revisionId;
+      return {
+        ...existing,
+        type: CONTENT_JOB_TYPE,
+        pageId: page.id,
+        status: upToDate ? 'done' : 'pending',
+        targetRevisionId: page.revisionId,
+        error: undefined,
+        updatedAt: now,
+      } satisfies JobRecord;
+    });
+    const staleJobIds = existingJobs
+      .filter((job) => !eligiblePageIds.has(job.pageId) && job.id !== undefined)
+      .map((job) => job.id as number);
     if (staleJobIds.length) await database.jobs.bulkDelete(staleJobIds);
     if (jobs.length) await database.jobs.bulkPut(jobs);
   });

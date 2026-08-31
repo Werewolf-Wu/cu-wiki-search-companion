@@ -200,6 +200,62 @@ describe('wikitext content search', () => {
     await database.delete();
   });
 
+  it('does not overwrite a newer revision job created while jobs are being prepared', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '准备竞态', '旧正文', 10));
+    const writerDatabase = new WikiSearchDatabase(database.name);
+    await writerDatabase.open();
+    const jobId = await database.jobs.add({
+      type: 'wikitext-content',
+      pageId: 1,
+      status: 'done',
+      targetRevisionId: 10,
+    });
+    const originalFilter = database.jobs.filter.bind(database.jobs);
+    let concurrentWrite: Promise<void> | undefined;
+    vi.spyOn(database.jobs, 'filter').mockImplementation((predicate) => {
+      const collection = originalFilter(predicate);
+      if (concurrentWrite) return collection;
+      const originalToArray = collection.toArray.bind(collection);
+      vi.spyOn(collection, 'toArray').mockImplementation(
+        (async () => {
+          const jobs = await originalToArray();
+          concurrentWrite = writerDatabase.transaction(
+            'rw',
+            writerDatabase.pages,
+            writerDatabase.jobs,
+            async () => {
+              await writerDatabase.pages.update(1, { revisionId: 20 });
+              await writerDatabase.jobs.put({
+                id: jobId,
+                type: 'wikitext-content',
+                pageId: 1,
+                status: 'pending',
+                targetRevisionId: 20,
+              });
+            },
+          );
+          return jobs;
+        }) as never,
+      );
+      return collection;
+    });
+
+    await prepareContentJobs(database, false);
+    await concurrentWrite;
+
+    expect(await database.pages.get(1)).toMatchObject({ revisionId: 20 });
+    expect(await database.jobs.get(jobId)).toMatchObject({
+      status: 'pending',
+      targetRevisionId: 20,
+    });
+
+    writerDatabase.close();
+    database.close();
+    await database.delete();
+  });
+
   it('removes jobs when a page no longer has a searchable content model', async () => {
     const calls: number[][] = [];
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
@@ -284,6 +340,39 @@ describe('wikitext content search', () => {
       [51, 51, 1],
     ]);
     expect(resumed).toEqual({ total: 51, done: 51, pending: 0, failed: 0 });
+
+    database.close();
+    await database.delete();
+  });
+
+  it('only restores jobs claimed by the failing content sync', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '失败批次', undefined, 10));
+    let otherJobId: number | undefined;
+    const fetcher = vi.fn(async () => {
+      otherJobId = await database.jobs.add({
+        type: 'wikitext-content',
+        pageId: 99,
+        status: 'running',
+        targetRevisionId: 990,
+        updatedAt: Date.now(),
+      });
+      throw new Error('模拟当前批次网络中断');
+    });
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+    await expect(syncContent(database, api, { requestIntervalMs: 0 })).rejects.toThrow(
+      '模拟当前批次网络中断',
+    );
+
+    expect(
+      await database.jobs.filter((job) => job.pageId === 1).first(),
+    ).toMatchObject({ status: 'pending', targetRevisionId: 10 });
+    expect(await database.jobs.get(otherJobId)).toMatchObject({
+      status: 'running',
+      targetRevisionId: 990,
+    });
 
     database.close();
     await database.delete();

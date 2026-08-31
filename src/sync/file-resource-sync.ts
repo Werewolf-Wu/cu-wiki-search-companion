@@ -11,6 +11,7 @@ import { delay, WikiApi } from './wiki-api';
 
 const FILE_RESOURCE_SYNC_KEY = 'file-resource-sync';
 const LOCAL_SEQUENCE_KEY = 'local-sequence';
+const RECENT_CHANGES_SYNC_KEY = 'recent-changes-sync';
 const FILE_NAMESPACE = 6;
 
 interface AllFilesResponse {
@@ -55,7 +56,7 @@ export async function syncFileResources(
   }
 
   let state: TitleSyncState;
-  if (!existing || options.force || existing.status === 'failed') {
+  if (!existing || options.force) {
     state = {
       status: 'running',
       namespaceIds: [FILE_NAMESPACE],
@@ -143,12 +144,22 @@ export async function syncFileResources(
             namespaceIndex: nextContinue ? 0 : 1,
             ...(nextContinue ? { apcontinue: nextContinue } : { apcontinue: undefined }),
           };
+          const recentChangeRecord =
+            sequence === initialSequence
+              ? undefined
+              : await database.syncState.get(RECENT_CHANGES_SYNC_KEY);
           await database.fileResources.bulkPut(storedBatch);
           await database.syncState.bulkPut([
             { key: FILE_RESOURCE_SYNC_KEY, value: nextState },
             ...(sequence === initialSequence
               ? []
-              : [{ key: LOCAL_SEQUENCE_KEY, value: sequence }]),
+              : [
+                  { key: LOCAL_SEQUENCE_KEY, value: sequence },
+                  {
+                    key: RECENT_CHANGES_SYNC_KEY,
+                    value: withFileChangeSequence(recentChangeRecord?.value, sequence),
+                  },
+                ]),
           ]);
           state = nextState;
         },
@@ -176,12 +187,21 @@ export async function syncFileResources(
           : await database.pages.orderBy('localSeq').last();
         const sequence =
           (sequenceRecord?.value ?? newestPage?.localSeq ?? 0) + staleIds.length;
+        const recentChangeRecord = staleIds.length
+          ? await database.syncState.get(RECENT_CHANGES_SYNC_KEY)
+          : undefined;
         await database.fileResources.bulkDelete(staleIds);
         state = { ...state, status: 'complete', completedAt: Date.now() };
         await database.syncState.bulkPut([
           { key: FILE_RESOURCE_SYNC_KEY, value: state },
           ...(staleIds.length
-            ? [{ key: LOCAL_SEQUENCE_KEY, value: sequence }]
+            ? [
+                { key: LOCAL_SEQUENCE_KEY, value: sequence },
+                {
+                  key: RECENT_CHANGES_SYNC_KEY,
+                  value: withFileChangeSequence(recentChangeRecord?.value, sequence),
+                },
+              ]
             : []),
         ]);
       },
@@ -210,6 +230,15 @@ function fileFactChanged(oldFile: PageRecord | undefined, nextFile: PageRecord):
     oldFile.contentModel !== nextFile.contentModel ||
     Boolean(oldFile.deleted) !== Boolean(nextFile.deleted)
   );
+}
+
+function withFileChangeSequence(value: unknown, sequence: number): Record<string, unknown> {
+  const state =
+    value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const previous = typeof state.fileChangeSeq === 'number' ? state.fileChangeSeq : 0;
+  return { ...state, fileChangeSeq: Math.max(previous, sequence) };
 }
 
 function report(

@@ -144,6 +144,131 @@ describe('title sync', () => {
     database.close();
     await database.delete();
   });
+
+  it('clears cached content when a completed title scan tombstones a page', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      if (url.searchParams.get('meta') === 'siteinfo') {
+        return json({ query: { namespaces: { 0: { id: 0, name: '' } } } });
+      }
+      return json({ query: { pages: [] } });
+    });
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put({
+      id: 1,
+      title: '远程已删除',
+      normalizedTitle: analyzer.normalize('远程已删除'),
+      namespace: 0,
+      namespaceName: '（主）',
+      isRedirect: false,
+      localSeq: 1,
+      seenInTitleSync: 1,
+      deleted: false,
+      revisionId: 10,
+      contentModel: 'wikitext',
+      content: '不得复活的旧正文',
+      contentRevisionId: 10,
+    });
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+    await syncTitles(database, api, analyzer, { requestIntervalMs: 0 });
+
+    expect(await database.pages.get(1)).toMatchObject({
+      deleted: true,
+      content: undefined,
+      contentRevisionId: undefined,
+    });
+
+    database.close();
+    await database.delete();
+  });
+
+  it('resumes a failed title scan from its saved continuation', async () => {
+    const requests: URL[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      requests.push(url);
+      if (url.searchParams.get('meta') === 'siteinfo') {
+        return json({ query: { namespaces: { 0: { id: 0, name: '' } } } });
+      }
+      if (!url.searchParams.has('gapcontinue')) {
+        return json({
+          continue: { gapcontinue: '第二页' },
+          query: {
+            pages: [
+              { pageid: 1, ns: 0, title: '已完成首页', lastrevid: 10, contentmodel: 'wikitext' },
+            ],
+          },
+        });
+      }
+      return json({
+        query: {
+          pages: [
+            { pageid: 2, ns: 0, title: '恢复后次页', lastrevid: 20, contentmodel: 'wikitext' },
+          ],
+        },
+      });
+    });
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put({
+      id: 1,
+      title: '已完成首页',
+      normalizedTitle: analyzer.normalize('已完成首页'),
+      namespace: 0,
+      namespaceName: '（主）',
+      isRedirect: false,
+      localSeq: 1,
+      seenInTitleSync: 100,
+      deleted: false,
+      revisionId: 10,
+      contentModel: 'wikitext',
+    });
+    await database.syncState.bulkPut([
+      { key: 'local-sequence', value: 1 },
+      {
+        key: 'title-sync',
+        value: {
+          status: 'failed',
+          namespaceIds: [0],
+          namespaceNames: { 0: '（主）' },
+          namespaceIndex: 0,
+          apcontinue: '第二页',
+          generation: 100,
+          pagesFetched: 1,
+          startedAt: 100,
+          error: '断网',
+        },
+      },
+    ]);
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+    const result = await syncTitles(database, api, analyzer, { requestIntervalMs: 0 });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.searchParams.get('gapcontinue')).toBe('第二页');
+    expect(result).toMatchObject({
+      status: 'complete',
+      generation: 100,
+      pagesFetched: 2,
+    });
+    expect(await database.pages.get(1)).toMatchObject({ deleted: false });
+    expect(await database.pages.get(2)).toMatchObject({ title: '恢复后次页' });
+
+    requests.length = 0;
+    const forced = await syncTitles(database, api, analyzer, {
+      force: true,
+      requestIntervalMs: 0,
+    });
+    expect(requests[0]?.searchParams.get('meta')).toBe('siteinfo');
+    expect(requests[1]?.searchParams.has('gapcontinue')).toBe(false);
+    expect(forced.generation).not.toBe(100);
+
+    database.close();
+    await database.delete();
+  });
 });
 
 function json(value: unknown): Response {

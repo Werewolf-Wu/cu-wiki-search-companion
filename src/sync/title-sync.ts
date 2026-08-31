@@ -60,7 +60,7 @@ export async function syncTitles(
   }
 
   let state: TitleSyncState;
-  if (!existing || options.force || existing.status === 'failed') {
+  if (!existing || options.force) {
     const siteInfo = await api.query<SiteInfoResponse>({
       meta: 'siteinfo',
       siprop: 'namespaces',
@@ -185,6 +185,8 @@ export async function syncTitles(
       for (const page of stalePages) {
         sequence += 1;
         page.deleted = true;
+        page.content = undefined;
+        page.contentRevisionId = undefined;
         page.localSeq = sequence;
       }
       await database.pages.bulkPut(stalePages);
