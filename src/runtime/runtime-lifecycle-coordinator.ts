@@ -49,9 +49,19 @@ export class RuntimeLifecycleCoordinator {
     const active = this.writerPromises.get(key);
     if (active) return active;
     const request = Promise.resolve().then(async () => {
-      const result = this.options.writer
-        ? await this.options.writer.runExclusive(task)
-        : (await task(), 'ran' as const);
+      let result: 'ran' | 'lock-unavailable';
+      try {
+        result = this.options.writer
+          ? await this.options.writer.runExclusive(task)
+          : (await task(), 'ran' as const);
+      } catch (error) {
+        try {
+          await afterRelease?.();
+        } catch {
+          // The writer failure is authoritative; a derived refresh can retry later.
+        }
+        throw error;
+      }
       if (result === 'ran') await afterRelease?.();
       return result;
     });

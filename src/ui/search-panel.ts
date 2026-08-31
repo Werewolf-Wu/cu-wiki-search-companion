@@ -75,6 +75,7 @@ export class SearchPanel {
   private maintenanceBusy = false;
   private startupFailed = false;
   private searchTimer?: number;
+  private returnFocus?: HTMLElement;
 
   constructor(private readonly callbacks: SearchPanelCallbacks) {
     this.host = document.createElement('div');
@@ -133,7 +134,10 @@ export class SearchPanel {
     reloadButton.onclick = reload;
   }
 
-  open(): void {
+  open(returnFocus?: HTMLElement): void {
+    if (this.panel.hidden) {
+      this.returnFocus = returnFocus ?? this.currentReturnFocus();
+    }
     if (!this.startupFailed) {
       this.prepareCurrentMode();
     }
@@ -144,8 +148,16 @@ export class SearchPanel {
   }
 
   close(): void {
+    if (this.panel.hidden) return;
     this.panel.hidden = true;
     this.toggle.setAttribute('aria-expanded', 'false');
+    const returnFocus = this.returnFocus;
+    this.returnFocus = undefined;
+    if (returnFocus?.isConnected && !returnFocus.matches(':disabled')) {
+      returnFocus.focus();
+    } else {
+      this.toggle.focus();
+    }
   }
 
   refreshResults(): void {
@@ -154,7 +166,7 @@ export class SearchPanel {
 
   private bindEvents(): void {
     this.toggle.addEventListener('click', () => {
-      if (this.panel.hidden) this.open();
+      if (this.panel.hidden) this.open(this.toggle);
       else this.close();
     });
     this.requireElement<HTMLButtonElement>('.close').addEventListener('click', () => this.close());
@@ -368,12 +380,13 @@ export class SearchPanel {
   }
 
   private handleKeydown(event: KeyboardEvent): void {
+    if (this.composing || event.isComposing) return;
     if (event.key === 'Escape') {
       event.preventDefault();
       this.close();
       return;
     }
-    if (!this.results.length || this.composing) return;
+    if (!this.results.length) return;
     if (event.key === 'ArrowDown') {
       event.preventDefault();
       this.selectedIndex = (this.selectedIndex + 1) % this.results.length;
@@ -390,10 +403,10 @@ export class SearchPanel {
   }
 
   private insert(result: SearchPanelResult): void {
+    this.close();
     if (isDataCodeResult(result)) this.callbacks.selectCode(result);
     else if (isLuaResult(result)) this.callbacks.open(result);
     else this.callbacks.insert(result, this.input.value);
-    this.close();
   }
 
   private updateModePresentation(): void {
@@ -449,6 +462,19 @@ export class SearchPanel {
       item.dataset.selected = String(index === this.selectedIndex);
     });
     items[this.selectedIndex]?.scrollIntoView({ block: 'nearest' });
+  }
+
+  private currentReturnFocus(): HTMLElement {
+    const active = this.root.activeElement ?? document.activeElement;
+    if (
+      active instanceof HTMLElement &&
+      active !== document.body &&
+      active !== document.documentElement &&
+      !this.panel.contains(active)
+    ) {
+      return active;
+    }
+    return this.toggle;
   }
 
   private messageItem(message: string): HTMLLIElement {

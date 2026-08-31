@@ -126,6 +126,30 @@ describe('runtime lifecycle coordinator', () => {
     ]);
   });
 
+  it('refreshes partially committed content after the writer lock is released and preserves the writer error', async () => {
+    const originalError = new Error('第二批正文请求失败');
+    const writer = new QueuedWriter();
+    const coordinator = new RuntimeLifecycleCoordinator({
+      applyStorageInvalidation: vi.fn(async () => undefined),
+      writer,
+    });
+    const order: string[] = [];
+
+    const request = coordinator.runContentWriter(
+      async () => {
+        order.push('facts-committed');
+        throw originalError;
+      },
+      async () => {
+        order.push('refresh-after-release');
+        throw new Error('派生刷新也失败');
+      },
+    );
+
+    await expect(request).rejects.toBe(originalError);
+    expect(order).toEqual(['facts-committed', 'refresh-after-release']);
+  });
+
   it('serializes refreshes and coalesces invalidations that arrive during a refresh', async () => {
     let finishFirst!: () => void;
     const firstHeld = new Promise<void>((resolve) => {

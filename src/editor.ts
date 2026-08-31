@@ -16,7 +16,7 @@ export function insertAtEditorSelection(text: string): 'codemirror' | 'textarea'
     .map((element) => element.CodeMirror)
     .find((editor) => editor?.getTextArea() === textarea);
   if (codeMirror) {
-    codeMirror.operation(() => codeMirror.replaceSelection(text, 'around', '+input'));
+    codeMirror.operation(() => codeMirror.replaceSelection(text, 'end', '+input'));
     codeMirror.focus();
     return 'codemirror';
   }
@@ -30,10 +30,11 @@ export function insertAtEditorSelection(text: string): 'codemirror' | 'textarea'
   return 'textarea';
 }
 
-export function wikiLink(title: string, query: string): string {
+export function wikiLink(title: string, query: string, namespace?: number): string {
   const label = query.trim();
+  const target = namespace === 6 || namespace === 14 ? `:${title.replace(/^:/, '')}` : title;
   if (!label || label.toLocaleLowerCase() === title.toLocaleLowerCase()) {
-    return `[[${title}]]`;
+    return `[[${target}]]`;
   }
-  return `[[${title}|${label}]]`;
+  return `[[${target}|${label}]]`;
 }

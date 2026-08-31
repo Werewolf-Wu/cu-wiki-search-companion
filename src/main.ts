@@ -7,13 +7,16 @@ import {
 } from './data/data-field-rules';
 import { insertAtEditorSelection, wikiLink } from './editor';
 import { LocalDataMaintenance } from './maintenance/local-data-maintenance';
+import { AnalyzerPreparationCoordinator } from './runtime/analyzer-preparation';
 import { browserTaskScheduler } from './runtime/cooperative-task-scheduler';
 import { InitialBackgroundRefreshCoordinator } from './runtime/initial-background-refresh';
+import { CommittedReconciliationRefresh } from './runtime/reconciliation-commit-refresh';
 import {
   RuntimeLifecycleCoordinator,
   type StorageInvalidation,
   type StorageInvalidationRequest,
 } from './runtime/runtime-lifecycle-coordinator';
+import { StagedPreparationCoordinator } from './runtime/staged-preparation';
 import { ContentIndex, type ContentSearchResult } from './search/content-index';
 import { DataCodeIndex, type DataCodeSearchResult } from './search/data-code-index';
 import { LuaModuleIndex, type LuaModuleSearchResult } from './search/lua-module-index';
@@ -178,9 +181,6 @@ async function start(): Promise<void> {
   let lastAppliedFileChangeSeq = 0;
   let analyzerResult: AnalyzerLoadResult | undefined;
   let dataCodeRulesSource = DEFAULT_DATA_CODE_RULES;
-  let engineReady: Promise<void> | undefined;
-  let contentReady: Promise<void> | undefined;
-  let luaReady: Promise<void> | undefined;
   let fileReady: Promise<void> | undefined;
   let fileReadySettled = false;
   let resolveInitialCacheReady!: () => void;
@@ -221,12 +221,20 @@ async function start(): Promise<void> {
         panel.setStatus(`当前为 ${contentModel}，已复制标题：${result.title}`, 'success');
         return;
       }
-      const link = wikiLink(result.title, 'kind' in result ? result.title : query);
+      const link = wikiLink(
+        result.title,
+        'kind' in result ? result.title : query,
+        result.namespace,
+      );
       const editor = insertAtEditorSelection(link);
       panel.setStatus(`已插入 ${link} · ${editor === 'codemirror' ? 'CodeMirror' : '文本框'}`, 'success');
     },
     copy: (result, query) => {
-      const link = wikiLink(result.title, 'kind' in result ? result.title : query);
+      const link = wikiLink(
+        result.title,
+        'kind' in result ? result.title : query,
+        result.namespace,
+      );
       GM_setClipboard(link, 'text');
       panel.setStatus(`已复制 ${link}`, 'success');
     },
@@ -279,6 +287,27 @@ async function start(): Promise<void> {
     requestPersistence: () => maintenance.requestPersistence(),
     resetLocalMirror: (resetDataRules) =>
       maintenance.resetLocalMirror({ resetDataRules }),
+  });
+  const analyzerPreparation = new AnalyzerPreparationCoordinator(async () => {
+    await initialCacheReady;
+    await browserTaskScheduler.waitUntilVisible();
+    const loadedAnalyzer = await loadAnalyzer();
+    analyzerResult = loadedAnalyzer;
+    debugApi.engine = loadedAnalyzer.engine;
+    debugApi.jiebaReadyMs = Math.round(performance.now() - bootStartedAt);
+    return loadedAnalyzer;
+  });
+  const titlePreparation = new StagedPreparationCoordinator({
+    prepareLocal: () => prepareEnhancedTitleIndex(),
+    settle: () => settleEnhancedTitleIndex(),
+  });
+  const contentPreparation = new StagedPreparationCoordinator({
+    prepareLocal: () => prepareDerivedSearchIndex('content'),
+    settle: () => settleDerivedSearchIndex('content'),
+  });
+  const luaPreparation = new StagedPreparationCoordinator({
+    prepareLocal: () => prepareDerivedSearchIndex('lua'),
+    settle: () => settleDerivedSearchIndex('lua'),
   });
   startupPanel = panel;
   panel.setInsertMode(canInsertWikiText);
@@ -351,6 +380,16 @@ async function start(): Promise<void> {
   runtimeLifecycle = new RuntimeLifecycleCoordinator({
     applyStorageInvalidation: applyStorageInvalidation,
     writer: incrementalCoordinator,
+  });
+  const committedReconciliationRefresh = new CommittedReconciliationRefresh({
+    readState: () => readReconciliationSyncState(database),
+    readLocalSequence: async () => {
+      const value = (await database.syncState.get('local-sequence'))?.value;
+      return typeof value === 'number' ? value : 0;
+    },
+    lastAppliedSequence: () => lastAppliedLocalSeq,
+    refresh: (invalidation) => refreshIndexesFromStorage(invalidation),
+    broadcast: (message) => incrementalChannel?.postMessage(message),
   });
   const initialBackgroundRefresh = new InitialBackgroundRefreshCoordinator({
     canRun: () => writesCompatible,
@@ -430,98 +469,91 @@ async function start(): Promise<void> {
   }
 
   function ensureEnhancedTitleStarted(): Promise<void> {
-    if (!engineReady) {
-      panel.setStatus('正在按需加载分词引擎与标题索引…');
-      const attempt = (async () => {
-        await initialCacheReady;
-        await browserTaskScheduler.waitUntilVisible();
-        const loadedAnalyzer = await loadAnalyzer();
-        const restoredTitle = await indexCache.restoreOrRebuild(
-          'title',
-          loadedAnalyzer.analyzer,
-        );
-        const upgradedIndex = restoredTitle.index;
-        if (!bootstrapIndex) throw new Error('本地标题缓存尚未就绪');
-        analyzerResult = loadedAnalyzer;
-        titleHandle = restoredTitle;
-        titleIndex = upgradedIndex;
-        searchBackend = new CombinedTitleIndex(upgradedIndex, bootstrapIndex);
-        debugApi.engine = loadedAnalyzer.engine;
-        debugApi.indexedPages = upgradedIndex.size;
-        debugApi.jiebaReadyMs = Math.round(performance.now() - bootStartedAt);
-        await updateSnapshotDebug();
-        await runSync(false);
-        if (loadedAnalyzer.warning) {
-          panel.setStatus(
-            `jieba 加载失败，已用 Intl.Segmenter · ${upgradedIndex.size} 标题`,
-            'error',
-          );
-        } else {
-          panel.setStatus(
-            `标题索引已就绪 · ${upgradedIndex.size} 标题 · 正文与 Lua 按模式加载`,
-            'success',
-          );
-        }
-      })();
-      const tracked = attempt.catch((error: unknown) => {
-        if (engineReady === tracked) engineReady = undefined;
-        throw error;
-      });
-      engineReady = tracked;
+    return titlePreparation.prepare();
+  }
+
+  async function prepareEnhancedTitleIndex(): Promise<void> {
+    panel.setStatus('正在按需加载分词引擎与标题索引…');
+    const loadedAnalyzer = await analyzerPreparation.prepare();
+    const restoredTitle = await indexCache.restoreOrRebuild(
+      'title',
+      loadedAnalyzer.analyzer,
+    );
+    const upgradedIndex = restoredTitle.index;
+    if (!bootstrapIndex) throw new Error('本地标题缓存尚未就绪');
+    titleHandle = restoredTitle;
+    titleIndex = upgradedIndex;
+    searchBackend = new CombinedTitleIndex(upgradedIndex, bootstrapIndex);
+    debugApi.indexedPages = upgradedIndex.size;
+    await updateSnapshotDebug();
+    panel.refreshResults();
+  }
+
+  async function settleEnhancedTitleIndex(): Promise<void> {
+    panel.setStatus('正在同步标题…');
+    const syncResult = await runSync(false);
+    if (syncResult.status === 'error') throw syncResult.error;
+    if (!analyzerResult || !titleIndex) throw new Error('增强标题索引尚未就绪');
+    if (analyzerResult.warning) {
+      panel.setStatus(
+        `jieba 加载失败，已用 Intl.Segmenter · ${titleIndex.size} 标题`,
+        'error',
+      );
+    } else {
+      panel.setStatus(
+        `标题索引已就绪 · ${titleIndex.size} 标题 · 正文与 Lua 按模式加载`,
+        'success',
+      );
     }
-    return engineReady;
   }
 
   function ensureDerivedSearchStarted(kind: 'content' | 'lua'): Promise<void> {
-    const current = kind === 'content' ? contentReady : luaReady;
-    if (current) return current;
+    return kind === 'content' ? contentPreparation.prepare() : luaPreparation.prepare();
+  }
 
+  async function prepareDerivedSearchIndex(kind: 'content' | 'lua'): Promise<void> {
     panel.setStatus(
       kind === 'content' ? '正在按需恢复正文索引…' : '正在按需恢复 Lua 索引…',
     );
-    const attempt = (async () => {
-      await ensureEnhancedTitleStarted();
-      await browserTaskScheduler.waitUntilVisible();
-      if (!analyzerResult || analyzerResult.engine === 'bootstrap') {
-        throw new Error('增强分词引擎尚未就绪');
-      }
-      if (kind === 'content') {
-        const restored = await indexCache.restoreOrRebuild(
-          'content',
-          analyzerResult.analyzer,
-        );
-        contentHandle = restored;
-        contentIndex = restored.index;
-        debugApi.indexedContentPages = restored.index.size;
-        await settleRestoredDerivedHandle(restored);
-      } else {
-        const restored = await indexCache.restoreOrRebuild(
-          'lua',
-          analyzerResult.analyzer,
-        );
-        luaHandle = restored;
-        luaModuleIndex = restored.index;
-        debugApi.indexedLuaModules = restored.index.size;
-        await settleRestoredDerivedHandle(restored);
-      }
-      const readyMs = Math.round(performance.now() - bootStartedAt);
-      if (kind === 'content') debugApi.contentIndexReadyMs = readyMs;
-      else debugApi.luaIndexReadyMs = readyMs;
-      debugApi.contentReadyMs = Math.max(
-        debugApi.contentIndexReadyMs ?? 0,
-        debugApi.luaIndexReadyMs ?? 0,
+    await titlePreparation.prepareLocal();
+    await browserTaskScheduler.waitUntilVisible();
+    if (!analyzerResult || analyzerResult.engine === 'bootstrap') {
+      throw new Error('增强分词引擎尚未就绪');
+    }
+    if (kind === 'content') {
+      const restored = await indexCache.restoreOrRebuild(
+        'content',
+        analyzerResult.analyzer,
       );
-      await updateSnapshotDebug();
-      panel.refreshResults();
-    })();
-    const tracked = attempt.catch((error: unknown) => {
-      if (kind === 'content' && contentReady === tracked) contentReady = undefined;
-      if (kind === 'lua' && luaReady === tracked) luaReady = undefined;
-      throw error;
-    });
-    if (kind === 'content') contentReady = tracked;
-    else luaReady = tracked;
-    return tracked;
+      contentHandle = restored;
+      contentIndex = restored.index;
+      debugApi.indexedContentPages = restored.index.size;
+    } else {
+      const restored = await indexCache.restoreOrRebuild(
+        'lua',
+        analyzerResult.analyzer,
+      );
+      luaHandle = restored;
+      luaModuleIndex = restored.index;
+      debugApi.indexedLuaModules = restored.index.size;
+    }
+    panel.refreshResults();
+  }
+
+  async function settleDerivedSearchIndex(kind: 'content' | 'lua'): Promise<void> {
+    const handle = kind === 'content' ? contentHandle : luaHandle;
+    if (!handle) throw new Error(`${searchKindLabel(kind)}尚未就绪`);
+    await ensureEnhancedTitleStarted();
+    await settleRestoredDerivedHandle(handle);
+    const readyMs = Math.round(performance.now() - bootStartedAt);
+    if (kind === 'content') debugApi.contentIndexReadyMs = readyMs;
+    else debugApi.luaIndexReadyMs = readyMs;
+    debugApi.contentReadyMs = Math.max(
+      debugApi.contentIndexReadyMs ?? 0,
+      debugApi.luaIndexReadyMs ?? 0,
+    );
+    await updateSnapshotDebug();
+    panel.refreshResults();
   }
 
   async function settleRestoredDerivedHandle<K extends 'content' | 'lua'>(
@@ -610,9 +642,12 @@ async function start(): Promise<void> {
   }
 
   async function requestSync(force: boolean): Promise<void> {
-    await ensureEnhancedTitleStarted();
+    await titlePreparation.prepareLocal();
     const result = await runSync(force);
-    if (result.status === 'error') throw result.error;
+    if (result.status === 'error') {
+      titlePreparation.invalidateSettlement();
+      throw result.error;
+    }
   }
 
   async function saveDataCodeRules(source: string): Promise<void> {
@@ -720,6 +755,26 @@ async function start(): Promise<void> {
     return runContentSync(force);
   }
 
+  async function applyCommittedReconciliationAfterRelease(): Promise<
+    SyncAttemptResult | undefined
+  > {
+    try {
+      const committed = await committedReconciliationRefresh.apply();
+      if (committed?.refreshError) {
+        console.error(
+          '[CU Wiki Search] committed reconciliation refresh failed',
+          committed.refreshError,
+        );
+      }
+      if (committed?.dataCodesInvalidated) {
+        return requestDataCodeSync(false);
+      }
+    } catch (error) {
+      console.error('[CU Wiki Search] committed reconciliation refresh failed', error);
+    }
+    return undefined;
+  }
+
   async function requestIncrementalSync(): Promise<void> {
     if (!ensureWritesAllowed()) return;
     if (incrementalSyncPromise) return incrementalSyncPromise;
@@ -751,6 +806,12 @@ async function start(): Promise<void> {
           syncResult = await syncRecentChanges(database, api, fallbackAnalyzer);
           return syncResult.status === 'complete';
         });
+        if (
+          reconciliationResult?.status === 'complete' ||
+          reconciliationResult?.status === 'login-required'
+        ) {
+          await applyCommittedReconciliationAfterRelease();
+        }
         if (coordinated === 'lock-unavailable') {
           debugApi.incrementalStatus = 'lock-unavailable';
           await refreshIndexesFromStorage();
@@ -767,18 +828,6 @@ async function start(): Promise<void> {
             debugApi.reconciliationCompletedAt = (
               await readReconciliationSyncState(database)
             )?.completedAt;
-            await refreshIndexesFromStorage();
-            incrementalChannel?.postMessage({
-              type: 'reconciled',
-              throughLocalSeq: reconciliationResult.throughLocalSeq,
-              filesChanged: reconciliationResult.filesChanged,
-            });
-            if (reconciliationResult.dataCodesInvalidated) {
-              await requestDataCodeSync(false);
-            }
-            if (contentIndex || luaModuleIndex) {
-              await runContentSync(false);
-            }
           } else if (reconciliationResult.status === 'login-required') {
             debugApi.incrementalStatus = 'login-required';
             panel.setStatus(
@@ -806,6 +855,12 @@ async function start(): Promise<void> {
           filesChanged: syncResult.filesChanged,
         });
         if (syncResult.dataCodesInvalidated) await requestDataCodeSync(false);
+        if (
+          reconciliationResult?.status === 'complete' &&
+          (contentIndex || luaModuleIndex)
+        ) {
+          await runContentSync(false);
+        }
         if (syncResult.changedPages.length || syncResult.filesChanged) {
           panel.setStatus(
             `增量同步完成 · ${syncResult.changedPages.length} 个页面` +
@@ -814,6 +869,7 @@ async function start(): Promise<void> {
           );
         }
       } catch (error) {
+        await applyCommittedReconciliationAfterRelease();
         const committedReconciliation = await readReconciliationSyncState(database);
         if (
           reconciliationResult?.status === 'complete' &&
@@ -821,17 +877,6 @@ async function start(): Promise<void> {
         ) {
           debugApi.reconciliationStatus = 'complete';
           debugApi.reconciliationCompletedAt = committedReconciliation.completedAt;
-          await refreshIndexesFromStorage();
-          incrementalChannel?.postMessage({
-            type: 'reconciled',
-            filesChanged: committedReconciliation.filesChanged,
-          });
-          if (committedReconciliation.dataCodesInvalidated) {
-            await requestDataCodeSync(false);
-          }
-          if (contentIndex || luaModuleIndex) {
-            await runContentSync(false);
-          }
         } else if (debugApi.reconciliationStatus === 'running') {
           debugApi.reconciliationStatus = 'error';
         }
@@ -864,6 +909,7 @@ async function start(): Promise<void> {
         let result: Awaited<ReturnType<typeof reconcileWikiMirror>> | undefined;
         let catchUpResult: Awaited<ReturnType<typeof syncRecentChanges>> | undefined;
         let catchUpError: unknown;
+        let committedDataResult: SyncAttemptResult | undefined;
         const coordinated = await coordinator.runExclusive(async () => {
           result = await reconcileWikiMirror(database, api, fallbackAnalyzer, {
             force,
@@ -881,6 +927,9 @@ async function start(): Promise<void> {
             }
           }
         });
+        if (result?.status === 'complete' || result?.status === 'login-required') {
+          committedDataResult = await applyCommittedReconciliationAfterRelease();
+        }
         if (coordinated === 'lock-unavailable') {
           debugApi.reconciliationStatus = 'lock-unavailable';
           return { status: 'lock-unavailable' } as const;
@@ -913,16 +962,8 @@ async function start(): Promise<void> {
         debugApi.reconciliationCompletedAt = (
           await readReconciliationSyncState(database)
         )?.completedAt;
-        await refreshIndexesFromStorage();
-        incrementalChannel?.postMessage({
-          type: 'reconciled',
-          throughLocalSeq: result.throughLocalSeq,
-          filesChanged: result.filesChanged,
-        });
-        if (
-          result.dataCodesInvalidated ||
-          (catchUpResult?.status === 'complete' && catchUpResult.dataCodesInvalidated)
-        ) {
+        if (committedDataResult?.status === 'error') return committedDataResult;
+        if (catchUpResult?.status === 'complete' && catchUpResult.dataCodesInvalidated) {
           const dataResult = await requestDataCodeSync(false);
           if (dataResult.status === 'error') return dataResult;
         }
@@ -947,6 +988,7 @@ async function start(): Promise<void> {
         }
         return { status: 'complete' } as const;
       } catch (error) {
+        await applyCommittedReconciliationAfterRelease();
         debugApi.reconciliationStatus = 'error';
         const message = error instanceof Error ? error.message : String(error);
         panel.setStatus(`全量对账暂停，本地已有内容仍可搜索：${message}`, 'error');
@@ -1224,18 +1266,13 @@ async function start(): Promise<void> {
   async function rebuildSearchIndexes(): Promise<void> {
     assertWritesAllowed();
     await Promise.all([
-      ensureEnhancedTitleStarted(),
-      ensureDerivedSearchStarted('content'),
-      ensureDerivedSearchStarted('lua'),
+      titlePreparation.waitForActiveLocal(),
+      contentPreparation.waitForActiveLocal(),
+      luaPreparation.waitForActiveLocal(),
     ]);
-    if (!analyzerResult || analyzerResult.engine === 'bootstrap') {
-      throw new Error('增强分词引擎尚未就绪');
-    }
-    let rebuilt: Awaited<ReturnType<typeof maintenance.rebuildSearchIndexes>> | undefined;
-    await runCoordinatedWriter('maintenance-index', async () => {
-      rebuilt = await maintenance.rebuildSearchIndexes(analyzerResult!.analyzer);
-    });
-    if (!rebuilt) throw new Error('本地搜索索引重建未返回结果');
+    const rebuilt = await analyzerPreparation.runLocal((loadedAnalyzer) =>
+      maintenance.rebuildSearchIndexes(loadedAnalyzer.analyzer),
+    );
     titleHandle = rebuilt.title;
     contentHandle = rebuilt.content;
     luaHandle = rebuilt.lua;

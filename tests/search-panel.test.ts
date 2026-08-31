@@ -7,6 +7,7 @@ import { SearchPanel } from '../src/ui/search-panel';
 
 afterEach(() => {
   document.querySelectorAll('#cu-wiki-search-host').forEach((host) => host.remove());
+  document.querySelector('#editor-focus-target')?.remove();
 });
 
 describe('SearchPanel file resource mode', () => {
@@ -315,6 +316,62 @@ describe('SearchPanel startup recovery', () => {
     expect(callbacks.refresh).not.toHaveBeenCalled();
     expect(callbacks.refreshFiles).not.toHaveBeenCalled();
     expect(root.querySelector('.status')?.textContent).toContain('IndexedDB 无法打开');
+  });
+});
+
+describe('SearchPanel keyboard lifecycle', () => {
+  it('leaves Escape to the active IME and restores the editor focus when closing later', () => {
+    const editor = document.createElement('textarea');
+    editor.id = 'editor-focus-target';
+    document.body.append(editor);
+    editor.focus();
+    const panel = new SearchPanel(maintenanceCallbacks());
+    const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    const input = root?.querySelector<HTMLInputElement>('.query');
+    const panelElement = root?.querySelector<HTMLElement>('.panel');
+    if (!root || !input || !panelElement) throw new Error('搜索面板没有挂载');
+
+    panel.open();
+    input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+    expect(panelElement.hidden).toBe(false);
+
+    input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+    expect(panelElement.hidden).toBe(true);
+    expect(document.activeElement).toBe(editor);
+  });
+
+  it('keeps editor focus established by a mouse result action', () => {
+    const editor = document.createElement('textarea');
+    editor.id = 'editor-focus-target';
+    document.body.append(editor);
+    const result: TitleSearchResult = {
+      id: 1,
+      title: '12号鹿弹',
+      namespace: 0,
+      namespaceName: '',
+      score: 100,
+    };
+    const callbacks = maintenanceCallbacks({
+      search: vi.fn(() => [result]),
+      insert: vi.fn(() => editor.focus()),
+    });
+    const panel = new SearchPanel(callbacks);
+    const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    const toggle = root?.querySelector<HTMLButtonElement>('.toggle');
+    const input = root?.querySelector<HTMLInputElement>('.query');
+    if (!root || !toggle || !input) throw new Error('搜索面板没有挂载');
+
+    toggle.click();
+    input.value = '鹿弹';
+    panel.refreshResults();
+    root.querySelector<HTMLButtonElement>('.insert')?.click();
+
+    expect(callbacks.insert).toHaveBeenCalledWith(result, '鹿弹');
+    expect(document.activeElement).toBe(editor);
   });
 });
 

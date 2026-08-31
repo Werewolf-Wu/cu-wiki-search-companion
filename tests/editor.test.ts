@@ -13,6 +13,13 @@ describe('editor integration', () => {
     expect(wikiLink('12号鹿弹', '12号鹿弹')).toBe('[[12号鹿弹]]');
   });
 
+  it('creates ordinary links for Category and File namespaces', () => {
+    expect(wikiLink('分类:武器', '武器', 14)).toBe('[[:分类:武器|武器]]');
+    expect(wikiLink('文件:Item morphine.png', 'morphine', 6)).toBe(
+      '[[:文件:Item morphine.png|morphine]]',
+    );
+  });
+
   it('inserts into a native textarea selection', () => {
     const textarea = document.querySelector<HTMLTextAreaElement>('#wpTextbox1')!;
     textarea.setSelectionRange(1, 1);
@@ -37,6 +44,6 @@ describe('editor integration', () => {
     document.body.append(codeMirror);
 
     expect(insertAtEditorSelection('[[鹿弹]]')).toBe('codemirror');
-    expect(replaceSelection).toHaveBeenCalledWith('[[鹿弹]]', 'around', '+input');
+    expect(replaceSelection).toHaveBeenCalledWith('[[鹿弹]]', 'end', '+input');
   });
 });
