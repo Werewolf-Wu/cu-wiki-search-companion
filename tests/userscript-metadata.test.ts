@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 import { build } from 'vite';
 import nightlyWorkflow from '../.github/workflows/nightly.yml?raw';
+import packageManifestSource from '../package.json?raw';
 
 describe('userscript activation metadata', () => {
   it('builds edit/submit-only match patterns into both metadata headers', async () => {
@@ -23,7 +24,11 @@ describe('userscript activation metadata', () => {
         : new TextDecoder().decode(metaFile.source);
     const userMatches = metadataMatches(userScript.code);
     const metaMatches = metadataMatches(metaSource);
+    const packageVersion = (JSON.parse(packageManifestSource) as { version?: string }).version;
 
+    expect(packageVersion).toBe('0.3.0');
+    expect(metadataValue(userScript.code, 'version')).toBe(packageVersion);
+    expect(metadataValue(metaSource, 'version')).toBe(packageVersion);
     expect(metaMatches).toEqual(userMatches);
     expect(userMatches).not.toContain('https://casualtiesunknown.huijiwiki.com/*');
     for (const url of [
@@ -240,6 +245,13 @@ function metadataMatches(source: string): string[] {
   return source
     .split('\n')
     .flatMap((line) => /^\/\/ @match\s+(\S+)\s*$/.exec(line)?.[1] ?? []);
+}
+
+function metadataValue(source: string, key: string): string | undefined {
+  return source
+    .split('\n')
+    .map((line) => new RegExp(`^// @${key}\\s+(.+?)\\s*$`).exec(line)?.[1])
+    .find((value) => value !== undefined);
 }
 
 function matchesAnyPattern(url: string, patterns: string[]): boolean {

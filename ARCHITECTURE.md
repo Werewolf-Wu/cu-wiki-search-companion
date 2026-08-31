@@ -1,6 +1,6 @@
 # CU Wiki Search Companion 架构说明
 
-本文面向项目维护者与自动化开发工具。目标是让读者只依赖仓库内的公开材料，就能理解系统边界、数据所有权、启动时序、同步协议和修改时必须保持的不变量。
+本文对应 0.3.0 架构，面向项目维护者与自动化开发工具。目标是让读者只依赖仓库内的公开材料，就能理解系统边界、数据所有权、启动时序、同步协议和修改时必须保持的不变量。
 
 ## 1. 系统目标与核心约束
 
@@ -159,7 +159,8 @@ SearchPanel 按当前模式触发准备函数，单例 Promise 防止重复点�
 | file-resource-sync | namespace 6 独立基线 |
 | data-code-sync | Data 缓存时间、规则副本和格式版本 |
 | recent-changes-sync | RC through、重叠去重标记和文件变化序列 |
-| reconciliation-sync | 周期全量对账状态、generation 和起始栅栏 |
+| reconciliation-sync | 周期全量对账状态、scan protocol、独立 generation、throughLocalSeq 和起始栅栏 |
+| search-index-generation | 清除快照时原子推进的跨标签发布栅栏 |
 | incremental-sync-schedule | 多标签共享的 lastSuccessAt / nextDueAt |
 
 状态 key 是持久化协议的一部分。重命名或改变结构时必须通过版本契约或显式迁移处理。
@@ -195,9 +196,10 @@ WikiApi 封装同源 /api.php 查询：
 - 使用当前页面的 same-origin credentials，不保存或读取凭据。
 - HTTP 错误和 MediaWiki maxlag 按指数退避重试。
 - 服务器提供 Retry-After 时优先遵守秒数或 HTTP-date。
+- 每次尝试默认有 30 秒上限，范围同时覆盖 fetch、响应体读取与 JSON 解析；超时会 abort 底层请求，再由既有重试策略处理。
 - 权限错误在上层转换为 login-required，已有本地搜索保持可用。
 
-Data 代码使用站点的 /api/rest_v1/namespace/data，与页面事实流分开。
+Data 代码使用站点的 /api/rest_v1/namespace/data，与页面事实流分开，但复用同一个“完整请求生命周期”超时边界。
 
 ### 6.2 初始标题基线
 
@@ -206,7 +208,7 @@ syncTitles()：
 1. 读取 siteinfo namespace。
 2. 排除负 namespace 与文件 namespace 6。
 3. 对每个 namespace 使用 generator=allpages + prop=info，500 页一批，完整消费 gapcontinue。
-4. 每批在事务中比较旧事实，仅对有效变化分配新序列。
+4. 每批在事务中比较旧事实，仅对有效变化分配新序列；continuation、计数和完成状态从事务返回，只有 transaction promise 成功后才成为下一批的内存状态。
 5. 用 generation 标记本轮见过的页面。
 6. 全部 namespace 成功后，未被见到的旧页面写为 tombstone，再把状态置为 complete。
 
@@ -225,7 +227,7 @@ syncContent() 每批最多 50 页：
 5. 提交后才通知内存索引更新与其他标签刷新。
 6. 批次异常时把遗留 running jobs 恢复为 pending，以便重试。
 
-单条页面响应缺失时，该条 job 保持 failed 并显示在维护诊断中；整批请求抛错时，本批 running jobs 会统一恢复为 pending。重建正文队列只修复 jobs，不下载正文。
+单条页面响应缺失时，该条 job 保持 failed 并显示在维护诊断中；整批请求抛错时，本批 running jobs 会统一恢复为 pending。runtime 共享同一次在途正文尝试，但会保留并重新抛出原始失败，使按模式准备的远端 settlement 下次可以重试；已成功的本地索引准备不会因此重复。重建正文队列只修复 jobs，不下载正文。
 
 ### 6.4 RecentChanges 增量同步
 
@@ -241,6 +243,8 @@ syncRecentChanges() 需要完整标题基线：
 
 RC 游标只能随事实提交。不能先推进游标再写页面，否则刷新或失败会永久漏掉变化。
 
+自动 RC 与全量对账后的手动 RC catch-up 使用同一个锁后提交处理器：先按已提交 throughLocalSeq 刷新当前标签已经加载的索引，再广播页面、文件和 Data 失效标记。锁内只维护事实；派生刷新失败不会延长或回滚事实事务。
+
 ### 6.5 周期全量对账
 
 RC 不是永久完整日志，因此 reconcileWikiMirror() 约每 24 小时、检测到 RC 缺口或用户手动要求时运行：
@@ -248,6 +252,8 @@ RC 不是永久完整日志，因此 reconcileWikiMirror() 约每 24 小时、�
 - 枚举当前全部 namespace 的 pageid + lastrevid + contentmodel。
 - 如果文件基线已存在，也对账 namespace 6。
 - 记录 startLocalSeq 作为并发栅栏；对账期间被较新写者更新的页面不允许被旧批次覆盖。
+- scan protocol 2 使用独立 seenInReconciliation 标记，绝不复用标题或文件同步 generation。旧协议留下的 running/failed 状态会从新的服务器 fence 重启，只有同协议 continuation 才能续传。
+- 每个成功批次原子保存 continuation、throughLocalSeq、页面事实和 Data 失效状态；外层恢复状态只在事务提交后更新。事务 abort 不得把未提交游标写进 failed 状态。
 - generation 收尾只 tombstone 在本轮未见且未越过栅栏的旧事实。
 - 同时修复正文 jobs、文件事实、Data 缓存失效状态。
 - 完成时把 RC 基线推进到对账开始的服务器时间，随后立即做一次 RC catch-up。
@@ -260,6 +266,7 @@ RC 不是永久完整日志，因此 reconcileWikiMirror() 约每 24 小时、�
 
 - 仅首次进入文件模式时恢复 fileResources 并同步。
 - gapnamespace=6、500 页一批，成功完成后清理 stale 项。
+- continuation、计数与 complete/prune 状态只在对应 Dexie transaction promise 成功后推进；callback 已返回但事务最终 abort 时必须保留上一份已提交状态。
 - 使用轻量 LinearTitleIndex，无索引快照。
 - 不进入普通 pages、标题或正文结果。
 
@@ -269,6 +276,7 @@ Data 代码：
 - 字段规则决定 REST projection 和可搜索标量值。
 - 缓存兼容性同时检查规则文本与 Data index format。
 - 规则保存在 GM preference，data-code-sync 只保存副本用于缓存判断。
+- 页面进入或离开 Data namespace 都会使派生缓存失效。REST 刷新失败、标签转入后台或其他标签广播失效时，待办会保留到下次可见机会；成功的 data-committed 通知才清除待办。
 
 ## 7. 多标签协调
 
@@ -281,8 +289,9 @@ Data 代码：
 
 BroadcastChannel cu-wiki-local-search:changes:v1 只做失效通知：
 
-- committed / reconciled / content-committed：可见标签按 localSeq 刷新已加载索引。
+- committed / reconciled / content-committed：可见标签按 localSeq 刷新已加载索引；消息携带文件与 Data 派生失效标记。
 - files-committed：文件模式已加载时刷新文件缓存。
+- data-committed：刷新已加载 Data 缓存，并确认此前失效待办已完成。
 - reset：其他标签关闭数据库并 reload，避免旧在途写入在数据库删除后复活。
 
 通知不能替代事务、游标或 Web Lock。隐藏标签只记录“存储已失效”，恢复可见时再读取；通知也绝不能导致冷加载 jieba 或正文、Lua、文件索引。
@@ -384,12 +393,13 @@ VersionedSearchIndexCache 是 title/content/lua 三类快照的唯一入口：
 
 发布先冻结候选序列、文档数和 JSON，再检查：
 
+- handle 的 snapshot generation 仍等于 IndexedDB 中的 search-index-generation。
 - 单类 payload 不超过 64 MiB。
 - 估算剩余配额至少为 payload 的 1.2 倍。
 - 写事务中的当前全局序列仍等于候选序列。
 - 同 compatibility key 下，已有快照序列不得高于或等于候选。
 
-序列在构建期间变化时拒绝旧候选，刷新 handle 后重新防抖。搜索不依赖发布成功；容量或配额不足只显示提示。
+已有同兼容版本且不低于候选序列的快照会在 JSON 序列化和配额检查前直接返回 not-newer，避免把无需写入误报成低配额。序列在构建期间变化时拒绝旧候选，刷新 handle 后重新防抖。clear() 在一个事务中推进 generation 并删除三类 key，因此其他标签的旧 handle 即使稍后醒来也无法回写；维护界面的显式重建会取得新 generation 的 handle。搜索不依赖发布成功；容量或配额不足只显示提示，维护界面会明确说明内存索引仍可用。
 
 ## 11. UI、编辑器与维护
 
@@ -397,11 +407,13 @@ SearchPanel 挂在开放 Shadow DOM 中，隔离站点 CSS。快捷键为 Alt+K�
 
 结果主动作按类型区分：
 
-- 页面标题与文件：插入以查询词为显示文本的 Wiki 链接。
+- 页面标题与文件：插入以查询词为显示文本的 Wiki 链接。Category 与 File namespace 必须使用前导冒号，生成普通链接而不是分类页面或嵌入文件。
 - 页面正文：插入以页面标题为显示文本的 Wiki 链接，通常简化为普通页面链接。
 - Lua：打开对应模块页，行内显示命中符号类型。
 - Data：复制代码名，另可打开来源页。
 - 文件：作为页面链接插入、复制或打开。
+
+CodeMirror 5 用 replaceSelection 后把光标显式放到插入内容之后，确保下一次输入不会覆盖刚插入的链接。面板关闭会避开仍在 composition 的 IME 事件；主动作已经把焦点移到新目标时，关闭逻辑不会再抢回旧焦点。
 
 “重新同步本地数据”按顺序执行联网全量对账、Data 刷新与正文/Lua 队列续传；它不清空本地镜像，也不修改 Wiki 页面。文件按钮只处理文件命名空间。
 
@@ -426,7 +438,9 @@ SearchPanel 挂在开放 Shadow DOM 中，隔离站点 CSS。快捷键为 Alt+K�
 - jieba 失败：降级 Intl.Segmenter。
 - 快照损坏：删除单类快照并本地重建；版本过旧：忽略旧记录并本地重建，待发布时覆盖；两者都不联网。
 - 正文批次失败：running jobs 回 pending；已提交批次保留。
-- 对账后 catch-up 失败：对账事实不回滚，RC 稍后重试。
+- 正文 settlement 失败：错误保持可观察，下一次正文/Lua 准备会重试，不把失败 promise 永久缓存成成功。
+- 对账后 catch-up 失败：对账事实不回滚；已提交 RC 仍先在锁外刷新/广播，失败阶段稍后重试。
+- Data REST 失败：保留旧 Data 搜索结果与 pending 标记，下一次可见机会或其他标签提交后继续处理。
 - Storage API 不支持、拒绝或抛错：只显示行内提示。
 - 未来事实版本：停止所有后台写入，不自动降级或清库。
 
@@ -452,6 +466,7 @@ SearchPanel 挂在开放 Shadow DOM 中，隔离站点 CSS。快捷键为 Alt+K�
 关键回归必须覆盖：
 
 - facts + localSeq + cursor 的原子性。
+- transaction callback 已结束但最终 abort 时，外层 continuation/complete 状态仍停在上一份已提交值。
 - RC continuation、重叠与 rcid 去重。
 - 对账栅栏不会覆盖更新事实。
 - snapshot 恢复与全量重建结果完全一致。
@@ -459,6 +474,10 @@ SearchPanel 挂在开放 Shadow DOM 中，隔离站点 CSS。快捷键为 Alt+K�
 - 旧标签不能以较低序列覆盖较新快照。
 - 冷启动不读重型派生数据。
 - 搜索域之间没有结果泄漏。
+
+### 13.1 发布自动化不变量
+
+push 工作流先在只读权限 job 中安装锁定依赖、运行测试和生产构建，再生成带 SHA-256 的资产。main 的滚动 Nightly job 按同一 ref 排队而不取消正在发布的任务；既有 release 的更新顺序固定为“上传已验证资产 → 成功编辑说明与 target → 最后 PATCH rolling tag”。若 release edit 失败，tag 必须仍指向上一次成功 Nightly，使下一次提交列表的比较基线不被污染。回归测试会在临时 Git 历史上实际执行这段 workflow shell，并用有状态的假 gh 验证失败与重试顺序。
 
 ## 14. 修改导航
 
