@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 // @vitest-environment jsdom
+import 'fake-indexeddb/auto';
+
 import installUserscriptSource from '../scripts/install-userscript.playwright.js?raw';
 import testMaintenanceSource from '../scripts/test-maintenance.playwright.js?raw';
 import testReconciliationSource from '../scripts/test-reconciliation.playwright.js?raw';
+import { WikiSearchDatabase } from '../src/storage/database';
 
 type RunCodeScript = (page: unknown) => Promise<unknown>;
 const BrowserURL = globalThis.URL;
@@ -81,7 +84,7 @@ describe('browser tooling scripts', () => {
 
   it('runs reconciliation after removing the probe page and completes the acceptance flow', async () => {
     const reconcile = await loadRunCodeScript('test-reconciliation.playwright.js');
-    const page = new ReconciliationPage();
+    const page = await ReconciliationPage.create();
 
     await expect(reconcile(page)).resolves.toMatchObject({
       selected: { id: 42, title: '地下水', revisionId: 420 },
@@ -89,6 +92,79 @@ describe('browser tooling scripts', () => {
     });
     expect(page.forceSyncCalls).toBe(1);
     expect(page.cleanupRestores).toBe(0);
+  });
+
+  it('does not restore the probe backup when reconciliation commits before forceSync rejects', async () => {
+    const reconcile = await loadRunCodeScript('test-reconciliation.playwright.js');
+    const page = await ReconciliationPage.create({ rejectAfterCommit: true });
+
+    await expect(reconcile(page)).rejects.toThrow('模拟对账提交后的收尾失败');
+
+    expect(page.forceSyncCalls).toBe(1);
+    expect(page.cleanupRestores).toBe(0);
+    await expect(page.readProbePage()).resolves.toMatchObject({
+      id: 42,
+      revisionId: 420,
+      localSeq: 11,
+    });
+    expect(page.requestListenerAttached).toBe(false);
+  });
+
+  it('restores the probe backup when forceSync rejects before any durable change', async () => {
+    const reconcile = await loadRunCodeScript('test-reconciliation.playwright.js');
+    const page = await ReconciliationPage.create({ rejectBeforeCommit: true });
+
+    await expect(reconcile(page)).rejects.toThrow('模拟对账提交前失败');
+
+    expect(page.cleanupRestores).toBe(1);
+    await expect(page.readProbePage()).resolves.toMatchObject({
+      id: 42,
+      revisionId: 420,
+      localSeq: 10,
+    });
+    expect(page.requestListenerAttached).toBe(false);
+  });
+
+  it('does not mistake an unchanged prior complete state for this reconciliation run', async () => {
+    const reconcile = await loadRunCodeScript('test-reconciliation.playwright.js');
+    const page = await ReconciliationPage.create({ resolveWithoutCommit: true });
+
+    await expect(reconcile(page)).rejects.toThrow('对账没有补回本地缺页');
+
+    expect(page.cleanupRestores).toBe(1);
+    await expect(page.readProbePage()).resolves.toMatchObject({
+      id: 42,
+      revisionId: 420,
+      localSeq: 10,
+    });
+    expect(page.requestListenerAttached).toBe(false);
+  });
+
+  it('does not restore the probe backup after another writer advances local facts', async () => {
+    const reconcile = await loadRunCodeScript('test-reconciliation.playwright.js');
+    const page = await ReconciliationPage.create({ advanceSequenceBeforeReject: true });
+
+    await expect(reconcile(page)).rejects.toThrow('模拟其他写者提交后的失败');
+
+    expect(page.cleanupRestores).toBe(0);
+    await expect(page.readProbePage()).resolves.toBeUndefined();
+    await expect(page.readLocalSequence()).resolves.toBe(11);
+    expect(page.requestListenerAttached).toBe(false);
+  });
+
+  it('does not overwrite a probe page restored by another writer at a newer revision', async () => {
+    const reconcile = await loadRunCodeScript('test-reconciliation.playwright.js');
+    const page = await ReconciliationPage.create({ replaceProbeBeforeReject: true });
+
+    await expect(reconcile(page)).rejects.toThrow('模拟探针事实更新后的失败');
+
+    expect(page.cleanupRestores).toBe(0);
+    await expect(page.readProbePage()).resolves.toMatchObject({
+      id: 42,
+      revisionId: 421,
+      localSeq: 11,
+    });
+    expect(page.requestListenerAttached).toBe(false);
   });
 
   it('waits for a terminal persistence result before maintenance acceptance completes', async () => {
@@ -253,10 +329,72 @@ class InstallControl {
   }
 }
 
+interface ReconciliationPageOptions {
+  advanceSequenceBeforeReject?: boolean;
+  rejectAfterCommit?: boolean;
+  rejectBeforeCommit?: boolean;
+  replaceProbeBeforeReject?: boolean;
+  resolveWithoutCommit?: boolean;
+}
+
 class ReconciliationPage {
   forceSyncCalls = 0;
   cleanupRestores = 0;
+  private cleanupPending = false;
   private requestListener?: (request: { url(): string }) => void;
+
+  private constructor(private readonly options: ReconciliationPageOptions) {}
+
+  static async create(
+    options: ReconciliationPageOptions = {},
+  ): Promise<ReconciliationPage> {
+    const database = new WikiSearchDatabase();
+    await database.open();
+    await database.transaction(
+      'rw',
+      database.pages,
+      database.jobs,
+      database.syncState,
+      async () => {
+        await Promise.all([
+          database.pages.clear(),
+          database.jobs.clear(),
+          database.syncState.clear(),
+        ]);
+        await database.pages.put({
+          id: 42,
+          title: '地下水',
+          normalizedTitle: '地下水',
+          namespace: 0,
+          namespaceName: '',
+          revisionId: 420,
+          isRedirect: true,
+          deleted: false,
+          localSeq: 10,
+          seenInTitleSync: 100,
+        });
+        await database.syncState.bulkPut([
+          { key: 'local-sequence', value: 10 },
+          {
+            key: 'reconciliation-sync',
+            value: {
+              status: 'complete',
+              generation: 100,
+              completedAt: 1_000,
+            },
+          },
+        ]);
+      },
+    );
+    database.close();
+    const page = new ReconciliationPage(options);
+    page.setDebugState('complete', 1_000);
+    return page;
+  }
+
+  get requestListenerAttached(): boolean {
+    return this.requestListener !== undefined;
+  }
 
   async waitForFunction(): Promise<void> {}
 
@@ -272,71 +410,164 @@ class ReconciliationPage {
 
   async evaluate<T>(callback: (...args: never[]) => T, argument?: unknown): Promise<T> {
     const source = callback.toString();
-    if (source.includes('const preferred = pages.find')) {
-      return {
-        debug: {
-          engine: 'bootstrap',
-          indexedPages: 10,
-          indexedFiles: 0,
-          indexedContentPages: 0,
-          indexedLuaModules: 0,
-          incrementalStatus: 'idle',
-          reconciliationStatus: 'idle',
-        },
-        selected: {
-          id: 42,
-          title: '地下水',
-          revisionId: 420,
-          isRedirect: true,
-          deleted: false,
-          content: undefined,
-        },
-        selectedJobs: [],
-        pageCount: 10,
-      } as T;
-    }
-    if (source.includes("objectStore('pages').delete(pageId)")) {
-      expect(argument).toBe(42);
-      return undefined as T;
-    }
     if (source.includes('__CU_WIKI_SEARCH__.forceSync()')) {
       this.forceSyncCalls += 1;
       this.requestListener?.({
         url: () =>
           'https://casualtiesunknown.huijiwiki.com/api.php?action=query&generator=allpages&assert=user&gaplimit=500&prop=info&gapnamespace=0',
       });
+      if (this.options.advanceSequenceBeforeReject) {
+        await this.commitOtherFact();
+        this.cleanupPending = true;
+        throw new Error('模拟其他写者提交后的失败');
+      }
+      if (this.options.replaceProbeBeforeReject) {
+        await this.commitNewerProbeFact();
+        this.cleanupPending = true;
+        throw new Error('模拟探针事实更新后的失败');
+      }
+      if (this.options.rejectBeforeCommit) {
+        this.cleanupPending = true;
+        throw new Error('模拟对账提交前失败');
+      }
+      if (this.options.resolveWithoutCommit) {
+        this.cleanupPending = true;
+        return undefined as T;
+      }
+      await this.commitReconciliation();
+      if (this.options.rejectAfterCommit) {
+        this.cleanupPending = true;
+        throw new Error('模拟对账提交后的收尾失败');
+      }
       return undefined as T;
     }
-    if (source.includes('const [page, jobs, reconciliation, recent, sequence]')) {
-      expect(argument).toBe(42);
-      return {
-        debug: {
-          engine: 'bootstrap',
-          indexedPages: 10,
-          indexedFiles: 0,
-          indexedContentPages: 0,
-          indexedLuaModules: 0,
-          incrementalStatus: 'complete',
-          reconciliationStatus: 'complete',
-        },
-        page: {
-          id: 42,
-          title: '地下水',
-          revisionId: 420,
-          isRedirect: true,
-          deleted: false,
-        },
-        selectedJobs: [],
-        reconciliation: { status: 'complete', pagesFetched: 10 },
-        recent: { through: 'cursor' },
-        sequence: 11,
-      } as T;
+
+    const beforeCleanup = this.cleanupPending ? await this.readProbePage() : undefined;
+    try {
+      return await (
+        callback as unknown as (value?: unknown) => T | Promise<T>
+      )(argument);
+    } finally {
+      if (this.cleanupPending) {
+        const afterCleanup = await this.readProbePage();
+        if (
+          beforeCleanup?.localSeq !== 10 &&
+          afterCleanup?.localSeq === 10
+        ) {
+          this.cleanupRestores += 1;
+        }
+      }
     }
-    if (source.includes("transaction.objectStore('pages').put(backup.selected)")) {
-      this.cleanupRestores += 1;
-      return undefined as T;
-    }
-    throw new Error(`Unexpected reconciliation evaluate call: ${source.slice(0, 100)}`);
+  }
+
+  async readProbePage(): Promise<
+    { id: number; revisionId?: number; localSeq: number } | undefined
+  > {
+    const database = new WikiSearchDatabase();
+    const page = await database.pages.get(42);
+    database.close();
+    return page;
+  }
+
+  async readLocalSequence(): Promise<number | undefined> {
+    const database = new WikiSearchDatabase();
+    const sequence = await database.syncState.get('local-sequence');
+    database.close();
+    return sequence?.value as number | undefined;
+  }
+
+  private async commitOtherFact(): Promise<void> {
+    const database = new WikiSearchDatabase();
+    await database.transaction('rw', database.pages, database.syncState, async () => {
+      await database.pages.put({
+        id: 99,
+        title: '并发事实',
+        normalizedTitle: '并发事实',
+        namespace: 0,
+        namespaceName: '',
+        revisionId: 990,
+        isRedirect: false,
+        deleted: false,
+        localSeq: 11,
+        seenInTitleSync: 100,
+      });
+      await database.syncState.put({ key: 'local-sequence', value: 11 });
+    });
+    database.close();
+  }
+
+  private async commitNewerProbeFact(): Promise<void> {
+    const database = new WikiSearchDatabase();
+    await database.transaction('rw', database.pages, database.syncState, async () => {
+      await database.pages.put({
+        id: 42,
+        title: '地下水（新事实）',
+        normalizedTitle: '地下水（新事实）',
+        namespace: 0,
+        namespaceName: '',
+        revisionId: 421,
+        isRedirect: true,
+        deleted: false,
+        localSeq: 11,
+        seenInTitleSync: 100,
+      });
+      await database.syncState.put({ key: 'local-sequence', value: 11 });
+    });
+    database.close();
+  }
+
+  private async commitReconciliation(): Promise<void> {
+    const database = new WikiSearchDatabase();
+    await database.transaction('rw', database.pages, database.syncState, async () => {
+      await database.pages.put({
+        id: 42,
+        title: '地下水',
+        normalizedTitle: '地下水',
+        namespace: 0,
+        namespaceName: '',
+        revisionId: 420,
+        isRedirect: true,
+        deleted: false,
+        localSeq: 11,
+        seenInTitleSync: 200,
+      });
+      await database.syncState.bulkPut([
+        { key: 'local-sequence', value: 11 },
+        {
+          key: 'recent-changes-sync',
+          value: { through: 'cursor', completedAt: 2_000, recentChanges: [] },
+        },
+        {
+          key: 'reconciliation-sync',
+          value: {
+            status: 'complete',
+            generation: 200,
+            completedAt: 2_000,
+            pagesFetched: 10,
+          },
+        },
+      ]);
+    });
+    database.close();
+    this.setDebugState('complete', 2_000);
+  }
+
+  private setDebugState(status: string, completedAt: number): void {
+    (
+      window as Window & {
+        __CU_WIKI_SEARCH__?: Record<string, unknown>;
+      }
+    ).__CU_WIKI_SEARCH__ = {
+      ready: true,
+      engine: 'bootstrap',
+      indexedPages: 10,
+      indexedFiles: 0,
+      indexedContentPages: 0,
+      indexedLuaModules: 0,
+      incrementalStatus: 'complete',
+      reconciliationStatus: status,
+      reconciliationCompletedAt: completedAt,
+    };
   }
 }
 

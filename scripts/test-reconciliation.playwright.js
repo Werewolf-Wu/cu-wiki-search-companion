@@ -6,9 +6,11 @@ async page => {
 
   const before = await page.evaluate(async () => {
     const database = await openDatabase();
-    const [pages, jobs] = await Promise.all([
+    const [pages, jobs, reconciliation, sequence] = await Promise.all([
       readAll(database, 'pages'),
       readAll(database, 'jobs'),
+      readOne(database, 'syncState', 'reconciliation-sync'),
+      readOne(database, 'syncState', 'local-sequence'),
     ]);
     database.close();
     const preferred = pages.find(
@@ -29,6 +31,8 @@ async page => {
       selected,
       selectedJobs: jobs.filter(job => job.pageId === selected.id),
       pageCount: pages.filter(page => !page.deleted).length,
+      reconciliation: reconciliation?.value,
+      sequence: typeof sequence?.value === 'number' ? sequence.value : 0,
     };
 
     function openDatabase() {
@@ -43,6 +47,15 @@ async page => {
       return new Promise((resolve, reject) => {
         const transaction = database.transaction(storeName, 'readonly');
         const request = transaction.objectStore(storeName).getAll();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    }
+
+    function readOne(database, storeName, key) {
+      return new Promise((resolve, reject) => {
+        const transaction = database.transaction(storeName, 'readonly');
+        const request = transaction.objectStore(storeName).get(key);
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(request.error);
       });
@@ -166,7 +179,10 @@ async page => {
         };
       }
     }, before.selected.id);
-    reconciliationCommitted = after.reconciliation?.status === 'complete';
+    reconciliationCommitted = isNewReconciliationCommit(
+      before.reconciliation,
+      after.reconciliation,
+    );
 
     if (!after.page || after.page.deleted) throw new Error('对账没有补回本地缺页');
     if (after.page.revisionId !== before.selected.revisionId) {
@@ -238,18 +254,61 @@ async page => {
     }
   } finally {
     page.off('request', onRequest);
+    let cleanupVerified = false;
     if (!completed && !reconciliationCommitted) {
+      try {
+        reconciliationCommitted = await page.evaluate(async previous => {
+          const database = await openDatabase();
+          try {
+            const current = await readOne(
+              database,
+              'syncState',
+              'reconciliation-sync',
+            );
+            return isNewComplete(previous, current?.value);
+          } finally {
+            database.close();
+          }
+
+          function openDatabase() {
+            return new Promise((resolve, reject) => {
+              const request = indexedDB.open('cu-wiki-local-search');
+              request.onsuccess = () => resolve(request.result);
+              request.onerror = () => reject(request.error);
+            });
+          }
+
+          function readOne(database, storeName, key) {
+            return new Promise((resolve, reject) => {
+              const transaction = database.transaction(storeName, 'readonly');
+              const request = transaction.objectStore(storeName).get(key);
+              request.onsuccess = () => resolve(request.result);
+              request.onerror = () => reject(request.error);
+            });
+          }
+
+          function isNewComplete(previous, current) {
+            return (
+              current?.status === 'complete' &&
+              (previous?.status !== 'complete' ||
+                current.generation !== previous.generation ||
+                current.completedAt !== previous.completedAt)
+            );
+          }
+        }, before.reconciliation);
+        cleanupVerified = true;
+      } catch {
+        // If the durable state cannot be checked, an old backup is not safe to write.
+      }
+    }
+    if (!completed && !reconciliationCommitted && cleanupVerified) {
       await page.evaluate(async backup => {
         const database = await openDatabase();
-        await new Promise((resolve, reject) => {
-          const transaction = database.transaction(['pages', 'jobs'], 'readwrite');
-          transaction.objectStore('pages').put(backup.selected);
-          for (const job of backup.selectedJobs) transaction.objectStore('jobs').put(job);
-          transaction.oncomplete = () => resolve();
-          transaction.onerror = () => reject(transaction.error);
-          transaction.onabort = () => reject(transaction.error);
-        });
-        database.close();
+        try {
+          await restoreIfUnchanged(database, backup);
+        } finally {
+          database.close();
+        }
 
         function openDatabase() {
           return new Promise((resolve, reject) => {
@@ -258,7 +317,72 @@ async page => {
             request.onerror = () => reject(request.error);
           });
         }
+
+        function restoreIfUnchanged(database, backup) {
+          return new Promise((resolve, reject) => {
+            const transaction = database.transaction(
+              ['pages', 'jobs', 'syncState'],
+              'readwrite',
+            );
+            const pages = transaction.objectStore('pages');
+            const jobs = transaction.objectStore('jobs');
+            const syncState = transaction.objectStore('syncState');
+            const pageRequest = pages.get(backup.selected.id);
+            const jobsRequest = jobs.getAll();
+            const reconciliationRequest = syncState.get('reconciliation-sync');
+            const sequenceRequest = syncState.get('local-sequence');
+            let readsRemaining = 4;
+            let restored = false;
+            const finishRead = () => {
+              readsRemaining -= 1;
+              if (readsRemaining !== 0) return;
+              const currentJobs = jobsRequest.result.filter(
+                job => job.pageId === backup.selected.id,
+              );
+              const currentSequence = sequenceRequest.result?.value ?? 0;
+              const committed = isNewComplete(
+                backup.reconciliation,
+                reconciliationRequest.result?.value,
+              );
+              if (
+                !committed &&
+                pageRequest.result === undefined &&
+                currentJobs.length === 0 &&
+                currentSequence === backup.sequence
+              ) {
+                pages.put(backup.selected);
+                for (const job of backup.selectedJobs) jobs.put(job);
+                restored = true;
+              }
+            };
+            pageRequest.onsuccess = finishRead;
+            jobsRequest.onsuccess = finishRead;
+            reconciliationRequest.onsuccess = finishRead;
+            sequenceRequest.onsuccess = finishRead;
+            transaction.oncomplete = () => resolve(restored);
+            transaction.onerror = () => reject(transaction.error);
+            transaction.onabort = () => reject(transaction.error);
+          });
+        }
+
+        function isNewComplete(previous, current) {
+          return (
+            current?.status === 'complete' &&
+            (previous?.status !== 'complete' ||
+              current.generation !== previous.generation ||
+              current.completedAt !== previous.completedAt)
+          );
+        }
       }, before);
     }
+  }
+
+  function isNewReconciliationCommit(previous, current) {
+    return (
+      current?.status === 'complete' &&
+      (previous?.status !== 'complete' ||
+        current.generation !== previous.generation ||
+        current.completedAt !== previous.completedAt)
+    );
   }
 }
