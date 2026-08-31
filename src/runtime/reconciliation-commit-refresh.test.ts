@@ -18,6 +18,26 @@ describe('CommittedReconciliationRefresh', () => {
     });
   });
 
+  it('broadcasts a committed Data invalidation to other tabs', async () => {
+    const broadcast = vi.fn();
+    const refresh = new CommittedReconciliationRefresh({
+      readState: async () =>
+        reconciliationState({ throughLocalSeq: 13, dataCodesInvalidated: true }),
+      lastAppliedSequence: () => 10,
+      refresh: async () => undefined,
+      broadcast,
+    });
+
+    await refresh.apply();
+
+    expect(broadcast).toHaveBeenCalledWith({
+      type: 'reconciled',
+      throughLocalSeq: 13,
+      filesChanged: false,
+      dataCodesInvalidated: true,
+    });
+  });
+
   it('re-exposes Data invalidation without a new local sequence so a failed refresh can retry', async () => {
     let lastApplied = 10;
     const refreshStorage = vi.fn(async () => {
@@ -170,6 +190,7 @@ describe('CommittedReconciliationRefresh', () => {
       type: 'reconciled',
       throughLocalSeq: 11,
       filesChanged: true,
+      dataCodesInvalidated: false,
     });
   });
 

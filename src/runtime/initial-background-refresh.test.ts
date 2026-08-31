@@ -61,4 +61,75 @@ describe('InitialBackgroundRefreshCoordinator', () => {
 
     expect(syncIncremental).toHaveBeenCalledOnce();
   });
+
+  it('retries a later Data invalidation on the next visible tick', async () => {
+    const incrementalResults = ['startup', 'changed', 'not-due'];
+    const observedIncremental: string[] = [];
+    const syncData = vi
+      .fn<() => Promise<boolean>>()
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const coordinator = new InitialBackgroundRefreshCoordinator({
+      canRun: () => true,
+      isVisible: () => true,
+      syncIncremental: async () => {
+        observedIncremental.push(incrementalResults.shift() ?? 'unexpected');
+      },
+      syncData,
+    });
+
+    await coordinator.request();
+    expect(coordinator.pending).toBe(false);
+
+    coordinator.markPending();
+    await coordinator.request();
+    expect(coordinator.pending).toBe(true);
+
+    await coordinator.request();
+
+    expect(observedIncremental).toEqual(['startup', 'changed', 'not-due']);
+    expect(syncData).toHaveBeenCalledTimes(3);
+    expect(coordinator.pending).toBe(false);
+  });
+
+  it('clears a pending invalidation after another refresh path succeeds', async () => {
+    const syncIncremental = vi.fn(async () => undefined);
+    const syncData = vi.fn(async () => true);
+    const coordinator = new InitialBackgroundRefreshCoordinator({
+      canRun: () => true,
+      isVisible: () => true,
+      syncIncremental,
+      syncData,
+    });
+
+    await coordinator.request();
+    coordinator.markPending();
+    expect(coordinator.pending).toBe(true);
+
+    coordinator.markComplete();
+    await coordinator.request();
+
+    expect(coordinator.pending).toBe(false);
+    expect(syncIncremental).toHaveBeenCalledOnce();
+    expect(syncData).toHaveBeenCalledOnce();
+  });
+
+  it('does not let an early external Data success skip the startup incremental pass', async () => {
+    const syncIncremental = vi.fn(async () => undefined);
+    const syncData = vi.fn(async () => true);
+    const coordinator = new InitialBackgroundRefreshCoordinator({
+      canRun: () => true,
+      isVisible: () => true,
+      syncIncremental,
+      syncData,
+    });
+
+    coordinator.markComplete();
+    await coordinator.request();
+
+    expect(syncIncremental).toHaveBeenCalledOnce();
+    expect(syncData).not.toHaveBeenCalled();
+    expect(coordinator.pending).toBe(false);
+  });
 });

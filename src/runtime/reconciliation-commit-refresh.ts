@@ -6,6 +6,7 @@ export interface ReconciliationCommitBroadcast {
   type: 'reconciled';
   throughLocalSeq: number;
   filesChanged: boolean;
+  dataCodesInvalidated: boolean;
 }
 
 export interface CommittedReconciliationRefreshOptions {
@@ -67,6 +68,7 @@ export class CommittedReconciliationRefresh {
           type: 'reconciled',
           throughLocalSeq: committedSequence,
           filesChanged: state.filesChanged,
+          dataCodesInvalidated: state.dataCodesInvalidated,
         });
         this.lastBroadcastSequence = committedSequence;
       } catch (error) {

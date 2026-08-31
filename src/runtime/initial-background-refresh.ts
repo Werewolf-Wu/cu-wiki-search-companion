@@ -13,25 +13,37 @@ export interface InitialBackgroundRefreshOptions {
  * document, a failed request, or a throttled timer made forward progress.
  */
 export class InitialBackgroundRefreshCoordinator {
-  private refreshPending = true;
+  private incrementalPending = true;
+  private dataRefreshPending = true;
   private active: Promise<void> | undefined;
 
   constructor(private readonly options: InitialBackgroundRefreshOptions) {}
 
   get pending(): boolean {
-    return this.refreshPending;
+    return this.incrementalPending || this.dataRefreshPending;
+  }
+
+  markPending(): void {
+    this.dataRefreshPending = true;
+  }
+
+  markComplete(): void {
+    this.dataRefreshPending = false;
   }
 
   request(): Promise<void> {
-    if (!this.refreshPending || !this.options.canRun() || !this.options.isVisible()) {
+    if (!this.pending || !this.options.canRun() || !this.options.isVisible()) {
       return Promise.resolve();
     }
     if (this.active) return this.active;
 
     const request = (async () => {
       await this.options.syncIncremental();
+      this.incrementalPending = false;
       if (!this.options.isVisible()) return;
-      if (await this.options.syncData()) this.refreshPending = false;
+      if (this.dataRefreshPending && (await this.options.syncData())) {
+        this.dataRefreshPending = false;
+      }
     })();
     const tracked = request.finally(() => {
       if (this.active === tracked) this.active = undefined;
