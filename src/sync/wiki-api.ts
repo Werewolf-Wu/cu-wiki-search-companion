@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
+import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  runWithRequestTimeout,
+} from './request-timeout';
+
 export interface WikiApiOptions {
   fetcher?: typeof fetch;
   retries?: number;
   baseDelayMs?: number;
+  requestTimeoutMs?: number;
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
@@ -27,12 +33,14 @@ export class WikiApi {
   private readonly fetcher: typeof fetch;
   private readonly retries: number;
   private readonly baseDelayMs: number;
+  private readonly requestTimeoutMs: number;
   private readonly sleep: (milliseconds: number) => Promise<void>;
 
   constructor(options: WikiApiOptions = {}) {
     this.fetcher = options.fetcher ?? fetch.bind(globalThis);
     this.retries = options.retries ?? 4;
     this.baseDelayMs = options.baseDelayMs ?? 1_000;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.sleep = options.sleep ?? delay;
   }
 
@@ -51,32 +59,39 @@ export class WikiApi {
     for (let attempt = 0; attempt <= this.retries; attempt += 1) {
       let retryAfterMs: number | undefined;
       try {
-        const response = await this.fetcher(`/api.php?${search.toString()}`, {
-          credentials: 'same-origin',
-          headers: { Accept: 'application/json' },
-        });
-        retryAfterMs = parseRetryAfter(response.headers.get('Retry-After'));
-        if (!response.ok) {
-          const loginRequired = response.status === 401 || response.status === 403;
-          throw new WikiApiError(
-            `Wiki API returned HTTP ${response.status}`,
-            `http-${response.status}`,
-            response.statusText || 'HTTP error',
-            !loginRequired,
-            response.status,
-          );
-        }
-        const payload = (await response.json()) as T & ApiErrorPayload;
-        if (payload.error) {
-          const code = payload.error.code ?? 'api-error';
-          const info = payload.error.info ?? 'unknown error';
-          throw new WikiApiError(
-            `${code}: ${info}`,
-            code,
-            info,
-            code === 'maxlag',
-          );
-        }
+        const payload = await runWithRequestTimeout(
+          async (signal) => {
+            const response = await this.fetcher(`/api.php?${search.toString()}`, {
+              credentials: 'same-origin',
+              headers: { Accept: 'application/json' },
+              signal,
+            });
+            retryAfterMs = parseRetryAfter(response.headers.get('Retry-After'));
+            if (!response.ok) {
+              const loginRequired = response.status === 401 || response.status === 403;
+              throw new WikiApiError(
+                `Wiki API returned HTTP ${response.status}`,
+                `http-${response.status}`,
+                response.statusText || 'HTTP error',
+                !loginRequired,
+                response.status,
+              );
+            }
+            const payload = (await response.json()) as T & ApiErrorPayload;
+            if (payload.error) {
+              const code = payload.error.code ?? 'api-error';
+              const info = payload.error.info ?? 'unknown error';
+              throw new WikiApiError(
+                `${code}: ${info}`,
+                code,
+                info,
+                code === 'maxlag',
+              );
+            }
+            return payload;
+          },
+          this.requestTimeoutMs,
+        );
         return payload;
       } catch (error) {
         lastError = error;

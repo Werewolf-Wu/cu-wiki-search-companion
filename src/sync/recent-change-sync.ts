@@ -292,7 +292,9 @@ export async function syncRecentChanges(
         sequence += 1;
         nextPage.localSeq = sequence;
         changedPages.push(nextPage);
-        if (nextPage.namespace === 3500) dataCodesInvalidated = true;
+        if (oldPage?.namespace === 3500 || nextPage.namespace === 3500) {
+          dataCodesInvalidated = true;
+        }
       }
       nextPages.set(nextPage.id, nextPage);
     }

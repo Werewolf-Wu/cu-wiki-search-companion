@@ -10,6 +10,7 @@ export interface PageRecord {
   /** Comparable global sequence for file-row writes; legacy file localSeq held revisions. */
   writerSeq?: number;
   seenInTitleSync: number;
+  seenInReconciliation?: number;
   deleted?: boolean;
   revisionId?: number;
   contentModel?: string;
@@ -115,6 +116,7 @@ export type ReconciliationReason = 'scheduled' | 'rc-gap' | 'manual';
 
 export interface ReconciliationSyncState {
   status: 'running' | 'complete' | 'failed';
+  scanProtocol: number;
   reason: ReconciliationReason;
   namespaceIds: number[];
   namespaceNames: Record<number, string>;
@@ -122,6 +124,7 @@ export interface ReconciliationSyncState {
   gapcontinue?: string;
   generation: number;
   startLocalSeq: number;
+  throughLocalSeq: number;
   serverStartedAt: string;
   pagesFetched: number;
   pagesChanged: number;
@@ -144,11 +147,19 @@ export type ReconciliationSyncResult =
       throughLocalSeq: number;
     }
   | {
-      status: 'not-due' | 'no-baseline' | 'login-required';
+      status: 'not-due' | 'no-baseline';
       pagesFetched: 0;
       pagesChanged: 0;
       filesChanged: false;
       dataCodesInvalidated: false;
+      throughLocalSeq: number;
+    }
+  | {
+      status: 'login-required';
+      pagesFetched: number;
+      pagesChanged: number;
+      filesChanged: boolean;
+      dataCodesInvalidated: boolean;
       throughLocalSeq: number;
     };
 

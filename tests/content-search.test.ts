@@ -432,6 +432,35 @@ describe('wikitext content search', () => {
     await database.delete();
   });
 
+  it('restores a claimed job after a stalled content request times out', async () => {
+    let requestSignal: AbortSignal | null | undefined;
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '超时页面', undefined, 10));
+    const api = new WikiApi({
+      retries: 0,
+      requestTimeoutMs: 10,
+      fetcher: vi.fn(
+        async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+          requestSignal = init?.signal;
+          return new Promise<Response>(() => undefined);
+        },
+      ) as typeof fetch,
+    });
+
+    await expect(syncContent(database, api, { requestIntervalMs: 0 })).rejects.toThrow(
+      '请求超时',
+    );
+
+    expect(requestSignal?.aborted).toBe(true);
+    expect(
+      await database.jobs.filter((job) => job.pageId === 1).first(),
+    ).toMatchObject({ status: 'pending', targetRevisionId: 10 });
+
+    database.close();
+    await database.delete();
+  });
+
   it('rejects a stale revision response without rolling cached content backward', async () => {
     const fetcher = vi.fn(async () =>
       json({

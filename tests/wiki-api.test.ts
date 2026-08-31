@@ -2,6 +2,85 @@
 import { isWikiLoginRequired, WikiApi, WikiApiError } from '../src/sync/wiki-api';
 
 describe('WikiApi retry behavior', () => {
+  it('times out and aborts a fetcher that never settles', async () => {
+    vi.useFakeTimers();
+    try {
+      let requestSignal: AbortSignal | null | undefined;
+      const fetcher = vi.fn(
+        async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+          requestSignal = init?.signal;
+          return new Promise<Response>(() => undefined);
+        },
+      );
+      const api = new WikiApi({
+        fetcher: fetcher as typeof fetch,
+        retries: 0,
+        requestTimeoutMs: 50,
+      });
+      const outcome = api.query({ list: 'allpages' }).then(
+        () => ({ status: 'resolved' as const }),
+        (error: unknown) => ({
+          status: 'rejected' as const,
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      const guard = new Promise<{ status: 'test-guard' }>((resolve) => {
+        setTimeout(() => resolve({ status: 'test-guard' }), 100);
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(Promise.race([outcome, guard])).resolves.toMatchObject({
+        status: 'rejected',
+        message: expect.stringContaining('请求超时'),
+      });
+      expect(requestSignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('times out when response headers arrive but the JSON body never finishes', async () => {
+    vi.useFakeTimers();
+    try {
+      let requestSignal: AbortSignal | null | undefined;
+      const fetcher = vi.fn(
+        async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+          requestSignal = init?.signal;
+          return new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        },
+      );
+      const api = new WikiApi({
+        fetcher: fetcher as typeof fetch,
+        retries: 0,
+        requestTimeoutMs: 50,
+      });
+      const outcome = api.query({ list: 'allpages' }).then(
+        () => ({ status: 'resolved' as const }),
+        (error: unknown) => ({
+          status: 'rejected' as const,
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      const guard = new Promise<{ status: 'test-guard' }>((resolve) => {
+        setTimeout(() => resolve({ status: 'test-guard' }), 100);
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(Promise.race([outcome, guard])).resolves.toMatchObject({
+        status: 'rejected',
+        message: expect.stringContaining('请求超时'),
+      });
+      expect(requestSignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('honors Retry-After when HTTP 429 is followed by success', async () => {
     const calls: URL[] = [];
     const waits: number[] = [];

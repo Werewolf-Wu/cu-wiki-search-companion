@@ -21,6 +21,7 @@ const LOCAL_SEQUENCE_KEY = 'local-sequence';
 const DATA_CODE_SYNC_KEY = 'data-code-sync';
 const CONTENT_JOB_TYPE = 'wikitext-content';
 const FILE_NAMESPACE = 6;
+const RECONCILIATION_SCAN_PROTOCOL = 2;
 const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 
 interface SiteInfoResponse {
@@ -84,17 +85,23 @@ export async function reconcileWikiMirror(
   }
 
   let state: ReconciliationSyncState;
-  if (existingState?.status === 'running' || existingState?.status === 'failed') {
+  const interruptedState =
+    existingState?.status === 'running' || existingState?.status === 'failed';
+  const canResume =
+    interruptedState && existingState.scanProtocol === RECONCILIATION_SCAN_PROTOCOL;
+  if (canResume) {
     state = { ...existingState, status: 'running', error: undefined };
     await database.syncState.put({ key: RECONCILIATION_SYNC_KEY, value: state });
   } else {
-    const reason = reconciliationReason(
-      options.force ?? false,
-      now(),
-      intervalMs,
-      existingState?.completedAt ?? titleState.completedAt ?? titleState.startedAt,
-      recentState?.through,
-    );
+    const reason = interruptedState
+      ? existingState.reason
+      : reconciliationReason(
+          options.force ?? false,
+          now(),
+          intervalMs,
+          existingState?.completedAt ?? titleState.completedAt ?? titleState.startedAt,
+          recentState?.through,
+        );
     if (!reason) return inactiveResult('not-due', initialSequence);
 
     let siteInfo: SiteInfoResponse;
@@ -115,6 +122,7 @@ export async function reconcileWikiMirror(
       .sort((left, right) => left.id - right.id);
     state = {
       status: 'running',
+      scanProtocol: RECONCILIATION_SCAN_PROTOCOL,
       reason,
       namespaceIds: namespaces.map(({ id }) => id),
       namespaceNames: Object.fromEntries(
@@ -126,6 +134,7 @@ export async function reconcileWikiMirror(
       namespaceIndex: 0,
       generation: now(),
       startLocalSeq: initialSequence,
+      throughLocalSeq: initialSequence,
       serverStartedAt: siteInfo.curtimestamp,
       pagesFetched: 0,
       pagesChanged: 0,
@@ -177,14 +186,14 @@ export async function reconcileWikiMirror(
               ? (oldPage?.writerSeq ?? 0) > state.startLocalSeq
               : (oldPage?.localSeq ?? 0) > state.startLocalSeq;
             if (oldPage && writtenAfterFence) {
-              return { ...oldPage, seenInTitleSync: state.generation };
+              return { ...oldPage, seenInReconciliation: state.generation };
             }
             const remoteRevisionIsOlder =
               oldPage?.revisionId !== undefined &&
               rawPage.lastrevid !== undefined &&
               oldPage.revisionId > rawPage.lastrevid;
             if (oldPage && remoteRevisionIsOlder) {
-              return { ...oldPage, seenInTitleSync: state.generation };
+              return { ...oldPage, seenInReconciliation: state.generation };
             }
             const revisionChanged = oldPage?.revisionId !== rawPage.lastrevid;
             const nextPage: PageRecord = {
@@ -197,10 +206,13 @@ export async function reconcileWikiMirror(
                 state.namespaceNames[rawPage.ns] ?? String(rawPage.ns),
               isRedirect: Boolean(rawPage.redirect),
               localSeq: oldPage?.localSeq ?? sequence,
-              seenInTitleSync: state.generation,
               deleted: false,
               revisionId: rawPage.lastrevid,
               contentModel: rawPage.contentmodel,
+              seenInTitleSync:
+                oldPage?.seenInTitleSync ??
+                (isFileBatch ? (fileState?.generation ?? 0) : titleState.generation),
+              seenInReconciliation: state.generation,
               ...(revisionChanged
                 ? { content: undefined, contentRevisionId: undefined }
                 : {}),
@@ -210,7 +222,9 @@ export async function reconcileWikiMirror(
               nextPage.localSeq = sequence;
               if (isFileBatch) nextPage.writerSeq = sequence;
               changed += 1;
-              if (rawPage.ns === 3500) dataChanged = true;
+              if (oldPage?.namespace === 3500 || rawPage.ns === 3500) {
+                dataChanged = true;
+              }
             }
             return nextPage;
           });
@@ -220,6 +234,7 @@ export async function reconcileWikiMirror(
             pagesChanged: state.pagesChanged + (isFileBatch ? 0 : changed),
             filesChanged: state.filesChanged || (isFileBatch && changed > 0),
             dataCodesInvalidated: state.dataCodesInvalidated || dataChanged,
+            throughLocalSeq: sequence,
             namespaceIndex: nextContinue
               ? state.namespaceIndex
               : state.namespaceIndex + 1,
@@ -228,6 +243,15 @@ export async function reconcileWikiMirror(
               : { gapcontinue: undefined }),
           };
           if (storedPages.length) await table.bulkPut(storedPages);
+          if (dataChanged) {
+            const dataCodeState = await database.syncState.get(DATA_CODE_SYNC_KEY);
+            if (dataCodeState?.value && typeof dataCodeState.value === 'object') {
+              await database.syncState.put({
+                key: DATA_CODE_SYNC_KEY,
+                value: { ...dataCodeState.value, syncedAt: 0 },
+              });
+            }
+          }
           await database.syncState.bulkPut([
             { key: LOCAL_SEQUENCE_KEY, value: sequence },
             { key: RECONCILIATION_SYNC_KEY, value: nextState },
@@ -256,7 +280,7 @@ export async function reconcileWikiMirror(
       throughLocalSeq: sequence,
     };
   } catch (error) {
-    if (isWikiLoginRequired(error)) return inactiveResult('login-required', initialSequence);
+    if (isWikiLoginRequired(error)) return loginRequiredResult(state);
     state = {
       ...state,
       status: 'failed',
@@ -288,7 +312,7 @@ async function finalizeReconciliation(
         .filter(
           (page) =>
             !page.deleted &&
-            page.seenInTitleSync !== state.generation &&
+            page.seenInReconciliation !== state.generation &&
             page.localSeq <= state.startLocalSeq,
         )
         .toArray();
@@ -307,7 +331,7 @@ async function finalizeReconciliation(
           .filter(
             (file) =>
               !file.deleted &&
-              file.seenInTitleSync !== state.generation &&
+              file.seenInReconciliation !== state.generation &&
               (file.writerSeq ?? 0) <= state.startLocalSeq,
           )
           .toArray();
@@ -389,6 +413,7 @@ async function finalizeReconciliation(
         pagesChanged,
         filesChanged,
         dataCodesInvalidated,
+        throughLocalSeq: sequence,
         completedAt,
         error: undefined,
       };
@@ -447,5 +472,16 @@ function inactiveResult(
     filesChanged: false,
     dataCodesInvalidated: false,
     throughLocalSeq,
+  };
+}
+
+function loginRequiredResult(state: ReconciliationSyncState): ReconciliationSyncResult {
+  return {
+    status: 'login-required',
+    pagesFetched: state.pagesFetched,
+    pagesChanged: state.pagesChanged,
+    filesChanged: state.filesChanged,
+    dataCodesInvalidated: state.dataCodesInvalidated,
+    throughLocalSeq: state.throughLocalSeq,
   };
 }

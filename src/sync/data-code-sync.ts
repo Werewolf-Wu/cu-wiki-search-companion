@@ -9,6 +9,10 @@ import {
 } from '../data/data-field-rules';
 import type { WikiSearchDatabase } from '../storage/database';
 import type { DataCodeRecord, DataCodeSyncState } from '../types';
+import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  runWithRequestTimeout,
+} from './request-timeout';
 import { delay } from './wiki-api';
 
 const DATA_CODE_SYNC_KEY = 'data-code-sync';
@@ -33,6 +37,7 @@ export interface DataCodeSyncOptions {
   force?: boolean;
   maxAgeMs?: number;
   fetcher?: typeof fetch;
+  requestTimeoutMs?: number;
   retries?: number;
   rulesSource?: string;
 }
@@ -73,10 +78,17 @@ export async function syncDataCodes(
   }
 
   const fetcher = options.fetcher ?? fetch.bind(globalThis);
+  const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const syncedAt = Date.now();
   const recordsBySource = new Map<string, DataCodeRecord>();
   for (let page = 1; page <= MAX_PAGES; page += 1) {
-    const response = await fetchMongoPage(fetcher, page, options.retries ?? 3, projection);
+    const response = await fetchMongoPage(
+      fetcher,
+      page,
+      options.retries ?? 3,
+      projection,
+      requestTimeoutMs,
+    );
     const records = parseDataCodeResponse(response, analyzer, syncedAt, rules);
     for (const record of records) recordsBySource.set(record.source, record);
     if (returnedCount(response) < PAGE_SIZE) break;
@@ -137,6 +149,7 @@ async function fetchMongoPage(
   page: number,
   retries: number,
   projection: Record<string, 1> | undefined,
+  requestTimeoutMs: number,
 ): Promise<MongoDataResponse> {
   const parameters = new URLSearchParams({
     page: String(page),
@@ -146,12 +159,18 @@ async function fetchMongoPage(
   let lastError: unknown;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      const response = await fetcher(`/api/rest_v1/namespace/data?${parameters}`, {
-        credentials: 'same-origin',
-        headers: { Accept: 'application/json' },
-      });
-      if (!response.ok) throw new Error(`Mongo Data API 返回 HTTP ${response.status}`);
-      return (await response.json()) as MongoDataResponse;
+      return await runWithRequestTimeout(
+        async (signal) => {
+          const response = await fetcher(`/api/rest_v1/namespace/data?${parameters}`, {
+            credentials: 'same-origin',
+            headers: { Accept: 'application/json' },
+            signal,
+          });
+          if (!response.ok) throw new Error(`Mongo Data API 返回 HTTP ${response.status}`);
+          return (await response.json()) as MongoDataResponse;
+        },
+        requestTimeoutMs,
+      );
     } catch (error) {
       lastError = error;
       if (attempt === retries) break;

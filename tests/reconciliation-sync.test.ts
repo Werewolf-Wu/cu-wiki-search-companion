@@ -5,6 +5,7 @@ import { cut, cut_for_search } from 'jieba-wasm/node';
 
 import { Analyzer } from '../src/analyzer/analyzer';
 import { WikiSearchDatabase } from '../src/storage/database';
+import { syncFileResources } from '../src/sync/file-resource-sync';
 import { reconcileWikiMirror } from '../src/sync/reconciliation-sync';
 import { WikiApi } from '../src/sync/wiki-api';
 import type { PageRecord, TitleSyncState } from '../src/types';
@@ -243,6 +244,241 @@ describe('full mirror reconciliation', () => {
     await destroy(database);
   });
 
+  it('keeps files scanned by an interrupted reconciliation after a forced file refresh', async () => {
+    const database = await databaseWithBaseline([
+      page({ id: 1, title: '主页', revisionId: 10, localSeq: 1 }),
+    ]);
+    await database.fileResources.bulkPut([
+      page({
+        id: 6001,
+        title: '文件:A.png',
+        namespace: 6,
+        namespaceName: '文件',
+        revisionId: 61,
+        localSeq: 61,
+        writerSeq: 1,
+      }),
+      page({
+        id: 6002,
+        title: '文件:B.png',
+        namespace: 6,
+        namespaceName: '文件',
+        revisionId: 62,
+        localSeq: 62,
+        writerSeq: 2,
+      }),
+    ]);
+    await database.syncState.put({
+      key: 'file-resource-sync',
+      value: {
+        status: 'complete',
+        namespaceIds: [6],
+        namespaceNames: { 6: '文件' },
+        namespaceIndex: 1,
+        generation: 10,
+        pagesFetched: 2,
+        startedAt: now - 1_000,
+        completedAt: now,
+      } satisfies TitleSyncState,
+    });
+    const interruptedApi = new WikiApi({
+      retries: 0,
+      fetcher: vi.fn(async (input: RequestInfo | URL) => {
+        const parameters = new URL(String(input), 'https://example.test').searchParams;
+        if (parameters.get('meta') === 'siteinfo') {
+          return json({
+            curtimestamp: '2026-08-31T06:00:05Z',
+            query: {
+              namespaces: {
+                0: { id: 0, name: '' },
+                6: { id: 6, name: '文件' },
+                10: { id: 10, name: '模板' },
+              },
+            },
+          });
+        }
+        const namespace = Number(parameters.get('gapnamespace'));
+        if (namespace === 0) {
+          return json({
+            query: {
+              pages: [
+                { pageid: 1, ns: 0, title: '主页', lastrevid: 10, contentmodel: 'wikitext' },
+              ],
+            },
+          });
+        }
+        if (namespace === 6) {
+          return json({
+            query: {
+              pages: [
+                {
+                  pageid: 6001,
+                  ns: 6,
+                  title: '文件:A.png',
+                  lastrevid: 61,
+                  contentmodel: 'wikitext',
+                },
+                {
+                  pageid: 6002,
+                  ns: 6,
+                  title: '文件:B.png',
+                  lastrevid: 62,
+                  contentmodel: 'wikitext',
+                },
+              ],
+            },
+          });
+        }
+        throw new Error('后续命名空间中断');
+      }) as typeof fetch,
+    });
+
+    await expect(
+      reconcileWikiMirror(database, interruptedApi, analyzer, {
+        force: true,
+        now: () => now,
+        requestIntervalMs: 0,
+      }),
+    ).rejects.toThrow('后续命名空间中断');
+
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now + 1_000);
+    try {
+      const fileApi = new WikiApi({
+        retries: 0,
+        fetcher: vi.fn(async () =>
+          json({
+            query: {
+              pages: [
+                {
+                  pageid: 6001,
+                  ns: 6,
+                  title: '文件:A.png',
+                  lastrevid: 61,
+                  contentmodel: 'wikitext',
+                },
+                {
+                  pageid: 6002,
+                  ns: 6,
+                  title: '文件:B.png',
+                  lastrevid: 62,
+                  contentmodel: 'wikitext',
+                },
+              ],
+            },
+          }),
+        ) as typeof fetch,
+      });
+      await syncFileResources(database, fileApi, analyzer, {
+        force: true,
+        requestIntervalMs: 0,
+      });
+    } finally {
+      dateNow.mockRestore();
+    }
+
+    const resumedApi = new WikiApi({
+      retries: 0,
+      fetcher: vi.fn(async () => json({ query: { pages: [] } })) as typeof fetch,
+    });
+    await reconcileWikiMirror(database, resumedApi, analyzer, {
+      now: () => now + 2_000,
+      requestIntervalMs: 0,
+    });
+
+    expect(await database.fileResources.orderBy('id').toArray()).toEqual([
+      expect.objectContaining({ id: 6001, deleted: false }),
+      expect.objectContaining({ id: 6002, deleted: false }),
+    ]);
+
+    await destroy(database);
+  });
+
+  it('restarts a legacy interrupted scan that has no reconciliation marker protocol', async () => {
+    const requests: URL[] = [];
+    const database = await databaseWithBaseline([
+      page({ id: 1, title: '旧扫描首页', revisionId: 10, localSeq: 1 }),
+      page({ id: 2, title: '旧扫描次页', revisionId: 20, localSeq: 2 }),
+    ]);
+    await database.syncState.put({
+      key: 'reconciliation-sync',
+      value: {
+        status: 'failed',
+        reason: 'scheduled',
+        namespaceIds: [0],
+        namespaceNames: { 0: '（主）' },
+        namespaceIndex: 0,
+        gapcontinue: 'legacy-second-page',
+        generation: 100,
+        startLocalSeq: 2,
+        serverStartedAt: '2026-08-30T06:00:00Z',
+        pagesFetched: 1,
+        pagesChanged: 0,
+        filesChanged: false,
+        dataCodesInvalidated: false,
+        startedAt: now - 24 * 60 * 60 * 1_000,
+        error: '旧版中断',
+      },
+    });
+    const api = new WikiApi({
+      retries: 0,
+      fetcher: vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input), 'https://example.test');
+        requests.push(url);
+        if (url.searchParams.get('meta') === 'siteinfo') {
+          return json({
+            curtimestamp: '2026-08-31T06:00:05Z',
+            query: { namespaces: { 0: { id: 0, name: '' } } },
+          });
+        }
+        const pages = url.searchParams.has('gapcontinue')
+          ? [
+              {
+                pageid: 2,
+                ns: 0,
+                title: '旧扫描次页',
+                lastrevid: 20,
+                contentmodel: 'wikitext',
+              },
+            ]
+          : [
+              {
+                pageid: 1,
+                ns: 0,
+                title: '旧扫描首页',
+                lastrevid: 10,
+                contentmodel: 'wikitext',
+              },
+              {
+                pageid: 2,
+                ns: 0,
+                title: '旧扫描次页',
+                lastrevid: 20,
+                contentmodel: 'wikitext',
+              },
+            ];
+        return json({ query: { pages } });
+      }) as typeof fetch,
+    });
+
+    await reconcileWikiMirror(database, api, analyzer, {
+      now: () => now,
+      requestIntervalMs: 0,
+    });
+
+    expect(requests.some((request) => request.searchParams.get('meta') === 'siteinfo')).toBe(
+      true,
+    );
+    expect(
+      requests.some((request) => request.searchParams.get('gapcontinue') === 'legacy-second-page'),
+    ).toBe(false);
+    expect(await database.pages.orderBy('id').toArray()).toEqual([
+      expect.objectContaining({ id: 1, deleted: false }),
+      expect.objectContaining({ id: 2, deleted: false }),
+    ]);
+
+    await destroy(database);
+  });
+
   it('does not resurrect or prune pages written after the reconciliation fence', async () => {
     const database = await databaseWithBaseline([
       page({ id: 1, title: '扫描期间被删除', revisionId: 10, localSeq: 2 }),
@@ -387,12 +623,12 @@ describe('full mirror reconciliation', () => {
       revisionId: 20,
       contentRevisionId: 20,
       content: '保留本地较新正文',
-      seenInTitleSync: now,
+      seenInReconciliation: now,
     });
     expect(await database.fileResources.get(6001)).toMatchObject({
       title: '文件:本地较新.png',
       revisionId: 20,
-      seenInTitleSync: now,
+      seenInReconciliation: now,
     });
 
     await destroy(database);
@@ -546,6 +782,162 @@ describe('full mirror reconciliation', () => {
 
     await destroy(database);
   });
+
+  it('invalidates Data codes in the committed batch before a later namespace fails', async () => {
+    const database = await databaseWithBaseline([
+      page({
+        id: 350,
+        title: 'Data:Item/old.json',
+        namespace: 3500,
+        namespaceName: 'Data',
+        revisionId: 40,
+        contentModel: 'BSON',
+        content: '{"id":"old"}',
+        contentRevisionId: 40,
+        localSeq: 2,
+      }),
+    ]);
+    await database.syncState.put({
+      key: 'data-code-sync',
+      value: { syncedAt: now, count: 1, indexVersion: 2 },
+    });
+    const api = new WikiApi({
+      retries: 0,
+      fetcher: vi.fn(async (input: RequestInfo | URL) => {
+        const parameters = new URL(String(input), 'https://example.test').searchParams;
+        if (parameters.get('meta') === 'siteinfo') {
+          return json({
+            curtimestamp: '2026-08-31T06:00:05Z',
+            query: {
+              namespaces: {
+                0: { id: 0, name: '' },
+                10: { id: 10, name: '模板' },
+                3500: { id: 3500, name: 'Data' },
+              },
+            },
+          });
+        }
+        if (parameters.get('gapnamespace') === '0') {
+          return json({
+            query: {
+              pages: [
+                {
+                  pageid: 350,
+                  ns: 0,
+                  title: '移出 Data 后页面',
+                  lastrevid: 40,
+                  contentmodel: 'BSON',
+                },
+              ],
+            },
+          });
+        }
+        throw new Error('后续命名空间断网');
+      }) as typeof fetch,
+    });
+
+    await expect(
+      reconcileWikiMirror(database, api, analyzer, {
+        force: true,
+        now: () => now,
+        requestIntervalMs: 0,
+      }),
+    ).rejects.toThrow('后续命名空间断网');
+
+    expect(await database.pages.get(350)).toMatchObject({
+      namespace: 0,
+      title: '移出 Data 后页面',
+      deleted: false,
+    });
+    expect((await database.syncState.get('data-code-sync'))?.value).toMatchObject({
+      syncedAt: 0,
+      count: 1,
+    });
+    expect((await database.syncState.get('reconciliation-sync'))?.value).toMatchObject({
+      status: 'failed',
+      dataCodesInvalidated: true,
+      throughLocalSeq: 3,
+    });
+
+    await destroy(database);
+  });
+
+  it('returns committed progress when login expires after an earlier batch', async () => {
+    const database = await databaseWithBaseline([
+      page({
+        id: 350,
+        title: 'Data:Item/login.json',
+        namespace: 3500,
+        namespaceName: 'Data',
+        revisionId: 40,
+        contentModel: 'BSON',
+        content: '{"id":"login"}',
+        contentRevisionId: 40,
+        localSeq: 2,
+      }),
+    ]);
+    await database.syncState.put({
+      key: 'data-code-sync',
+      value: { syncedAt: now, count: 1, indexVersion: 2 },
+    });
+    const api = new WikiApi({
+      retries: 0,
+      fetcher: vi.fn(async (input: RequestInfo | URL) => {
+        const parameters = new URL(String(input), 'https://example.test').searchParams;
+        if (parameters.get('meta') === 'siteinfo') {
+          return json({
+            curtimestamp: '2026-08-31T06:00:05Z',
+            query: {
+              namespaces: {
+                3500: { id: 3500, name: 'Data' },
+                3600: { id: 3600, name: '测试' },
+              },
+            },
+          });
+        }
+        if (parameters.get('gapnamespace') === '3500') {
+          return json({
+            query: {
+              pages: [
+                {
+                  pageid: 350,
+                  ns: 3500,
+                  title: 'Data:Item/login.json',
+                  lastrevid: 41,
+                  contentmodel: 'BSON',
+                },
+              ],
+            },
+          });
+        }
+        return loginRequired();
+      }) as typeof fetch,
+    });
+
+    const result = await reconcileWikiMirror(database, api, analyzer, {
+      force: true,
+      now: () => now,
+      requestIntervalMs: 0,
+    });
+
+    expect(result).toEqual({
+      status: 'login-required',
+      pagesFetched: 1,
+      pagesChanged: 1,
+      filesChanged: false,
+      dataCodesInvalidated: true,
+      throughLocalSeq: 3,
+    });
+    expect((await database.syncState.get('reconciliation-sync'))?.value).toMatchObject({
+      status: 'running',
+      pagesFetched: 1,
+      pagesChanged: 1,
+      dataCodesInvalidated: true,
+      throughLocalSeq: 3,
+    });
+
+    await destroy(database);
+  });
 });
 
 async function databaseWithBaseline(
@@ -607,5 +999,14 @@ function json(value: unknown): Response {
   return new Response(JSON.stringify(value), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function loginRequired(): Response {
+  return json({
+    error: {
+      code: 'assertuserfailed',
+      info: 'Assertion that the user is logged in failed',
+    },
   });
 }

@@ -879,6 +879,88 @@ describe('RecentChanges incremental sync', () => {
     await destroy(database);
   });
 
+  it('invalidates derived Data codes when a page moves out of the Data namespace', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const parameters = new URL(
+        String(input),
+        'https://casualtiesunknown.huijiwiki.com',
+      ).searchParams;
+      if (parameters.get('curtimestamp') === '1') {
+        return json({ curtimestamp: '2026-08-31T03:10:00Z', query: { general: {} } });
+      }
+      if (parameters.get('list') === 'recentchanges') {
+        return json({
+          query: {
+            recentchanges: [
+              {
+                type: 'log',
+                ns: 3500,
+                title: 'Data:Item/old.json',
+                pageid: 0,
+                revid: 0,
+                old_revid: 0,
+                rcid: 502,
+                timestamp: '2026-08-31T03:06:00Z',
+                logtype: 'move',
+                logaction: 'move',
+                logparams: { target_title: '移出后页面' },
+              },
+            ],
+          },
+        });
+      }
+      return json({
+        query: {
+          pages: [
+            { ns: 3500, title: 'Data:Item/old.json', missing: true },
+            {
+              pageid: 8,
+              ns: 0,
+              title: '移出后页面',
+              contentmodel: 'BSON',
+              lastrevid: 80,
+            },
+          ],
+        },
+      });
+    });
+    const database = await databaseWithBaseline([
+      page({
+        id: 8,
+        title: 'Data:Item/old.json',
+        normalizedTitle: analyzer.normalize('Data:Item/old.json'),
+        namespace: 3500,
+        namespaceName: 'Data',
+        revisionId: 80,
+        contentRevisionId: 80,
+        contentModel: 'BSON',
+        content: '{"id":"old"}',
+      }),
+    ]);
+    await database.syncState.put({
+      key: 'data-code-sync',
+      value: { syncedAt: 100, count: 1, indexVersion: 2 },
+    });
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+    const result = await syncRecentChanges(database, api, analyzer, {
+      requestIntervalMs: 0,
+    });
+
+    expect(result).toMatchObject({ status: 'complete', dataCodesInvalidated: true });
+    expect(await database.pages.get(8)).toMatchObject({
+      namespace: 0,
+      title: '移出后页面',
+      deleted: false,
+    });
+    expect((await database.syncState.get('data-code-sync'))?.value).toMatchObject({
+      syncedAt: 0,
+      count: 1,
+    });
+
+    await destroy(database);
+  });
+
   it('does not commit pages or cursor when a required body response is missing', async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');

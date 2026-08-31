@@ -114,6 +114,110 @@ describe('Data code lookup', () => {
     database.close();
     await database.delete();
   });
+
+  it('times out a stalled Data request without clearing the existing cache', async () => {
+    let requestSignal: AbortSignal | null | undefined;
+    const fetcher = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        requestSignal = init?.signal;
+        return new Promise<Response>(() => undefined);
+      },
+    );
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.dataCodes.put({
+      source: 'Data:Item/cached.json',
+      code: 'cached',
+      chineseName: '已缓存',
+      normalizedName: '已缓存',
+      dataType: 'Item',
+      syncedAt: 100,
+    });
+    await database.syncState.put({
+      key: 'data-code-sync',
+      value: { syncedAt: 100, count: 1, indexVersion: 2 },
+    });
+    const outcome = syncDataCodes(database, analyzer, {
+      fetcher: fetcher as typeof fetch,
+      force: true,
+      requestTimeoutMs: 10,
+      retries: 0,
+    }).then(
+      () => ({ status: 'resolved' as const }),
+      (error: unknown) => ({
+        status: 'rejected' as const,
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    const guard = new Promise<{ status: 'test-guard' }>((resolve) => {
+      setTimeout(() => resolve({ status: 'test-guard' }), 100);
+    });
+
+    await expect(Promise.race([outcome, guard])).resolves.toMatchObject({
+      status: 'rejected',
+      message: expect.stringContaining('请求超时'),
+    });
+    expect(requestSignal?.aborted).toBe(true);
+    expect(await database.dataCodes.toArray()).toEqual([
+      expect.objectContaining({ source: 'Data:Item/cached.json', code: 'cached' }),
+    ]);
+
+    database.close();
+    await database.delete();
+  });
+
+  it('times out when a Data response body never finishes', async () => {
+    let requestSignal: AbortSignal | null | undefined;
+    const fetcher = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        requestSignal = init?.signal;
+        return new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      },
+    );
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.dataCodes.put({
+      source: 'Data:Item/cached-body.json',
+      code: 'cached-body',
+      chineseName: '正文缓存',
+      normalizedName: '正文缓存',
+      dataType: 'Item',
+      syncedAt: 100,
+    });
+    const outcome = syncDataCodes(database, analyzer, {
+      fetcher: fetcher as typeof fetch,
+      force: true,
+      requestTimeoutMs: 10,
+      retries: 0,
+    }).then(
+      () => ({ status: 'resolved' as const }),
+      (error: unknown) => ({
+        status: 'rejected' as const,
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    const guard = new Promise<{ status: 'test-guard' }>((resolve) => {
+      setTimeout(() => resolve({ status: 'test-guard' }), 100);
+    });
+
+    await expect(Promise.race([outcome, guard])).resolves.toMatchObject({
+      status: 'rejected',
+      message: expect.stringContaining('请求超时'),
+    });
+    expect(requestSignal?.aborted).toBe(true);
+    expect(await database.dataCodes.toArray()).toEqual([
+      expect.objectContaining({
+        source: 'Data:Item/cached-body.json',
+        code: 'cached-body',
+      }),
+    ]);
+
+    database.close();
+    await database.delete();
+  });
 });
 
 function document(source: string, code: string, chineseName: string) {
