@@ -10,7 +10,6 @@ export interface ReconciliationCommitBroadcast {
 
 export interface CommittedReconciliationRefreshOptions {
   readState(): Promise<ReconciliationSyncState | undefined>;
-  readLocalSequence(): Promise<number>;
   lastAppliedSequence(): number;
   refresh(invalidation: StorageInvalidationRequest): Promise<void>;
   broadcast(message: ReconciliationCommitBroadcast): void;
@@ -24,20 +23,35 @@ export interface CommittedReconciliationRefreshResult {
 
 /** Applies durable reconciliation batches after their cross-tab writer lock is gone. */
 export class CommittedReconciliationRefresh {
+  private broadcastBaselineInitialized = false;
   private lastBroadcastSequence = 0;
 
   constructor(private readonly options: CommittedReconciliationRefreshOptions) {}
 
   async apply(): Promise<CommittedReconciliationRefreshResult | undefined> {
-    const [state, localSequence] = await Promise.all([
-      this.options.readState(),
-      this.options.readLocalSequence(),
-    ]);
-    if (!state || localSequence <= state.startLocalSeq) return undefined;
+    const state = await this.options.readState();
+    if (!state) return undefined;
+    const startSequence = normalizeSequence(state.startLocalSeq, 0);
+    const committedSequence = Math.max(
+      startSequence,
+      normalizeSequence(state.throughLocalSeq as unknown, startSequence),
+    );
+    const hasCommittedFacts = committedSequence > startSequence;
+    if (!hasCommittedFacts && !state.dataCodesInvalidated) return undefined;
 
-    const shouldRefresh = localSequence > this.options.lastAppliedSequence();
-    const shouldBroadcast = localSequence > this.lastBroadcastSequence;
-    if (!shouldRefresh && !shouldBroadcast) return undefined;
+    const lastAppliedBefore = this.options.lastAppliedSequence();
+    if (hasCommittedFacts && !this.broadcastBaselineInitialized) {
+      this.broadcastBaselineInitialized = true;
+      if (committedSequence <= lastAppliedBefore) {
+        this.lastBroadcastSequence = committedSequence;
+      }
+    }
+    const shouldRefresh = hasCommittedFacts && committedSequence > lastAppliedBefore;
+    const shouldBroadcast =
+      hasCommittedFacts && committedSequence > this.lastBroadcastSequence;
+    if (!shouldRefresh && !shouldBroadcast && !state.dataCodesInvalidated) {
+      return undefined;
+    }
 
     let refreshError: unknown;
     try {
@@ -51,18 +65,24 @@ export class CommittedReconciliationRefresh {
       try {
         this.options.broadcast({
           type: 'reconciled',
-          throughLocalSeq: localSequence,
+          throughLocalSeq: committedSequence,
           filesChanged: state.filesChanged,
         });
-        this.lastBroadcastSequence = localSequence;
+        this.lastBroadcastSequence = committedSequence;
       } catch (error) {
         if (!refreshError) throw error;
       }
     }
     return {
-      throughLocalSeq: localSequence,
+      throughLocalSeq: committedSequence,
       dataCodesInvalidated: state.dataCodesInvalidated,
       ...(refreshError ? { refreshError } : {}),
     };
   }
+}
+
+function normalizeSequence(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : fallback;
 }

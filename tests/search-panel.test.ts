@@ -275,6 +275,31 @@ describe('SearchPanel local maintenance', () => {
     await vi.waitFor(() => expect(rebuildButton.disabled).toBe(false));
     expect(root.querySelector('.status')?.textContent).toBe('本地维护操作完成');
   });
+
+  it('shows an optional successful rebuild warning without reporting maintenance failure', async () => {
+    const callbacks = maintenanceCallbacks({
+      rebuildSearchIndexes: vi.fn(async () => ({
+        message:
+          '索引已重建，某些快照未保存：标题快照未保存：浏览器剩余配额不足；当前搜索可用',
+        tone: 'normal' as const,
+      })),
+    });
+    new SearchPanel(callbacks);
+    const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    if (!root) throw new Error('搜索面板没有挂载');
+
+    root.querySelector<HTMLButtonElement>('.rebuild-indexes')?.click();
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('.status')?.textContent).toContain(
+        '索引已重建，某些快照未保存',
+      );
+    });
+    expect(root.querySelector<HTMLElement>('.status')?.dataset.tone).toBe('normal');
+    expect(root.querySelector('.maintenance-output')?.textContent).not.toContain(
+      '本地维护操作失败',
+    );
+  });
 });
 
 describe('SearchPanel startup recovery', () => {

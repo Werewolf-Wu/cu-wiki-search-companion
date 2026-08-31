@@ -19,6 +19,11 @@ const FILE_REFRESH_HELP =
 
 export type SearchPreparationKind = 'title' | 'content' | 'lua';
 
+export interface MaintenanceActionFeedback {
+  message: string;
+  tone?: 'normal' | 'error' | 'success';
+}
+
 type SearchPanelResult =
   | TitleSearchResult
   | DataCodeSearchResult
@@ -44,7 +49,7 @@ export interface SearchPanelCallbacks {
   refreshFiles(): void;
   saveDataCodeRules(source: string): Promise<void>;
   loadMaintenance?(): Promise<LocalDataDiagnostics>;
-  rebuildSearchIndexes?(): Promise<void>;
+  rebuildSearchIndexes?(): Promise<void | MaintenanceActionFeedback>;
   rebuildContentQueue?(): Promise<void>;
   reconcileNow?(): Promise<void>;
   clearSnapshots?(): Promise<void>;
@@ -511,7 +516,7 @@ export class SearchPanel {
   private bindMaintenanceAction(
     selector: string,
     progressMessage: string,
-    action: () => Promise<void> | undefined,
+    action: () => Promise<void | MaintenanceActionFeedback> | undefined,
   ): void {
     this.requireElement<HTMLButtonElement>(selector).addEventListener('click', () => {
       void this.runMaintenanceAction(progressMessage, action);
@@ -520,7 +525,7 @@ export class SearchPanel {
 
   private async runMaintenanceAction(
     progressMessage: string,
-    action: () => Promise<void> | undefined,
+    action: () => Promise<void | MaintenanceActionFeedback> | undefined,
     announceCompletion = true,
   ): Promise<void> {
     if (this.maintenanceBusy) return;
@@ -530,8 +535,13 @@ export class SearchPanel {
     try {
       const request = action();
       if (!request) throw new Error('维护操作当前不可用');
-      await request;
-      if (announceCompletion) this.setStatus('本地维护操作完成', 'success');
+      const feedback = await request;
+      if (announceCompletion) {
+        this.setStatus(
+          feedback?.message ?? '本地维护操作完成',
+          feedback?.tone ?? 'success',
+        );
+      }
       await this.loadMaintenance();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

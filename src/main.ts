@@ -51,7 +51,7 @@ import {
 import { syncTitles } from './sync/title-sync';
 import { WikiApi } from './sync/wiki-api';
 import type { NamespaceInfo, PageRecord, TitleSyncProgress } from './types';
-import { SearchPanel } from './ui/search-panel';
+import { SearchPanel, type MaintenanceActionFeedback } from './ui/search-panel';
 
 declare const __CU_WIKI_BUILD_ID__: string;
 
@@ -383,10 +383,6 @@ async function start(): Promise<void> {
   });
   const committedReconciliationRefresh = new CommittedReconciliationRefresh({
     readState: () => readReconciliationSyncState(database),
-    readLocalSequence: async () => {
-      const value = (await database.syncState.get('local-sequence'))?.value;
-      return typeof value === 'number' ? value : 0;
-    },
     lastAppliedSequence: () => lastAppliedLocalSeq,
     refresh: (invalidation) => refreshIndexesFromStorage(invalidation),
     broadcast: (message) => incrementalChannel?.postMessage(message),
@@ -1263,7 +1259,7 @@ async function start(): Promise<void> {
     return syncPromise;
   }
 
-  async function rebuildSearchIndexes(): Promise<void> {
+  async function rebuildSearchIndexes(): Promise<MaintenanceActionFeedback | undefined> {
     assertWritesAllowed();
     await Promise.all([
       titlePreparation.waitForActiveLocal(),
@@ -1292,6 +1288,13 @@ async function start(): Promise<void> {
     debugApi.indexedLuaModules = luaModuleIndex.size;
     await updateSnapshotDebug();
     panel.refreshResults();
+    if (rebuilt.warnings.length) {
+      return {
+        message: `索引已重建，某些快照未保存：${rebuilt.warnings.map(({ message }) => message).join('；')}；当前搜索可用`,
+        tone: 'normal',
+      };
+    }
+    return undefined;
   }
 
   async function updateSnapshotDebug(): Promise<void> {
