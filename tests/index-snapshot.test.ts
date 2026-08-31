@@ -34,6 +34,36 @@ describe('VersionedSearchIndexCache', () => {
     await database.delete();
   });
 
+  it('clears a rejected snapshot message after the rebuilt snapshot is published', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '诊断恢复', '正文', 'wikitext', 1));
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const firstCache = new VersionedSearchIndexCache(database, {
+      storage: unlimitedStorage(),
+    });
+    await firstCache.publish(await firstCache.restoreOrRebuild('title', analyzer));
+    const oldSnapshot = await database.indexSnapshots.get(snapshotKey('title'));
+    if (!oldSnapshot) throw new Error('测试快照未发布');
+    oldSnapshot.snapshotFormatVersion = 1;
+    await database.indexSnapshots.put(oldSnapshot);
+
+    const cache = new VersionedSearchIndexCache(database, {
+      storage: unlimitedStorage(),
+    });
+    const rebuilt = await cache.restoreOrRebuild('title', analyzer);
+    expect(rebuilt.source).toBe('rebuild');
+    await cache.publish(rebuilt);
+
+    expect((await cache.inspect()).find(({ kind }) => kind === 'title')).toMatchObject({
+      status: 'available',
+      message: undefined,
+    });
+
+    database.close();
+    await database.delete();
+  });
+
   it('restores title, content snippets, and structured Lua matches identically', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();

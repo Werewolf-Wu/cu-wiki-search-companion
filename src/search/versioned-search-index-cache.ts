@@ -271,33 +271,40 @@ export class VersionedSearchIndexCache {
       json,
       serializationMs,
     };
-    let result: SnapshotPublishResult = { status: 'skipped', reason: 'sequence-changed' };
-    await this.database.transaction(
+    const result = await this.database.transaction(
       'rw',
       this.database.indexSnapshots,
       this.database.syncState,
-      async () => {
+      async (): Promise<SnapshotPublishResult> => {
         if (this.publishingSuppressed || candidateEpoch !== this.publishEpoch) {
-          result = { status: 'skipped', reason: 'cleared-this-session' };
-          return;
+          return { status: 'skipped', reason: 'cleared-this-session' };
         }
         const sequenceRecord = (await this.database.syncState.get(
           LOCAL_SEQUENCE_KEY,
         )) as SyncStateRecord<number> | undefined;
         const currentSequence = sequenceRecord?.value ?? 0;
-        if (currentSequence !== record.throughLocalSeq) return;
+        if (currentSequence !== record.throughLocalSeq) {
+          return { status: 'skipped', reason: 'sequence-changed' };
+        }
         const existing = await this.database.indexSnapshots.get(record.key);
         if (
           existing?.compatibilityKey === record.compatibilityKey &&
           existing.throughLocalSeq >= record.throughLocalSeq
         ) {
-          result = { status: 'skipped', reason: 'not-newer' };
-          return;
+          return { status: 'skipped', reason: 'not-newer' };
         }
         await this.database.indexSnapshots.put(record);
-        result = { status: 'published', record };
+        return { status: 'published', record };
       },
     );
+    if (result.status === 'published') {
+      this.runtime.set(handle.kind, {
+        ...this.runtime.get(handle.kind),
+        compatibilityKey: handle.compatibilityKey,
+        status: 'available',
+        message: undefined,
+      });
+    }
     return result;
   }
 

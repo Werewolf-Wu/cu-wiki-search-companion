@@ -3,10 +3,11 @@ async page => {
   const environment = globalThis.process?.env ?? {};
   const wikiOrigin = environment.CU_WIKI_ORIGIN ??
     'https://casualtiesunknown.huijiwiki.com';
-  const editUrl = new URL(
-    environment.CU_WIKI_INSTALL_EDIT_PATH ?? '/wiki/首页?action=edit',
-    wikiOrigin,
-  ).href;
+  const editTarget =
+    environment.CU_WIKI_INSTALL_EDIT_PATH ?? '/wiki/首页?action=edit';
+  const editUrl = /^https?:\/\//i.test(editTarget)
+    ? editTarget
+    : `${wikiOrigin.replace(/\/+$/, '')}/${editTarget.replace(/^\/+/, '')}`;
   const userscriptUrl = environment.CU_WIKI_USERSCRIPT_URL ??
     'http://127.0.0.1:8788/cu-wiki-local-search.user.js';
   const context = page.context();
