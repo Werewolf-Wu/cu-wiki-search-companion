@@ -265,7 +265,7 @@ Data 代码：
 1. Web Lock cu-wiki-local-search:incremental-sync:v1 提供浏览器级互斥。
 2. incremental-sync-schedule 在 IndexedDB 中共享下次到期时间，默认间隔 5 分钟并增加最多 1 分钟 jitter。
 
-标题强制同步、文件强制同步、手动对账与周期 RC 共用同一写入缝隙。没有 Web Locks 时，周期增量返回 lock-unavailable；显式排他任务可以在当前标签直接运行。
+标题、正文、Data、文件同步、手动对账与维护重建共用同一写入缝隙。没有 Web Locks 时，周期和显式写入都返回 lock-unavailable，不在当前标签绕过互斥；已有本地镜像仍可只读搜索。
 
 BroadcastChannel cu-wiki-local-search:changes:v1 只做失效通知：
 
@@ -285,7 +285,7 @@ BroadcastChannel cu-wiki-local-search:changes:v1 只做失效通知：
 - OpenCC 繁体转简体。
 - 小写化与空白压缩。
 - jieba 文档/查询分词。
-- CJK bigram，保障词典外片段。
+- CJK unigram + bigram，兼顾单字查询与词典外片段。
 - 拉丁 run、点/下划线/camelCase 分段与至少 4 字符 run 的 3-gram，支持代码中缀。
 
 jieba 不可用时使用 Intl.Segmenter。实际 analyzer engine 进入三类快照 compatibility key，防止不同分词结果误用旧快照。Data 代码和文件索引始终使用冷启动的 fallbackAnalyzer；它们依赖归一化、compact substring 与轻量线性扫描，不等待 jieba，也不创建快照。
@@ -316,7 +316,7 @@ CURRENT_VERSION_CONTRACT 当前包含：
 
 - database schema 3。
 - page facts 1、content job format 1。
-- analyzer pipeline 1。
+- analyzer pipeline 2（CJK unigram + bigram）。
 - wikitext/BSON/Lua extractor 各 1。
 - title/content/Lua index 各 1。
 - Data code format 2。

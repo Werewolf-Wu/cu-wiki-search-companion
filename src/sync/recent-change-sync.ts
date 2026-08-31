@@ -10,7 +10,7 @@ import type {
 } from '../types';
 import { readFileResourceSyncState } from './file-resource-sync';
 import { readTitleSyncState } from './title-sync';
-import { delay, type WikiApi, WikiApiError } from './wiki-api';
+import { delay, isWikiLoginRequired, type WikiApi } from './wiki-api';
 
 const RECENT_CHANGES_SYNC_KEY = 'recent-changes-sync';
 const LOCAL_SEQUENCE_KEY = 'local-sequence';
@@ -113,7 +113,7 @@ export async function syncRecentChanges(
       siprop: 'general',
     });
   } catch (error) {
-    if (isLoginRequired(error)) return inactiveResult('login-required', initialSequence);
+    if (isWikiLoginRequired(error)) return inactiveResult('login-required', initialSequence);
     throw error;
   }
   if (!clock.curtimestamp) throw new Error('Wiki API 未返回服务器时间');
@@ -128,7 +128,7 @@ export async function syncRecentChanges(
       options.requestIntervalMs ?? 300,
     );
   } catch (error) {
-    if (isLoginRequired(error)) return inactiveResult('login-required', initialSequence);
+    if (isWikiLoginRequired(error)) return inactiveResult('login-required', initialSequence);
     throw error;
   }
   const events = deduplicateRecentChanges(
@@ -147,7 +147,7 @@ export async function syncRecentChanges(
       ),
     );
   } catch (error) {
-    if (isLoginRequired(error)) return inactiveResult('login-required', initialSequence);
+    if (isWikiLoginRequired(error)) return inactiveResult('login-required', initialSequence);
     throw error;
   }
   const regularInfoPages = infoPages.filter(
@@ -185,7 +185,7 @@ export async function syncRecentChanges(
       options.requestIntervalMs ?? 300,
     );
   } catch (error) {
-    if (isLoginRequired(error)) return inactiveResult('login-required', initialSequence);
+    if (isWikiLoginRequired(error)) return inactiveResult('login-required', initialSequence);
     throw error;
   }
   const contentPageIdSet = new Set(contentPageIds);
@@ -714,13 +714,4 @@ function inactiveResult(
     dataCodesInvalidated: false,
     throughLocalSeq,
   };
-}
-
-function isLoginRequired(error: unknown): boolean {
-  return (
-    error instanceof WikiApiError &&
-    (error.code === 'assertuserfailed' ||
-      error.code === 'readapidenied' ||
-      error.code === 'permissiondenied')
-  );
 }

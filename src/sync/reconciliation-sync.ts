@@ -13,7 +13,7 @@ import type {
 import { readFileResourceSyncState } from './file-resource-sync';
 import { readRecentChangeSyncState } from './recent-change-sync';
 import { readTitleSyncState } from './title-sync';
-import { delay, type WikiApi, WikiApiError } from './wiki-api';
+import { delay, isWikiLoginRequired, type WikiApi } from './wiki-api';
 
 const RECONCILIATION_SYNC_KEY = 'reconciliation-sync';
 const RECENT_CHANGES_SYNC_KEY = 'recent-changes-sync';
@@ -106,7 +106,7 @@ export async function reconcileWikiMirror(
         siprop: 'namespaces',
       });
     } catch (error) {
-      if (isLoginRequired(error)) return inactiveResult('login-required', initialSequence);
+      if (isWikiLoginRequired(error)) return inactiveResult('login-required', initialSequence);
       throw error;
     }
     if (!siteInfo.curtimestamp) throw new Error('Wiki API 未返回对账服务器时间');
@@ -179,6 +179,13 @@ export async function reconcileWikiMirror(
             if (oldPage && writtenAfterFence) {
               return { ...oldPage, seenInTitleSync: state.generation };
             }
+            const remoteRevisionIsOlder =
+              oldPage?.revisionId !== undefined &&
+              rawPage.lastrevid !== undefined &&
+              oldPage.revisionId > rawPage.lastrevid;
+            if (oldPage && remoteRevisionIsOlder) {
+              return { ...oldPage, seenInTitleSync: state.generation };
+            }
             const revisionChanged = oldPage?.revisionId !== rawPage.lastrevid;
             const nextPage: PageRecord = {
               ...oldPage,
@@ -249,7 +256,7 @@ export async function reconcileWikiMirror(
       throughLocalSeq: sequence,
     };
   } catch (error) {
-    if (isLoginRequired(error)) return inactiveResult('login-required', initialSequence);
+    if (isWikiLoginRequired(error)) return inactiveResult('login-required', initialSequence);
     state = {
       ...state,
       status: 'failed',
@@ -441,13 +448,4 @@ function inactiveResult(
     dataCodesInvalidated: false,
     throughLocalSeq,
   };
-}
-
-function isLoginRequired(error: unknown): boolean {
-  return (
-    error instanceof WikiApiError &&
-    (error.code === 'assertuserfailed' ||
-      error.code === 'readapidenied' ||
-      error.code === 'permissiondenied')
-  );
 }

@@ -113,6 +113,47 @@ describe('incremental sync coordinator', () => {
     await database.delete();
   });
 
+  it('does not postpone the next attempt when the sync task reports a deferred outcome', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    const coordinator = new IncrementalSyncCoordinator(database, {
+      intervalMs: 1_000,
+      jitterMs: 0,
+      lockManager: new ContendedLockManager(),
+      now: () => 1_000,
+    });
+    const tasksRun: string[] = [];
+
+    const deferred = await coordinator.runIfDue(async () => {
+      tasksRun.push('login-required');
+      return false;
+    });
+    const retry = await coordinator.runIfDue(async () => {
+      tasksRun.push('retry');
+      return true;
+    });
+
+    expect(deferred).toBe('ran');
+    expect(retry).toBe('ran');
+    expect(tasksRun).toEqual(['login-required', 'retry']);
+
+    database.close();
+    await database.delete();
+  });
+
+  it('does not run an exclusive writer when Web Locks are unavailable', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    const coordinator = new IncrementalSyncCoordinator(database, { lockManager: null });
+    const task = vi.fn(async () => undefined);
+
+    expect(await coordinator.runExclusive(task)).toBe('lock-unavailable');
+    expect(task).not.toHaveBeenCalled();
+
+    database.close();
+    await database.delete();
+  });
+
   it('queues an explicit full reconciliation behind the same writer lock', async () => {
     const databaseName = `test-${crypto.randomUUID()}`;
     const firstDatabase = new WikiSearchDatabase(databaseName);

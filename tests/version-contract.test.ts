@@ -11,6 +11,10 @@ import {
 } from '../src/storage/version-contract';
 
 describe('cache version contract', () => {
+  it('uses analyzer pipeline v2 for CJK unigram indexes', () => {
+    expect(CURRENT_VERSION_CONTRACT.analyzerPipeline).toBe(2);
+  });
+
   it('registers known schema-v3 legacy data without deleting facts, jobs, or cursors', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();

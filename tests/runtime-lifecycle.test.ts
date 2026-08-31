@@ -43,6 +43,41 @@ describe('runtime lifecycle coordinator', () => {
     expect(secondRuns).toBe(1);
   });
 
+  it('deduplicates named writers locally while sharing the cross-tab lock', async () => {
+    const writer = new QueuedWriter();
+    const first = new RuntimeLifecycleCoordinator({
+      applyStorageInvalidation: vi.fn(async () => undefined),
+      writer,
+    });
+    const second = new RuntimeLifecycleCoordinator({
+      applyStorageInvalidation: vi.fn(async () => undefined),
+      writer,
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const order: string[] = [];
+
+    const dataWrite = first.runWriter('data', async () => {
+      order.push('data-start');
+      await held;
+      order.push('data-end');
+    });
+    const duplicate = first.runWriter('data', async () => {
+      order.push('duplicate');
+    });
+    const maintenance = second.runWriter('maintenance-index', async () => {
+      order.push('maintenance');
+    });
+    await vi.waitFor(() => expect(order).toEqual(['data-start']));
+
+    release();
+    await Promise.all([dataWrite, duplicate, maintenance]);
+
+    expect(order).toEqual(['data-start', 'data-end', 'maintenance']);
+  });
+
   it('serializes refreshes and coalesces invalidations that arrive during a refresh', async () => {
     let finishFirst!: () => void;
     const firstHeld = new Promise<void>((resolve) => {

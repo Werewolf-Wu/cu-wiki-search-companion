@@ -57,11 +57,12 @@ export class WikiApi {
         });
         retryAfterMs = parseRetryAfter(response.headers.get('Retry-After'));
         if (!response.ok) {
+          const loginRequired = response.status === 401 || response.status === 403;
           throw new WikiApiError(
             `Wiki API returned HTTP ${response.status}`,
             `http-${response.status}`,
             response.statusText || 'HTTP error',
-            true,
+            !loginRequired,
             response.status,
           );
         }
@@ -90,6 +91,17 @@ export class WikiApi {
     }
     throw lastError;
   }
+}
+
+export function isWikiLoginRequired(error: unknown): boolean {
+  return (
+    error instanceof WikiApiError &&
+    (error.status === 401 ||
+      error.status === 403 ||
+      error.code === 'assertuserfailed' ||
+      error.code === 'readapidenied' ||
+      error.code === 'permissiondenied')
+  );
 }
 
 export function delay(milliseconds: number): Promise<void> {

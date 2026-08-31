@@ -24,38 +24,75 @@ export interface ContentSearchResult {
   score: number;
 }
 
+interface PendingContentRebuild {
+  updates: PageRecord[][];
+}
+
 export class ContentIndex {
   private index = this.createIndex();
-  private readonly extractedById = new Map<number, string>();
+  private extractedById = new Map<number, string>();
+  private rebuildGeneration = 0;
+  private readonly pendingRebuilds = new Set<PendingContentRebuild>();
 
   constructor(private readonly analyzer: Analyzer) {}
 
   rebuild(pages: PageRecord[]): void {
-    this.index = this.createIndex();
-    this.extractedById.clear();
-    const documents = pages.flatMap((page) => {
-      const document = this.toDocument(page);
-      return document ? [document] : [];
-    });
-    this.index.addAll(documents);
+    this.rebuildGeneration += 1;
+    const nextIndex = this.createIndex();
+    const nextExtractedById = new Map<number, string>();
+    this.applyPages(nextIndex, nextExtractedById, pages);
+    this.index = nextIndex;
+    this.extractedById = nextExtractedById;
   }
 
   async rebuildAsync(pages: PageRecord[], batchSize = 2): Promise<void> {
-    this.index = this.createIndex();
-    this.extractedById.clear();
-    await this.updateAsync(pages, batchSize);
+    const generation = ++this.rebuildGeneration;
+    const nextIndex = this.createIndex();
+    const nextExtractedById = new Map<number, string>();
+    const pending: PendingContentRebuild = { updates: [] };
+    this.pendingRebuilds.add(pending);
+    try {
+      for (let offset = 0; offset < pages.length; offset += batchSize) {
+        this.applyPages(
+          nextIndex,
+          nextExtractedById,
+          pages.slice(offset, offset + batchSize),
+        );
+        await yieldToEventLoop();
+      }
+      for (const update of pending.updates) {
+        this.applyPages(nextIndex, nextExtractedById, update);
+      }
+      if (generation === this.rebuildGeneration) {
+        this.index = nextIndex;
+        this.extractedById = nextExtractedById;
+      }
+    } finally {
+      this.pendingRebuilds.delete(pending);
+    }
   }
 
   update(pages: PageRecord[]): void {
+    for (const pending of this.pendingRebuilds) {
+      pending.updates.push(pages.map((page) => ({ ...page })));
+    }
+    this.applyPages(this.index, this.extractedById, pages);
+  }
+
+  private applyPages(
+    index: MiniSearch<IndexedContent>,
+    extractedById: Map<number, string>,
+    pages: PageRecord[],
+  ): void {
     for (const page of pages) {
-      const document = this.toDocument(page);
+      const document = this.toDocument(page, extractedById);
       if (!document) {
-        if (this.index.has(page.id)) this.index.discard(page.id);
-        this.extractedById.delete(page.id);
-      } else if (this.index.has(page.id)) {
-        this.index.replace(document);
+        if (index.has(page.id)) index.discard(page.id);
+        extractedById.delete(page.id);
+      } else if (index.has(page.id)) {
+        index.replace(document);
       } else {
-        this.index.add(document);
+        index.add(document);
       }
     }
   }
@@ -84,17 +121,30 @@ export class ContentIndex {
     ) {
       throw new Error('正文快照 payload 结构无效');
     }
-    const restored = await MiniSearch.loadJSONAsync<IndexedContent>(
-      JSON.stringify(payload.miniSearch),
-      this.indexOptions(),
-    );
-    this.index = restored;
-    this.extractedById.clear();
+    const generation = ++this.rebuildGeneration;
+    const pending: PendingContentRebuild = { updates: [] };
+    this.pendingRebuilds.add(pending);
+    const restoredExtractedById = new Map<number, string>();
     for (const [id, extracted] of payload.extractedById) {
-      this.extractedById.set(id, extracted);
+      restoredExtractedById.set(id, extracted);
     }
-    if (this.extractedById.size !== this.index.documentCount) {
-      throw new Error('正文快照摘要数量不一致');
+    try {
+      const restored = await MiniSearch.loadJSONAsync<IndexedContent>(
+        JSON.stringify(payload.miniSearch),
+        this.indexOptions(),
+      );
+      if (restoredExtractedById.size !== restored.documentCount) {
+        throw new Error('正文快照摘要数量不一致');
+      }
+      for (const update of pending.updates) {
+        this.applyPages(restored, restoredExtractedById, update);
+      }
+      if (generation === this.rebuildGeneration) {
+        this.index = restored;
+        this.extractedById = restoredExtractedById;
+      }
+    } finally {
+      this.pendingRebuilds.delete(pending);
     }
   }
 
@@ -158,7 +208,10 @@ export class ContentIndex {
     };
   }
 
-  private toDocument(page: PageRecord): IndexedContent | undefined {
+  private toDocument(
+    page: PageRecord,
+    extractedById: Map<number, string>,
+  ): IndexedContent | undefined {
     if (
       page.deleted ||
       page.isRedirect ||
@@ -168,7 +221,7 @@ export class ContentIndex {
     }
     const extracted = extractContent(page.contentModel, page.content);
     if (!extracted) return undefined;
-    this.extractedById.set(page.id, extracted);
+    extractedById.set(page.id, extracted);
     return {
       id: page.id,
       title: page.title,

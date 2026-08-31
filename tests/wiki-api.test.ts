@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-import { WikiApi, WikiApiError } from '../src/sync/wiki-api';
+import { isWikiLoginRequired, WikiApi, WikiApiError } from '../src/sync/wiki-api';
 
 describe('WikiApi retry behavior', () => {
   it('honors Retry-After when HTTP 429 is followed by success', async () => {
@@ -78,6 +78,30 @@ describe('WikiApi retry behavior', () => {
     expect(error).toMatchObject({ code: 'assertuserfailed' });
     expect(fetcher).toHaveBeenCalledOnce();
   });
+
+  it.each([401, 403])(
+    'treats HTTP %i as a non-retryable login requirement',
+    async (status) => {
+      const fetcher = vi.fn(async () =>
+        json({ error: 'login required' }, { status, statusText: 'Forbidden' }),
+      );
+      const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 4 });
+
+      const error = await api.query({ list: 'recentchanges' }).catch((value) => value);
+
+      expect(error).toBeInstanceOf(WikiApiError);
+      expect(error).toMatchObject({ status, retryable: false });
+      expect(isWikiLoginRequired(error)).toBe(true);
+      expect(fetcher).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(['assertuserfailed', 'readapidenied', 'permissiondenied'])(
+    'recognizes the MediaWiki %s response as a login requirement',
+    (code) => {
+      expect(isWikiLoginRequired(new WikiApiError(code, code, code, false))).toBe(true);
+    },
+  );
 });
 
 function json(payload: unknown, init: ResponseInit = {}): Response {

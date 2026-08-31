@@ -173,6 +173,7 @@ async function start(): Promise<void> {
   let engineReady: Promise<void> | undefined;
   let contentReady: Promise<void> | undefined;
   let fileReady: Promise<void> | undefined;
+  let fileReadySettled = false;
   let resolveInitialCacheReady!: () => void;
   const initialCacheReady = new Promise<void>((resolve) => {
     resolveInitialCacheReady = resolve;
@@ -253,7 +254,9 @@ async function start(): Promise<void> {
     rebuildSearchIndexes: () => rebuildSearchIndexes(),
     rebuildContentQueue: async () => {
       assertWritesAllowed();
-      await maintenance.rebuildContentQueue();
+      await runCoordinatedWriter('maintenance-queue', () =>
+        maintenance.rebuildContentQueue(),
+      );
     },
     reconcileNow: () => requestManualReconciliation(),
     clearSnapshots: async () => {
@@ -462,7 +465,8 @@ async function start(): Promise<void> {
 
   function ensureFileSearchStarted(force: boolean): Promise<void> {
     if (!fileReady) {
-      fileReady = (async () => {
+      fileReadySettled = false;
+      const loading = (async () => {
         await initialCacheReady;
         const cachedFiles = await database.fileResources
           .filter((file) => !file.deleted)
@@ -476,13 +480,17 @@ async function start(): Promise<void> {
           panel.setStatus('正在首次同步文件资源…');
         }
         await runFileSync(force);
-      })().catch((error: unknown) => {
+      })();
+      fileReady = loading.then(() => {
+        fileReadySettled = true;
+      }).catch((error: unknown) => {
         fileReady = undefined;
+        fileReadySettled = false;
         throw error;
       });
       return fileReady;
     }
-    return force ? fileReady.then(() => runFileSync(true)) : fileReady;
+    return force && fileReadySettled ? runFileSync(true) : fileReady;
   }
 
   async function runFileSync(force: boolean): Promise<void> {
@@ -544,17 +552,23 @@ async function start(): Promise<void> {
     if (dataCodeSyncPromise) await dataCodeSyncPromise;
 
     const task = (async () => {
-      const result = await syncDataCodes(database, fallbackAnalyzer, {
-        force: true,
-        rulesSource: source,
+      let result: Awaited<ReturnType<typeof syncDataCodes>> | undefined;
+      await runCoordinatedWriter('data', async () => {
+        result = await syncDataCodes(database, fallbackAnalyzer, {
+          force: true,
+          rulesSource: source,
+        });
+        // Keep the durable preference and its matching cache commit inside the
+        // same cross-tab writer window so a stale tab cannot win afterwards.
+        await dataRulesPreference.set(source);
       });
+      if (!result) throw new Error('Data 代码规则保存未返回结果');
       dataCodeIndex = new DataCodeIndex(fallbackAnalyzer, result.records);
       dataCodeRulesSource = source;
       debugApi.indexedDataCodes = dataCodeIndex.size;
       panel.setDataCodeRules(dataCodeRulesSource, DEFAULT_DATA_CODE_RULES);
       panel.refreshResults();
       incrementalChannel?.postMessage({ type: 'data-committed' });
-      await dataRulesPreference.set(source);
       panel.setStatus(`Data 代码检索字段已保存 · ${dataCodeIndex.size} 条`, 'success');
     })();
     dataCodeSyncPromise = task;
@@ -572,14 +586,22 @@ async function start(): Promise<void> {
     if (dataCodeSyncPromise) {
       return (await dataCodeSyncPromise) ?? { status: 'complete' };
     }
-    dataCodeSyncPromise = (async () => {
+    const task = (async (): Promise<SyncAttemptResult> => {
       try {
-        const result = await syncDataCodes(database, fallbackAnalyzer, {
-          force,
-          rulesSource: dataCodeRulesSource,
+        let result: Awaited<ReturnType<typeof syncDataCodes>> | undefined;
+        let canonicalRules = dataCodeRulesSource;
+        await runCoordinatedWriter('data', async () => {
+          canonicalRules = await readCanonicalDataRules();
+          result = await syncDataCodes(database, fallbackAnalyzer, {
+            force,
+            rulesSource: canonicalRules,
+          });
         });
+        if (!result) throw new Error('Data 代码同步未返回结果');
         dataCodeIndex = new DataCodeIndex(fallbackAnalyzer, result.records);
+        dataCodeRulesSource = canonicalRules;
         debugApi.indexedDataCodes = dataCodeIndex.size;
+        panel.setDataCodeRules(dataCodeRulesSource, DEFAULT_DATA_CODE_RULES);
         panel.refreshResults();
         if (result.refreshed) {
           incrementalChannel?.postMessage({ type: 'data-committed' });
@@ -594,11 +616,29 @@ async function start(): Promise<void> {
         );
         console.error('[CU Wiki Search] Data code sync failed', error);
         return { status: 'error', error } as const;
-      } finally {
-        dataCodeSyncPromise = undefined;
       }
     })();
-    return (await dataCodeSyncPromise) ?? { status: 'complete' };
+    dataCodeSyncPromise = task;
+    try {
+      return await task;
+    } finally {
+      if (dataCodeSyncPromise === task) dataCodeSyncPromise = undefined;
+    }
+  }
+
+  async function readCanonicalDataRules(): Promise<string> {
+    const preference = await dataRulesPreference.get();
+    const stored = await readDataCodeSyncState(database);
+    for (const source of [preference, stored?.rulesSource, dataCodeRulesSource]) {
+      if (typeof source !== 'string') continue;
+      try {
+        parseDataFieldRules(source);
+        return source;
+      } catch {
+        // Continue to the next durable/local source.
+      }
+    }
+    return DEFAULT_DATA_CODE_RULES;
   }
 
   async function requestManualDataCodeSync(): Promise<void> {
@@ -639,8 +679,9 @@ async function start(): Promise<void> {
               },
             },
           );
-          if (reconciliationResult.status === 'login-required') return;
+          if (reconciliationResult.status === 'login-required') return false;
           syncResult = await syncRecentChanges(database, api, fallbackAnalyzer);
+          return syncResult.status === 'complete';
         });
         if (coordinated === 'lock-unavailable') {
           debugApi.incrementalStatus = 'lock-unavailable';
@@ -855,7 +896,10 @@ async function start(): Promise<void> {
 
   async function requestManualReconciliation(): Promise<void> {
     const result = await requestReconciliationSync(true);
-    if (result.status === 'complete') return;
+    if (result.status === 'complete') {
+      if (contentIndex && luaModuleIndex) await runContentSync(false);
+      return;
+    }
     if ('error' in result && result.error) throw result.error;
     const message =
       result.status === 'login-required'
@@ -884,11 +928,12 @@ async function start(): Promise<void> {
   async function applyStorageInvalidation(
     invalidation: StorageInvalidation,
   ): Promise<void> {
-    const [sequenceRecord, incrementalState] = await Promise.all([
+    const [sequenceRecord, incrementalState, dataState] = await Promise.all([
       invalidation.pages ? database.syncState.get('local-sequence') : undefined,
       invalidation.pages || invalidation.files
         ? readRecentChangeSyncState(database)
         : undefined,
+      invalidation.data ? readDataCodeSyncState(database) : undefined,
     ]);
     const sequence = typeof sequenceRecord?.value === 'number' ? sequenceRecord.value : 0;
     let indexChanged = false;
@@ -947,6 +992,15 @@ async function start(): Promise<void> {
       const records = await database.dataCodes.toArray();
       dataCodeIndex = new DataCodeIndex(fallbackAnalyzer, records);
       debugApi.indexedDataCodes = dataCodeIndex.size;
+      if (typeof dataState?.rulesSource === 'string') {
+        try {
+          parseDataFieldRules(dataState.rulesSource);
+          dataCodeRulesSource = dataState.rulesSource;
+          panel.setDataCodeRules(dataCodeRulesSource, DEFAULT_DATA_CODE_RULES);
+        } catch (error) {
+          console.warn('[CU Wiki Search] ignored invalid broadcast Data code rules', error);
+        }
+      }
     }
     if (indexChanged) await updateSnapshotDebug();
     panel.refreshResults();
@@ -1098,7 +1152,11 @@ async function start(): Promise<void> {
     if (!analyzerResult || analyzerResult.engine === 'bootstrap') {
       throw new Error('增强分词引擎尚未就绪');
     }
-    const rebuilt = await maintenance.rebuildSearchIndexes(analyzerResult.analyzer);
+    let rebuilt: Awaited<ReturnType<typeof maintenance.rebuildSearchIndexes>> | undefined;
+    await runCoordinatedWriter('maintenance-index', async () => {
+      rebuilt = await maintenance.rebuildSearchIndexes(analyzerResult!.analyzer);
+    });
+    if (!rebuilt) throw new Error('本地搜索索引重建未返回结果');
     titleHandle = rebuilt.title;
     contentHandle = rebuilt.content;
     luaHandle = rebuilt.lua;
@@ -1135,6 +1193,19 @@ async function start(): Promise<void> {
 
   function assertWritesAllowed(): void {
     if (!ensureWritesAllowed()) throw new Error('本地数据版本不兼容，后台写入已停止');
+  }
+
+  async function runCoordinatedWriter(
+    key: string,
+    task: () => Promise<void>,
+  ): Promise<void> {
+    await initialCacheReady;
+    const coordinated = runtimeLifecycle
+      ? await runtimeLifecycle.runWriter(key, task)
+      : 'lock-unavailable';
+    if (coordinated === 'lock-unavailable') {
+      throw new Error('无法取得跨标签写入锁，请确认浏览器支持 Web Locks 后重试');
+    }
   }
 
   function snapshotPublishWarning(result: SnapshotPublishResult): string | undefined {

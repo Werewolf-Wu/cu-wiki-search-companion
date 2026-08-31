@@ -45,38 +45,75 @@ interface SerializedPreparedLuaSymbol extends LuaSymbolMatch {
   terms: string[];
 }
 
+interface PendingLuaRebuild {
+  updates: PageRecord[][];
+}
+
 export class LuaModuleIndex {
   private index = this.createIndex();
-  private readonly symbolsById = new Map<number, PreparedLuaSymbol[]>();
+  private symbolsById = new Map<number, PreparedLuaSymbol[]>();
+  private rebuildGeneration = 0;
+  private readonly pendingRebuilds = new Set<PendingLuaRebuild>();
 
   constructor(private readonly analyzer: Analyzer) {}
 
   rebuild(pages: PageRecord[]): void {
-    this.index = this.createIndex();
-    this.symbolsById.clear();
-    const documents = pages.flatMap((page) => {
-      const document = this.toDocument(page);
-      return document ? [document] : [];
-    });
-    this.index.addAll(documents);
+    this.rebuildGeneration += 1;
+    const nextIndex = this.createIndex();
+    const nextSymbolsById = new Map<number, PreparedLuaSymbol[]>();
+    this.applyPages(nextIndex, nextSymbolsById, pages);
+    this.index = nextIndex;
+    this.symbolsById = nextSymbolsById;
   }
 
   async rebuildAsync(pages: PageRecord[], batchSize = 2): Promise<void> {
-    this.index = this.createIndex();
-    this.symbolsById.clear();
-    await this.updateAsync(pages, batchSize);
+    const generation = ++this.rebuildGeneration;
+    const nextIndex = this.createIndex();
+    const nextSymbolsById = new Map<number, PreparedLuaSymbol[]>();
+    const pending: PendingLuaRebuild = { updates: [] };
+    this.pendingRebuilds.add(pending);
+    try {
+      for (let offset = 0; offset < pages.length; offset += batchSize) {
+        this.applyPages(
+          nextIndex,
+          nextSymbolsById,
+          pages.slice(offset, offset + batchSize),
+        );
+        await yieldToEventLoop();
+      }
+      for (const update of pending.updates) {
+        this.applyPages(nextIndex, nextSymbolsById, update);
+      }
+      if (generation === this.rebuildGeneration) {
+        this.index = nextIndex;
+        this.symbolsById = nextSymbolsById;
+      }
+    } finally {
+      this.pendingRebuilds.delete(pending);
+    }
   }
 
   update(pages: PageRecord[]): void {
+    for (const pending of this.pendingRebuilds) {
+      pending.updates.push(pages.map((page) => ({ ...page })));
+    }
+    this.applyPages(this.index, this.symbolsById, pages);
+  }
+
+  private applyPages(
+    index: MiniSearch<IndexedLuaModule>,
+    symbolsById: Map<number, PreparedLuaSymbol[]>,
+    pages: PageRecord[],
+  ): void {
     for (const page of pages) {
-      const document = this.toDocument(page);
+      const document = this.toDocument(page, symbolsById);
       if (!document) {
-        if (this.index.has(page.id)) this.index.discard(page.id);
-        this.symbolsById.delete(page.id);
-      } else if (this.index.has(page.id)) {
-        this.index.replace(document);
+        if (index.has(page.id)) index.discard(page.id);
+        symbolsById.delete(page.id);
+      } else if (index.has(page.id)) {
+        index.replace(document);
       } else {
-        this.index.add(document);
+        index.add(document);
       }
     }
   }
@@ -108,20 +145,33 @@ export class LuaModuleIndex {
     ) {
       throw new Error('Lua 快照 payload 结构无效');
     }
-    const restored = await MiniSearch.loadJSONAsync<IndexedLuaModule>(
-      JSON.stringify(payload.miniSearch),
-      this.indexOptions(),
-    );
-    this.index = restored;
-    this.symbolsById.clear();
+    const generation = ++this.rebuildGeneration;
+    const pending: PendingLuaRebuild = { updates: [] };
+    this.pendingRebuilds.add(pending);
+    const restoredSymbolsById = new Map<number, PreparedLuaSymbol[]>();
     for (const [id, symbols] of payload.symbolsById) {
-      this.symbolsById.set(
+      restoredSymbolsById.set(
         id,
         symbols.map((symbol) => ({ ...symbol, terms: new Set(symbol.terms) })),
       );
     }
-    if (this.symbolsById.size !== this.index.documentCount) {
-      throw new Error('Lua 快照符号数量不一致');
+    try {
+      const restored = await MiniSearch.loadJSONAsync<IndexedLuaModule>(
+        JSON.stringify(payload.miniSearch),
+        this.indexOptions(),
+      );
+      if (restoredSymbolsById.size !== restored.documentCount) {
+        throw new Error('Lua 快照符号数量不一致');
+      }
+      for (const update of pending.updates) {
+        this.applyPages(restored, restoredSymbolsById, update);
+      }
+      if (generation === this.rebuildGeneration) {
+        this.index = restored;
+        this.symbolsById = restoredSymbolsById;
+      }
+    } finally {
+      this.pendingRebuilds.delete(pending);
     }
   }
 
@@ -191,7 +241,10 @@ export class LuaModuleIndex {
     };
   }
 
-  private toDocument(page: PageRecord): IndexedLuaModule | undefined {
+  private toDocument(
+    page: PageRecord,
+    symbolsById: Map<number, PreparedLuaSymbol[]>,
+  ): IndexedLuaModule | undefined {
     if (
       page.deleted ||
       page.isRedirect ||
@@ -202,7 +255,7 @@ export class LuaModuleIndex {
     }
     const extracted = extractLua(page.content);
     if (!extracted.searchableText) return undefined;
-    this.symbolsById.set(page.id, this.prepareSymbols(extracted));
+    symbolsById.set(page.id, this.prepareSymbols(extracted));
     return {
       id: page.id,
       title: page.title,

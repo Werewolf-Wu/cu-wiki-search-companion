@@ -52,6 +52,29 @@ describe('wikitext content search', () => {
     });
   });
 
+  it('finds a single CJK character inside a multi-character body term', () => {
+    const index = new ContentIndex(analyzer);
+    index.rebuild([page(1, '医疗指导', '接受紧急治疗。')]);
+
+    expect(index.search('治')[0]?.id).toBe(1);
+  });
+
+  it('preserves a content update that arrives while an async rebuild is yielding', async () => {
+    const index = new ContentIndex(analyzer);
+    const oldPages = [
+      page(1, '第一页', '稳定正文'),
+      page(2, '第二页', '已经过时的正文'),
+    ];
+    index.rebuild(oldPages);
+
+    const rebuilding = index.rebuildAsync(oldPages, 1);
+    index.update([page(2, '第二页', '并发写入的最新正文')]);
+
+    await expect(rebuilding).resolves.toBeUndefined();
+    expect(index.search('最新正文').map(({ id }) => id)).toContain(2);
+    expect(index.search('过时').map(({ id }) => id)).not.toContain(2);
+  });
+
   it('centers snippets on traditional and full-width query matches', () => {
     const index = new ContentIndex(analyzer);
     const distantPrefix = '无关前言'.repeat(30);

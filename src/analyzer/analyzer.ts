@@ -147,7 +147,7 @@ export function latinParts(run: string): string[] {
 
 function addCjkTokens(tokens: Set<string>, value: string): void {
   for (const run of cjkRuns(value)) {
-    if ([...run].length === 1) tokens.add(run);
+    for (const character of run) tokens.add(character);
     for (const bigram of bigrams(run)) tokens.add(bigram);
   }
 }

@@ -31,6 +31,10 @@ interface LinearTitle {
   compactTitle: string;
 }
 
+interface PendingTitleRebuild {
+  updates: PageRecord[][];
+}
+
 /**
  * Small synchronous fallback used while the richer MiniSearch/jieba index is
  * built during an idle period. The title corpus is only a few thousand rows,
@@ -112,34 +116,52 @@ export class CombinedTitleIndex implements TitleSearchBackend {
 
 export class TitleIndex implements TitleSearchBackend {
   private index = this.createIndex();
+  private rebuildGeneration = 0;
+  private readonly pendingRebuilds = new Set<PendingTitleRebuild>();
 
   constructor(private readonly analyzer: Analyzer) {}
 
   rebuild(pages: PageRecord[]): void {
-    this.index = this.createIndex();
-    this.index.addAll(pages.filter((page) => !page.deleted).map((page) => this.toDocument(page)));
+    this.rebuildGeneration += 1;
+    const nextIndex = this.createIndex();
+    this.applyPages(nextIndex, pages);
+    this.index = nextIndex;
   }
 
   async rebuildAsync(pages: PageRecord[], batchSize = 5): Promise<void> {
-    this.index = this.createIndex();
+    const generation = ++this.rebuildGeneration;
+    const nextIndex = this.createIndex();
+    const pending: PendingTitleRebuild = { updates: [] };
+    this.pendingRebuilds.add(pending);
     const activePages = pages.filter((page) => !page.deleted);
-    for (let offset = 0; offset < activePages.length; offset += batchSize) {
-      this.index.addAll(
-        activePages.slice(offset, offset + batchSize).map((page) => this.toDocument(page)),
-      );
-      await yieldToEventLoop();
+    try {
+      for (let offset = 0; offset < activePages.length; offset += batchSize) {
+        this.applyPages(nextIndex, activePages.slice(offset, offset + batchSize));
+        await yieldToEventLoop();
+      }
+      for (const update of pending.updates) this.applyPages(nextIndex, update);
+      if (generation === this.rebuildGeneration) this.index = nextIndex;
+    } finally {
+      this.pendingRebuilds.delete(pending);
     }
   }
 
   update(pages: PageRecord[]): void {
+    for (const pending of this.pendingRebuilds) {
+      pending.updates.push(pages.map((page) => ({ ...page })));
+    }
+    this.applyPages(this.index, pages);
+  }
+
+  private applyPages(index: MiniSearch<IndexedTitle>, pages: PageRecord[]): void {
     for (const page of pages) {
       if (page.deleted) {
-        if (this.index.has(page.id)) this.index.discard(page.id);
+        if (index.has(page.id)) index.discard(page.id);
         continue;
       }
       const document = this.toDocument(page);
-      if (this.index.has(page.id)) this.index.replace(document);
-      else this.index.add(document);
+      if (index.has(page.id)) index.replace(document);
+      else index.add(document);
     }
   }
 
@@ -158,10 +180,19 @@ export class TitleIndex implements TitleSearchBackend {
     if (!payload || typeof payload !== 'object' || !('miniSearch' in payload)) {
       throw new Error('标题快照 payload 结构无效');
     }
-    this.index = await MiniSearch.loadJSONAsync<IndexedTitle>(
-      JSON.stringify(payload.miniSearch),
-      this.indexOptions(),
-    );
+    const generation = ++this.rebuildGeneration;
+    const pending: PendingTitleRebuild = { updates: [] };
+    this.pendingRebuilds.add(pending);
+    try {
+      const restored = await MiniSearch.loadJSONAsync<IndexedTitle>(
+        JSON.stringify(payload.miniSearch),
+        this.indexOptions(),
+      );
+      for (const update of pending.updates) this.applyPages(restored, update);
+      if (generation === this.rebuildGeneration) this.index = restored;
+    } finally {
+      this.pendingRebuilds.delete(pending);
+    }
   }
 
   search(query: string, namespace?: number, limit = 20): TitleSearchResult[] {

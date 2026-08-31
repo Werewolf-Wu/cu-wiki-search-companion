@@ -25,7 +25,7 @@ interface LockManagerAdapter {
 export interface IncrementalSyncCoordinatorOptions {
   intervalMs?: number;
   jitterMs?: number;
-  lockManager?: LockManagerAdapter;
+  lockManager?: LockManagerAdapter | null;
   now?: () => number;
   random?: () => number;
 }
@@ -43,12 +43,15 @@ export class IncrementalSyncCoordinator {
   ) {
     this.intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
     this.jitterMs = options.jitterMs ?? DEFAULT_JITTER_MS;
-    this.lockManager = options.lockManager ?? globalThis.navigator?.locks;
+    this.lockManager =
+      options.lockManager === null
+        ? undefined
+        : (options.lockManager ?? globalThis.navigator?.locks);
     this.now = options.now ?? Date.now;
     this.random = options.random ?? Math.random;
   }
 
-  async runIfDue(task: () => Promise<void>): Promise<CoordinatedSyncResult> {
+  async runIfDue(task: () => Promise<boolean | void>): Promise<CoordinatedSyncResult> {
     if (!this.lockManager) return 'lock-unavailable';
 
     return this.lockManager.request(
@@ -62,7 +65,8 @@ export class IncrementalSyncCoordinator {
           | undefined;
         if (stored && this.now() < stored.nextDueAt) return 'not-due';
 
-        await task();
+        const completed = await task();
+        if (completed === false) return 'ran';
         const lastSuccessAt = this.now();
         const jitter = Math.floor(Math.max(0, Math.min(1, this.random())) * this.jitterMs);
         await this.database.syncState.put({
@@ -78,10 +82,7 @@ export class IncrementalSyncCoordinator {
   }
 
   async runExclusive(task: () => Promise<void>): Promise<ExclusiveSyncResult> {
-    if (!this.lockManager) {
-      await task();
-      return 'ran';
-    }
+    if (!this.lockManager) return 'lock-unavailable';
 
     return this.lockManager.request(
       LOCK_NAME,

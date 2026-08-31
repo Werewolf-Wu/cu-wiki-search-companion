@@ -27,21 +27,32 @@ export interface RuntimeLifecycleCoordinatorOptions {
 export class RuntimeLifecycleCoordinator {
   private pendingInvalidation = emptyInvalidation();
   private refreshPromise: Promise<void> | undefined;
-  private contentWriterPromise: Promise<'ran' | 'lock-unavailable'> | undefined;
+  private readonly writerPromises = new Map<
+    string,
+    Promise<'ran' | 'lock-unavailable'>
+  >();
 
   constructor(private readonly options: RuntimeLifecycleCoordinatorOptions) {}
 
   runContentWriter(task: () => Promise<void>): Promise<'ran' | 'lock-unavailable'> {
-    if (this.contentWriterPromise) return this.contentWriterPromise;
+    return this.runWriter('content', task);
+  }
+
+  runWriter(
+    key: string,
+    task: () => Promise<void>,
+  ): Promise<'ran' | 'lock-unavailable'> {
+    const active = this.writerPromises.get(key);
+    if (active) return active;
     const request = Promise.resolve().then(async () => {
       if (this.options.writer) return this.options.writer.runExclusive(task);
       await task();
       return 'ran' as const;
     });
     const tracked = request.finally(() => {
-      if (this.contentWriterPromise === tracked) this.contentWriterPromise = undefined;
+      if (this.writerPromises.get(key) === tracked) this.writerPromises.delete(key);
     });
-    this.contentWriterPromise = tracked;
+    this.writerPromises.set(key, tracked);
     return tracked;
   }
 

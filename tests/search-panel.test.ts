@@ -268,6 +268,27 @@ describe('SearchPanel startup recovery', () => {
     reloadButton?.click();
     expect(reload).toHaveBeenCalledOnce();
   });
+
+  it('keeps mode and refresh controls from restarting work after startup failed', () => {
+    const callbacks = maintenanceCallbacks();
+    const panel = new SearchPanel(callbacks);
+    const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    if (!root) throw new Error('搜索面板没有挂载');
+    const mode = root.querySelector<HTMLSelectElement>('.mode');
+    const refresh = root.querySelector<HTMLButtonElement>('.refresh');
+    if (!mode || !refresh) throw new Error('搜索控件没有挂载');
+
+    panel.setStartupFailure('IndexedDB 无法打开', vi.fn());
+    mode.value = 'files';
+    mode.dispatchEvent(new Event('change'));
+    refresh.click();
+
+    expect(callbacks.prepareSearch).not.toHaveBeenCalled();
+    expect(callbacks.prepareFiles).not.toHaveBeenCalled();
+    expect(callbacks.refresh).not.toHaveBeenCalled();
+    expect(callbacks.refreshFiles).not.toHaveBeenCalled();
+    expect(root.querySelector('.status')?.textContent).toContain('IndexedDB 无法打开');
+  });
 });
 
 function maintenanceCallbacks(

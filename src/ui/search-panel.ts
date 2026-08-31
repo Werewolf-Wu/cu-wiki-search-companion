@@ -158,6 +158,7 @@ export class SearchPanel {
     });
     this.requireElement<HTMLButtonElement>('.close').addEventListener('click', () => this.close());
     this.requireElement<HTMLButtonElement>('.refresh').addEventListener('click', () => {
+      if (this.startupFailed) return;
       if (this.fileMode) this.callbacks.refreshFiles();
       else this.callbacks.refresh();
     });
@@ -228,8 +229,10 @@ export class SearchPanel {
     });
     this.namespaceSelect.addEventListener('change', () => this.performSearch());
     this.modeSelect.addEventListener('change', () => {
-      if (this.fileMode) this.callbacks.prepareFiles();
-      else this.callbacks.prepareSearch();
+      if (!this.startupFailed) {
+        if (this.fileMode) this.callbacks.prepareFiles();
+        else this.callbacks.prepareSearch();
+      }
       this.updateModePresentation();
       this.performSearch();
     });

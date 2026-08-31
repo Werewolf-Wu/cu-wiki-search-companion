@@ -13,7 +13,7 @@ describe('Analyzer', () => {
 
   it('adds CJK bigrams and jieba search tokens to documents', () => {
     const tokens = analyzer.documentTokens('医用级兴奋剂');
-    expect(tokens).toEqual(expect.arrayContaining(['医用', '兴奋', '奋剂']));
+    expect(tokens).toEqual(expect.arrayContaining(['医', '用', '医用', '兴奋', '奋剂']));
   });
 
   it('only creates CJK bigrams inside contiguous CJK runs', () => {

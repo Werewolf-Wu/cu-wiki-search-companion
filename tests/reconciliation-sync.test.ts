@@ -310,6 +310,94 @@ describe('full mirror reconciliation', () => {
     await destroy(database);
   });
 
+  it('does not roll pages or files back when allpages returns an older revision', async () => {
+    const database = await databaseWithBaseline([
+      page({
+        id: 20,
+        title: '本地较新页面',
+        revisionId: 20,
+        contentRevisionId: 20,
+        content: '保留本地较新正文',
+        localSeq: 2,
+      }),
+    ]);
+    await database.fileResources.put(
+      page({
+        id: 6001,
+        title: '文件:本地较新.png',
+        namespace: 6,
+        namespaceName: '文件',
+        revisionId: 20,
+        localSeq: 2,
+      }),
+    );
+    await database.syncState.put({
+      key: 'file-resource-sync',
+      value: {
+        status: 'complete',
+        namespaceIds: [6],
+        namespaceNames: { 6: '文件' },
+        namespaceIndex: 1,
+        generation: 1,
+        pagesFetched: 1,
+        startedAt: now - 48 * 60 * 60 * 1_000,
+        completedAt: now - 48 * 60 * 60 * 1_000,
+      } satisfies TitleSyncState,
+    });
+    const api = new WikiApi({
+      fetcher: vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+        if (url.searchParams.get('meta') === 'siteinfo') {
+          return json({
+            curtimestamp: '2026-08-31T06:00:05Z',
+            query: {
+              namespaces: {
+                0: { id: 0, name: '' },
+                6: { id: 6, name: '文件' },
+              },
+            },
+          });
+        }
+        const isFile = url.searchParams.get('gapnamespace') === '6';
+        return json({
+          query: {
+            pages: [
+              {
+                pageid: isFile ? 6001 : 20,
+                ns: isFile ? 6 : 0,
+                title: isFile ? '文件:远端旧标题.png' : '远端旧标题',
+                lastrevid: 19,
+                contentmodel: 'wikitext',
+              },
+            ],
+          },
+        });
+      }) as typeof fetch,
+      retries: 0,
+    });
+
+    const result = await reconcileWikiMirror(database, api, analyzer, {
+      now: () => now,
+      requestIntervalMs: 0,
+    });
+
+    expect(result).toMatchObject({ pagesChanged: 0, filesChanged: false });
+    expect(await database.pages.get(20)).toMatchObject({
+      title: '本地较新页面',
+      revisionId: 20,
+      contentRevisionId: 20,
+      content: '保留本地较新正文',
+      seenInTitleSync: now,
+    });
+    expect(await database.fileResources.get(6001)).toMatchObject({
+      title: '文件:本地较新.png',
+      revisionId: 20,
+      seenInTitleSync: now,
+    });
+
+    await destroy(database);
+  });
+
   it('reconciles an initialized file cache without treating legacy revision-based localSeq as a concurrent write', async () => {
     const database = await databaseWithBaseline([]);
     await database.fileResources.put(

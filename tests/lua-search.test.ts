@@ -175,6 +175,33 @@ describe('Lua module search', () => {
     });
   });
 
+  it('finds a single CJK character inside a multi-character Lua string', () => {
+    const index = new LuaModuleIndex(analyzer);
+    index.rebuild([
+      page(834, '模块:中文字符串', `return { label = '诊断字符串' }`, 'Scribunto'),
+    ]);
+
+    expect(index.search('串')[0]?.id).toBe(834);
+  });
+
+  it('preserves a Lua update that arrives while an async rebuild is yielding', async () => {
+    const index = new LuaModuleIndex(analyzer);
+    const oldPages = [
+      page(835, '模块:First', `return { label = '稳定符号' }`, 'Scribunto'),
+      page(836, '模块:Second', `return { label = '过时符号' }`, 'Scribunto'),
+    ];
+    index.rebuild(oldPages);
+
+    const rebuilding = index.rebuildAsync(oldPages, 1);
+    index.update([
+      page(836, '模块:Second', `return { label = '并发最新符号' }`, 'Scribunto'),
+    ]);
+
+    await expect(rebuilding).resolves.toBeUndefined();
+    expect(index.search('最新符号').map(({ id }) => id)).toContain(836);
+    expect(index.search('过时').map(({ id }) => id)).not.toContain(836);
+  });
+
   it('indexes the final entry in a large generated return table', () => {
     const generatedSource = `return { ${Array.from(
       { length: 3_000 },
