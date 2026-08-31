@@ -70,6 +70,8 @@ export class SearchPanel {
   private selectedIndex = -1;
   private insertMode = true;
   private composing = false;
+  private maintenanceBusy = false;
+  private startupFailed = false;
   private searchTimer?: number;
 
   constructor(private readonly callbacks: SearchPanelCallbacks) {
@@ -121,9 +123,19 @@ export class SearchPanel {
     this.defaultDataRules = defaultSource;
   }
 
+  setStartupFailure(message: string, reload: () => void): void {
+    this.startupFailed = true;
+    this.setStatus(`本地搜索启动失败：${message}。可重新加载页面重试。`, 'error');
+    const reloadButton = this.requireElement<HTMLButtonElement>('.reload-startup');
+    reloadButton.hidden = false;
+    reloadButton.onclick = reload;
+  }
+
   open(): void {
-    if (this.fileMode) this.callbacks.prepareFiles();
-    else this.callbacks.prepareSearch();
+    if (!this.startupFailed) {
+      if (this.fileMode) this.callbacks.prepareFiles();
+      else this.callbacks.prepareSearch();
+    }
     this.panel.hidden = false;
     this.toggle.setAttribute('aria-expanded', 'true');
     this.input.focus();
@@ -183,8 +195,15 @@ export class SearchPanel {
     this.requireElement<HTMLButtonElement>('.request-persistence').addEventListener(
       'click',
       () => {
-        const request = this.callbacks.requestPersistence?.();
-        if (request) void this.finishPersistenceRequest(request);
+        void this.runMaintenanceAction(
+          '正在申请浏览器持久保存…',
+          async () => {
+            const request = this.callbacks.requestPersistence?.();
+            if (!request) throw new Error('持久保存操作当前不可用');
+            await this.finishPersistenceRequest(request);
+          },
+          false,
+        );
       },
     );
     this.requireElement<HTMLButtonElement>('.reveal-danger').addEventListener('click', () => {
@@ -192,7 +211,9 @@ export class SearchPanel {
     });
     this.requireElement<HTMLButtonElement>('.reset-local').addEventListener('click', () => {
       const resetRules = this.requireElement<HTMLInputElement>('.reset-data-rules').checked;
-      void this.callbacks.resetLocalMirror?.(resetRules);
+      void this.runMaintenanceAction('正在清空本地镜像…', () =>
+        this.callbacks.resetLocalMirror?.(resetRules),
+      );
     });
 
     this.input.addEventListener('compositionstart', () => {
@@ -458,19 +479,42 @@ export class SearchPanel {
     action: () => Promise<void> | undefined,
   ): void {
     this.requireElement<HTMLButtonElement>(selector).addEventListener('click', () => {
-      const request = action();
-      if (!request) return;
-      this.setStatus(progressMessage);
-      void request
-        .then(async () => {
-          this.setStatus('本地维护操作完成', 'success');
-          await this.loadMaintenance();
-        })
-        .catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
-          this.setStatus(`本地维护操作失败：${message}`, 'error');
-        });
+      void this.runMaintenanceAction(progressMessage, action);
     });
+  }
+
+  private async runMaintenanceAction(
+    progressMessage: string,
+    action: () => Promise<void> | undefined,
+    announceCompletion = true,
+  ): Promise<void> {
+    if (this.maintenanceBusy) return;
+    this.maintenanceBusy = true;
+    this.setMaintenanceDisabled(true);
+    this.setStatus(progressMessage);
+    try {
+      const request = action();
+      if (!request) throw new Error('维护操作当前不可用');
+      await request;
+      if (announceCompletion) this.setStatus('本地维护操作完成', 'success');
+      await this.loadMaintenance();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failure = `本地维护操作失败：${message}`;
+      this.maintenanceOutput.textContent = failure;
+      this.setStatus(failure, 'error');
+    } finally {
+      this.maintenanceBusy = false;
+      this.setMaintenanceDisabled(false);
+    }
+  }
+
+  private setMaintenanceDisabled(disabled: boolean): void {
+    for (const button of this.root.querySelectorAll<HTMLButtonElement>(
+      '.maintenance-action',
+    )) {
+      button.disabled = disabled;
+    }
   }
 
   private async loadMaintenance(): Promise<void> {
@@ -644,6 +688,7 @@ const markup = `
   <section class="panel" hidden aria-label="未知伤亡维基本地搜索">
     <header class="header">
       <span class="heading">插入维基链接</span>
+      <button class="icon reload-startup" type="button" title="重新加载页面" hidden>重新加载</button>
       <button class="icon configure" type="button" title="配置 Data 代码检索字段" hidden>⚙</button>
       <button class="icon maintenance-toggle" type="button" title="本地数据与维护">▤</button>
       <button class="icon refresh" type="button" title="重新同步本地数据">↻</button>

@@ -163,9 +163,145 @@ describe('SearchPanel local maintenance', () => {
     root.querySelector<HTMLButtonElement>('.reset-local')?.click();
     expect(callbacks.resetLocalMirror).toHaveBeenCalledWith(true);
 
+    await vi.waitFor(() => {
+      expect(root.querySelector<HTMLButtonElement>('.reset-local')?.disabled).toBe(false);
+    });
+
     root.querySelector<HTMLButtonElement>('.request-persistence')?.click();
     await vi.waitFor(() => {
       expect(root.querySelector('.status')?.textContent).toContain('未授予持久保存');
     });
   });
+
+  it('serializes destructive maintenance actions and reports reset failures inline', async () => {
+    let rejectReset!: (error: Error) => void;
+    const reset = new Promise<void>((_resolve, reject) => {
+      rejectReset = reject;
+    });
+    const callbacks = maintenanceCallbacks({
+      resetLocalMirror: vi.fn(() => reset),
+    });
+    new SearchPanel(callbacks);
+    const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    if (!root) throw new Error('搜索面板没有挂载');
+
+    root.querySelector<HTMLButtonElement>('.reveal-danger')?.click();
+    const resetButton = root.querySelector<HTMLButtonElement>('.reset-local');
+    const rebuildButton = root.querySelector<HTMLButtonElement>('.rebuild-indexes');
+    const reconcileButton = root.querySelector<HTMLButtonElement>('.reconcile-now');
+    if (!resetButton || !rebuildButton || !reconcileButton) {
+      throw new Error('维护按钮没有挂载');
+    }
+
+    resetButton.click();
+    resetButton.click();
+    rebuildButton.click();
+    reconcileButton.click();
+
+    expect(callbacks.resetLocalMirror).toHaveBeenCalledOnce();
+    expect(callbacks.rebuildSearchIndexes).not.toHaveBeenCalled();
+    expect(callbacks.reconcileNow).not.toHaveBeenCalled();
+    expect(resetButton.disabled).toBe(true);
+    expect(rebuildButton.disabled).toBe(true);
+    expect(reconcileButton.disabled).toBe(true);
+
+    rejectReset(new Error('IndexedDB 删除失败'));
+    await vi.waitFor(() => {
+      expect(root.querySelector('.maintenance-output')?.textContent).toContain(
+        '本地维护操作失败：IndexedDB 删除失败',
+      );
+    });
+    expect(root.querySelector('.status')?.textContent).not.toContain('操作完成');
+    expect(resetButton.disabled).toBe(false);
+    expect(rebuildButton.disabled).toBe(false);
+    expect(reconcileButton.disabled).toBe(false);
+  });
+
+  it('keeps all maintenance actions busy until the active action finishes', async () => {
+    let finishRebuild!: () => void;
+    const rebuilding = new Promise<void>((resolve) => {
+      finishRebuild = resolve;
+    });
+    const callbacks = maintenanceCallbacks({
+      rebuildSearchIndexes: vi.fn(() => rebuilding),
+    });
+    new SearchPanel(callbacks);
+    const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    if (!root) throw new Error('搜索面板没有挂载');
+    const rebuildButton = root.querySelector<HTMLButtonElement>('.rebuild-indexes');
+    const queueButton = root.querySelector<HTMLButtonElement>('.rebuild-content-queue');
+    const resetButton = root.querySelector<HTMLButtonElement>('.reset-local');
+    if (!rebuildButton || !queueButton || !resetButton) throw new Error('维护按钮没有挂载');
+
+    rebuildButton.click();
+
+    expect([...root.querySelectorAll<HTMLButtonElement>('.maintenance-action')]).toSatisfy(
+      (buttons: HTMLButtonElement[]) => buttons.every((button) => button.disabled),
+    );
+    queueButton.click();
+    resetButton.click();
+    expect(callbacks.rebuildContentQueue).not.toHaveBeenCalled();
+    expect(callbacks.resetLocalMirror).not.toHaveBeenCalled();
+
+    finishRebuild();
+    await vi.waitFor(() => expect(rebuildButton.disabled).toBe(false));
+    expect(root.querySelector('.status')?.textContent).toBe('本地维护操作完成');
+  });
 });
+
+describe('SearchPanel startup recovery', () => {
+  it('shows a reload recovery action instead of remaining in loading state', () => {
+    const reload = vi.fn();
+    const callbacks = maintenanceCallbacks();
+    const panel = new SearchPanel(callbacks);
+    const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    if (!root) throw new Error('搜索面板没有挂载');
+
+    panel.setStartupFailure('IndexedDB 无法打开', reload);
+    panel.open();
+
+    expect(root.querySelector('.status')?.textContent).toContain('IndexedDB 无法打开');
+    expect(root.querySelector<HTMLElement>('.status')?.dataset.tone).toBe('error');
+    expect(callbacks.prepareSearch).not.toHaveBeenCalled();
+    const reloadButton = root.querySelector<HTMLButtonElement>('.reload-startup');
+    expect(reloadButton?.hidden).toBe(false);
+    reloadButton?.click();
+    expect(reload).toHaveBeenCalledOnce();
+  });
+});
+
+function maintenanceCallbacks(
+  overrides: Partial<ConstructorParameters<typeof SearchPanel>[0]> = {},
+): ConstructorParameters<typeof SearchPanel>[0] {
+  return {
+    prepareSearch: vi.fn(),
+    prepareFiles: vi.fn(),
+    search: vi.fn(() => []),
+    searchFiles: vi.fn(() => []),
+    searchLua: vi.fn(() => []),
+    searchContent: vi.fn(() => []),
+    searchCodes: vi.fn(() => []),
+    insert: vi.fn(),
+    selectCode: vi.fn(),
+    copy: vi.fn(),
+    copyCode: vi.fn(),
+    open: vi.fn(),
+    openCode: vi.fn(),
+    refresh: vi.fn(),
+    refreshFiles: vi.fn(),
+    saveDataCodeRules: vi.fn(async () => undefined),
+    loadMaintenance: vi.fn(async () => ({
+      counts: { pages: 0, files: 0, dataCodes: 0, contentSources: 0, luaSources: 0 },
+      jobs: { done: 0, pending: 0, running: 0, failed: 0 },
+      snapshots: [],
+      storage: {},
+    })),
+    rebuildSearchIndexes: vi.fn(async () => undefined),
+    rebuildContentQueue: vi.fn(async () => undefined),
+    reconcileNow: vi.fn(async () => undefined),
+    clearSnapshots: vi.fn(async () => undefined),
+    requestPersistence: vi.fn(async () => ({ status: 'unsupported' as const })),
+    resetLocalMirror: vi.fn(async () => undefined),
+    ...overrides,
+  };
+}
