@@ -267,7 +267,7 @@ export class LuaModuleIndex {
         ...candidate,
         normalized,
         compact: this.analyzer.compactNormalized(normalized),
-        terms: new Set(this.analyzer.documentTokensFromNormalized(normalized)),
+        terms: new Set(this.analyzer.documentTokens(candidate.value)),
       };
     });
   }

@@ -39,7 +39,9 @@ export class Analyzer {
   }
 
   documentTokens(value: string): string[] {
-    return this.documentTokensFromNormalized(this.normalize(value));
+    const tokens = new Set(this.documentTokensFromNormalized(this.normalize(value)));
+    addLatinTokens(tokens, value.normalize('NFKC'));
+    return [...tokens];
   }
 
   documentTokensFromNormalized(normalized: string): string[] {
@@ -48,10 +50,8 @@ export class Analyzer {
     for (const word of this.segmenter.cutForSearch(normalized)) {
       if (word.trim()) tokens.add(word);
     }
-    for (const bigram of bigrams(this.cjkOf(normalized))) tokens.add(bigram);
-    for (const run of latinRuns(normalized)) {
-      for (const part of latinParts(run)) tokens.add(part);
-    }
+    addCjkTokens(tokens, normalized);
+    addLatinTokens(tokens, normalized);
 
     return [...tokens];
   }
@@ -69,10 +69,9 @@ export class Analyzer {
     }
 
     const tokens = new Set<string>();
-    for (const bigram of bigrams(cjk)) tokens.add(bigram);
-    for (const run of latinRuns(normalized)) {
-      for (const part of latinParts(run)) tokens.add(part);
-    }
+    addCjkTokens(tokens, normalized);
+    addLatinTokens(tokens, normalized);
+    addLatinTokens(tokens, value.normalize('NFKC'));
     for (const word of this.segmenter.cut(normalized)) {
       if (word.trim().length >= 2) tokens.add(word);
     }
@@ -86,6 +85,21 @@ export function bigrams(value: string): string[] {
   for (let index = 0; index + 1 < characters.length; index += 1) {
     result.push(`${characters[index]}${characters[index + 1]}`);
   }
+  return result;
+}
+
+function cjkRuns(value: string): string[] {
+  const result: string[] = [];
+  let current = '';
+  for (const character of value) {
+    if (CJK_CHARACTER.test(character)) {
+      current += character;
+    } else if (current) {
+      result.push(current);
+      current = '';
+    }
+  }
+  if (current) result.push(current);
   return result;
 }
 
@@ -107,10 +121,10 @@ export function latinRuns(value: string): string[] {
 export function latinParts(run: string): string[] {
   const lower = run.toLowerCase();
   const parts = new Set<string>();
-  if (lower.length > 1) parts.add(lower);
+  if (/[a-z0-9]/.test(lower)) parts.add(lower);
 
   for (const part of lower.split(/[._]+/)) {
-    if (part.length > 1) parts.add(part);
+    if (part) parts.add(part);
   }
 
   const camelParts = run
@@ -119,7 +133,7 @@ export function latinParts(run: string): string[] {
     .split(/[ ._]+/);
   for (const part of camelParts) {
     const normalized = part.toLowerCase();
-    if (normalized.length > 1) parts.add(normalized);
+    if (normalized) parts.add(normalized);
   }
 
   const bare = lower.replace(/[^a-z0-9]/g, '');
@@ -129,6 +143,19 @@ export function latinParts(run: string): string[] {
     }
   }
   return [...parts];
+}
+
+function addCjkTokens(tokens: Set<string>, value: string): void {
+  for (const run of cjkRuns(value)) {
+    if ([...run].length === 1) tokens.add(run);
+    for (const bigram of bigrams(run)) tokens.add(bigram);
+  }
+}
+
+function addLatinTokens(tokens: Set<string>, value: string): void {
+  for (const run of latinRuns(value)) {
+    for (const part of latinParts(run)) tokens.add(part);
+  }
 }
 
 export function createIntlSegmenter(): WordSegmenter {

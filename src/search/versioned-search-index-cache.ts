@@ -11,7 +11,7 @@ import { LuaModuleIndex } from './lua-module-index';
 import { TitleIndex } from './title-index';
 
 const LOCAL_SEQUENCE_KEY = 'local-sequence';
-const SNAPSHOT_FORMAT_VERSION = 1;
+const SNAPSHOT_FORMAT_VERSION = 2;
 const MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
 const DEFAULT_PUBLISH_DELAY_MS = 5_000;
 
@@ -100,8 +100,10 @@ export class VersionedSearchIndexCache {
     ReturnType<typeof setTimeout>
   >();
   private readonly runtime = new Map<SearchIndexKind, RuntimeState>();
+  private readonly refreshQueues = new WeakMap<object, Promise<void>>();
   private publishQueue: Promise<void> = Promise.resolve();
   private publishingSuppressed = false;
+  private publishEpoch = 0;
 
   constructor(
     private readonly database: WikiSearchDatabase,
@@ -156,7 +158,7 @@ export class VersionedSearchIndexCache {
         } catch (error) {
           runtimeStatus = 'corrupt';
           runtimeMessage = error instanceof Error ? error.message : String(error);
-          await this.database.indexSnapshots.delete(snapshotKey(kind));
+          await this.deleteSnapshotIfUnchanged(bundle.snapshot);
         }
       }
     }
@@ -188,6 +190,28 @@ export class VersionedSearchIndexCache {
   async refresh<K extends SearchIndexKind>(
     handle: SearchIndexHandle<K>,
   ): Promise<number> {
+    const previous = this.refreshQueues.get(handle) ?? Promise.resolve();
+    const refreshing = previous.then(
+      () => this.refreshOnce(handle),
+      () => this.refreshOnce(handle),
+    );
+    const queued = refreshing.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.refreshQueues.set(handle, queued);
+    try {
+      return await refreshing;
+    } finally {
+      if (this.refreshQueues.get(handle) === queued) {
+        this.refreshQueues.delete(handle);
+      }
+    }
+  }
+
+  private async refreshOnce<K extends SearchIndexKind>(
+    handle: SearchIndexHandle<K>,
+  ): Promise<number> {
     const { currentSequence, pages } = await this.database.transaction(
       'r',
       this.database.pages,
@@ -211,7 +235,7 @@ export class VersionedSearchIndexCache {
       pages.sort((left, right) => left.localSeq - right.localSeq);
       await handle.index.updateAsync(pages);
     }
-    handle.throughLocalSeq = currentSequence;
+    handle.throughLocalSeq = Math.max(handle.throughLocalSeq, currentSequence);
     return pages.length;
   }
 
@@ -221,6 +245,7 @@ export class VersionedSearchIndexCache {
     if (this.publishingSuppressed) {
       return { status: 'skipped', reason: 'cleared-this-session' };
     }
+    const candidateEpoch = this.publishEpoch;
     const serializationStartedAt = this.clock();
     const candidateThroughLocalSeq = handle.throughLocalSeq;
     const json = JSON.stringify(handle.index.exportSnapshot());
@@ -252,6 +277,10 @@ export class VersionedSearchIndexCache {
       this.database.indexSnapshots,
       this.database.syncState,
       async () => {
+        if (this.publishingSuppressed || candidateEpoch !== this.publishEpoch) {
+          result = { status: 'skipped', reason: 'cleared-this-session' };
+          return;
+        }
         const sequenceRecord = (await this.database.syncState.get(
           LOCAL_SEQUENCE_KEY,
         )) as SyncStateRecord<number> | undefined;
@@ -306,7 +335,7 @@ export class VersionedSearchIndexCache {
       if (!record) {
         return {
           kind,
-          status: runtime?.compatibilityKey ? runtime.status : 'not-started',
+          status: runtime ? runtime.status : 'not-started',
           restoreMs: runtime?.restoreMs,
           message: runtime?.message,
         };
@@ -346,9 +375,17 @@ export class VersionedSearchIndexCache {
     for (const timer of this.pendingPublishes.values()) clearTimeout(timer);
     this.pendingPublishes.clear();
     this.publishingSuppressed = true;
+    this.publishEpoch += 1;
     await this.database.indexSnapshots.bulkDelete(
       (['title', 'content', 'lua'] as const).map(snapshotKey),
     );
+    for (const kind of ['title', 'content', 'lua'] as const) {
+      this.runtime.set(kind, {
+        ...this.runtime.get(kind),
+        status: 'missing',
+        message: undefined,
+      });
+    }
   }
 
   allowPublishing(): void {
@@ -400,6 +437,15 @@ export class VersionedSearchIndexCache {
     } catch {
       return true;
     }
+  }
+
+  private async deleteSnapshotIfUnchanged(snapshot: IndexSnapshotRecord): Promise<void> {
+    await this.database.transaction('rw', this.database.indexSnapshots, async () => {
+      const current = await this.database.indexSnapshots.get(snapshot.key);
+      if (current && isSameSnapshot(current, snapshot)) {
+        await this.database.indexSnapshots.delete(snapshot.key);
+      }
+    });
   }
 }
 
@@ -466,4 +512,23 @@ function isJsonObject(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isSameSnapshot(
+  left: IndexSnapshotRecord,
+  right: IndexSnapshotRecord,
+): boolean {
+  return (
+    left.key === right.key &&
+    left.kind === right.kind &&
+    left.snapshotFormatVersion === right.snapshotFormatVersion &&
+    left.compatibilityKey === right.compatibilityKey &&
+    left.throughLocalSeq === right.throughLocalSeq &&
+    left.createdAt === right.createdAt &&
+    left.documentCount === right.documentCount &&
+    left.payloadBytes === right.payloadBytes &&
+    left.sha256 === right.sha256 &&
+    left.json === right.json &&
+    left.serializationMs === right.serializationMs
+  );
 }

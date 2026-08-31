@@ -16,8 +16,24 @@ describe('Analyzer', () => {
     expect(tokens).toEqual(expect.arrayContaining(['医用', '兴奋', '奋剂']));
   });
 
+  it('only creates CJK bigrams inside contiguous CJK runs', () => {
+    expect(analyzer.documentTokens('医疗 救治')).not.toContain('疗救');
+    expect(analyzer.documentTokens('医疗ABC救治')).not.toContain('疗救');
+    expect(analyzer.documentTokens('医疗-救治')).not.toContain('疗救');
+    expect(analyzer.queryTokens('医疗 救治')).not.toContain('疗救');
+    expect(analyzer.queryTokens('医疗ABC救治')).not.toContain('疗救');
+    expect(analyzer.queryTokens('医疗-救治')).not.toContain('疗救');
+  });
+
   it('keeps a lone CJK character as the only query token', () => {
     expect(analyzer.queryTokens('鹿')).toEqual(['鹿']);
+  });
+
+  it('keeps short mixed-script and camelCase terms searchable', () => {
+    expect(analyzer.queryTokens('x')).toContain('x');
+    expect(analyzer.queryTokens('鹿x')).toEqual(expect.arrayContaining(['鹿', 'x']));
+    expect(analyzer.documentTokens('getId')).toContain('id');
+    expect(analyzer.queryTokens('id')).toContain('id');
   });
 
   it('supports latin infix matching with 3-grams', () => {

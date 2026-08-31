@@ -128,7 +128,11 @@ export class ContentIndex {
           title,
           namespace: Number(result.namespace),
           namespaceName: String(result.namespaceName),
-          snippet: makeSnippet(this.extractedById.get(Number(result.id)) ?? '', query),
+          snippet: makeSnippet(
+            this.extractedById.get(Number(result.id)) ?? '',
+            normalizedQuery,
+            this.analyzer,
+          ),
           score: result.score * titleBoost,
         };
       })
@@ -193,12 +197,14 @@ function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => globalThis.setTimeout(resolve, 0));
 }
 
-function makeSnippet(text: string, query: string): string {
+function makeSnippet(text: string, normalizedQuery: string, analyzer: Analyzer): string {
   const compactText = text.replace(/\s+/g, ' ').trim();
   if (!compactText) return '';
-  const needle = query.trim().toLocaleLowerCase();
-  const position = compactText.toLocaleLowerCase().indexOf(needle);
+  const position = analyzer.normalize(compactText).indexOf(normalizedQuery);
   const start = Math.max(0, (position >= 0 ? position : 0) - 36);
-  const end = Math.min(compactText.length, (position >= 0 ? position + needle.length : 0) + 64);
+  const end = Math.min(
+    compactText.length,
+    (position >= 0 ? position + normalizedQuery.length : 0) + 64,
+  );
   return `${start > 0 ? '…' : ''}${compactText.slice(start, end)}${end < compactText.length ? '…' : ''}`;
 }

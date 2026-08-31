@@ -17,6 +17,23 @@ const analyzer = new Analyzer(
 );
 
 describe('VersionedSearchIndexCache', () => {
+  it('publishes the snapshot format for the corrected analyzer and extractors', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '新版格式', '正文', 'wikitext', 1));
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const cache = new VersionedSearchIndexCache(database, { storage: unlimitedStorage() });
+    const result = await cache.publish(await cache.restoreOrRebuild('title', analyzer));
+
+    expect(result).toMatchObject({
+      status: 'published',
+      record: { snapshotFormatVersion: 2 },
+    });
+
+    database.close();
+    await database.delete();
+  });
+
   it('restores title, content snippets, and structured Lua matches identically', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();
@@ -146,6 +163,66 @@ describe('VersionedSearchIndexCache', () => {
     await database.delete();
   });
 
+  it('keeps a newer snapshot published while an older corrupt restore is failing', async () => {
+    const name = `test-${crypto.randomUUID()}`;
+    const restoringDatabase = new WikiSearchDatabase(name);
+    const publishingDatabase = new WikiSearchDatabase(name);
+    await restoringDatabase.open();
+    await publishingDatabase.open();
+    await restoringDatabase.pages.put(page(1, '第一版', '正文', 'wikitext', 1));
+    await restoringDatabase.syncState.put({ key: 'local-sequence', value: 1 });
+    const publishingCache = new VersionedSearchIndexCache(publishingDatabase, {
+      storage: unlimitedStorage(),
+    });
+    const publishingHandle = await publishingCache.restoreOrRebuild('title', analyzer);
+    await publishingCache.publish(publishingHandle);
+    const corrupt = await restoringDatabase.indexSnapshots.get(snapshotKey('title'));
+    if (!corrupt) throw new Error('测试快照未发布');
+    corrupt.json = '{invalid';
+    corrupt.payloadBytes = new TextEncoder().encode(corrupt.json).byteLength;
+    corrupt.sha256 = await digest(corrupt.json);
+    await restoringDatabase.indexSnapshots.put(corrupt);
+
+    let releaseValidation!: () => void;
+    const validationBlocked = new Promise<void>((resolve) => {
+      releaseValidation = resolve;
+    });
+    let validationStarted!: () => void;
+    const validationCalled = new Promise<void>((resolve) => {
+      validationStarted = resolve;
+    });
+    const originalDigest = crypto.subtle.digest.bind(crypto.subtle);
+    const digestSpy = vi.spyOn(crypto.subtle, 'digest').mockImplementation(async (...args) => {
+      validationStarted();
+      await validationBlocked;
+      return originalDigest(...args);
+    });
+    const restoringCache = new VersionedSearchIndexCache(restoringDatabase, {
+      storage: unlimitedStorage(),
+    });
+    const restoring = restoringCache.restoreOrRebuild('title', analyzer);
+    await validationCalled;
+    digestSpy.mockRestore();
+
+    await publishingDatabase.pages.put(page(1, '第二版', '正文', 'wikitext', 2));
+    await publishingDatabase.syncState.put({ key: 'local-sequence', value: 2 });
+    await publishingCache.refresh(publishingHandle);
+    expect((await publishingCache.publish(publishingHandle)).status).toBe('published');
+    releaseValidation();
+    await restoring;
+
+    const verifier = await new VersionedSearchIndexCache(publishingDatabase, {
+      storage: unlimitedStorage(),
+    }).restoreOrRebuild('title', analyzer);
+    expect(verifier.source).toBe('snapshot');
+    expect(verifier.throughLocalSeq).toBe(2);
+    expect(verifier.index.search('第二版')[0]?.title).toBe('第二版');
+
+    restoringDatabase.close();
+    publishingDatabase.close();
+    await restoringDatabase.delete();
+  });
+
   it('does not let an older handle overwrite a higher-sequence snapshot', async () => {
     const name = `test-${crypto.randomUUID()}`;
     const firstDatabase = new WikiSearchDatabase(name);
@@ -200,6 +277,51 @@ describe('VersionedSearchIndexCache', () => {
     });
     expect(handle.throughLocalSeq).toBe(2);
     expect(handle.index.search('第二版')[0]?.title).toBe('第二版标题');
+
+    database.close();
+    await database.delete();
+  });
+
+  it('serializes concurrent refreshes of one handle so its version cannot move backward', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, 'initialPage', '正文', 'wikitext', 1));
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const cache = new VersionedSearchIndexCache(database, { storage: unlimitedStorage() });
+    const handle = await cache.restoreOrRebuild('title', analyzer);
+    const updateAsync = handle.index.updateAsync.bind(handle.index);
+    let updateCall = 0;
+    let firstUpdateStarted!: () => void;
+    const firstUpdateCalled = new Promise<void>((resolve) => {
+      firstUpdateStarted = resolve;
+    });
+    let releaseFirstUpdate!: () => void;
+    const firstUpdateBlocked = new Promise<void>((resolve) => {
+      releaseFirstUpdate = resolve;
+    });
+    handle.index.updateAsync = async (pages, batchSize) => {
+      updateCall += 1;
+      if (updateCall === 1) {
+        firstUpdateStarted();
+        await firstUpdateBlocked;
+      }
+      await updateAsync(pages, batchSize);
+    };
+
+    await database.pages.put(page(1, 'obsoletePayload', '正文', 'wikitext', 2));
+    await database.syncState.put({ key: 'local-sequence', value: 2 });
+    const olderRefresh = cache.refresh(handle);
+    await firstUpdateCalled;
+    await database.pages.put(page(1, 'currentSignal', '正文', 'wikitext', 3));
+    await database.syncState.put({ key: 'local-sequence', value: 3 });
+    const newerRefresh = cache.refresh(handle);
+    setTimeout(releaseFirstUpdate, 25);
+
+    await Promise.all([olderRefresh, newerRefresh]);
+
+    expect(handle.throughLocalSeq).toBe(3);
+    expect(handle.index.search('currentSignal')[0]?.title).toBe('currentSignal');
+    expect(handle.index.search('obsoletePayload')).toEqual([]);
 
     database.close();
     await database.delete();
@@ -266,6 +388,56 @@ describe('VersionedSearchIndexCache', () => {
       status: 'skipped',
       reason: 'cleared-this-session',
     });
+
+    database.close();
+    await database.delete();
+  });
+
+  it('does not let an already-started publish recreate a snapshot after clear returns', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '清除后仍可搜索', '正文', 'wikitext', 1));
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const initialCache = new VersionedSearchIndexCache(database, {
+      storage: unlimitedStorage(),
+    });
+    await initialCache.publish(await initialCache.restoreOrRebuild('title', analyzer));
+    let releaseEstimate!: () => void;
+    const estimateBlocked = new Promise<void>((resolve) => {
+      releaseEstimate = resolve;
+    });
+    let estimateStarted!: () => void;
+    const estimateCalled = new Promise<void>((resolve) => {
+      estimateStarted = resolve;
+    });
+    const cache = new VersionedSearchIndexCache(database, {
+      storage: {
+        estimate: async () => {
+          estimateStarted();
+          await estimateBlocked;
+          return { usage: 1_000, quota: 1024 * 1024 * 1024 };
+        },
+      },
+    });
+    const handle = await cache.restoreOrRebuild('title', analyzer);
+    expect(handle.source).toBe('snapshot');
+
+    const publishing = cache.publish(handle);
+    await estimateCalled;
+    await cache.clear();
+    releaseEstimate();
+
+    expect(await publishing).toEqual({
+      status: 'skipped',
+      reason: 'cleared-this-session',
+    });
+    expect(await database.indexSnapshots.get(snapshotKey('title'))).toBeUndefined();
+    expect((await cache.inspect()).map(({ kind, status }) => ({ kind, status }))).toEqual([
+      { kind: 'title', status: 'missing' },
+      { kind: 'content', status: 'missing' },
+      { kind: 'lua', status: 'missing' },
+    ]);
+    expect(handle.index.search('清除后仍可搜索')[0]?.title).toBe('清除后仍可搜索');
 
     database.close();
     await database.delete();

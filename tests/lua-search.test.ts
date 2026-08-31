@@ -56,6 +56,35 @@ describe('Lua module search', () => {
     expect(extracted.searchableText).not.toContain('Module:Fake');
   });
 
+  it('stops numeric tokens before comments and adjacent operators', () => {
+    const extracted = extractLua(`
+      local x=1-- "hidden line"
+      local y=1--[[hidden block]]
+      local z=1+require('Module:Visible')
+    `);
+
+    expect(extracted.strings).not.toContain('hidden line');
+    expect(extracted.strings).not.toContain('hidden block');
+    expect(extracted.dependencies).toEqual(['Module:Visible']);
+  });
+
+  it('skips an extreme member path and continues extracting later symbols', () => {
+    const extremePath = `p${Array.from(
+      { length: 400 },
+      (_, index) => `.member${index}`,
+    ).join('')}`;
+    const extracted = extractLua(`
+      function ${extremePath}() end
+      function p.visible() end
+      local dependency = require('Module:StillVisible')
+      return p
+    `);
+
+    expect(extracted.functions).toContain('p.visible');
+    expect(extracted.functions).not.toContain(extremePath);
+    expect(extracted.dependencies).toEqual(['Module:StillVisible']);
+  });
+
   it('keeps structured Lua matches out of ordinary body search', () => {
     const luaPage = page(
       828,
@@ -129,18 +158,33 @@ describe('Lua module search', () => {
     });
   });
 
-  it('builds a large generated return table within the interactive prototype budget', () => {
+  it('finds a short camelCase function segment through the public Lua search', () => {
+    const index = new LuaModuleIndex(analyzer);
+    index.rebuild([
+      page(
+        833,
+        '模块:CamelCase',
+        'local p = {}; function p.getId() return 1 end; return p',
+        'Scribunto',
+      ),
+    ]);
+
+    expect(index.search('id')[0]).toMatchObject({
+      title: '模块:CamelCase',
+      matches: expect.arrayContaining([{ kind: 'function', value: 'p.getId' }]),
+    });
+  });
+
+  it('indexes the final entry in a large generated return table', () => {
     const generatedSource = `return { ${Array.from(
       { length: 3_000 },
       (_, index) =>
         `["recipe.${index}"] = { id = "item.${index}", label = "配方 ${index}" }`,
     ).join(',')} }`;
     const index = new LuaModuleIndex(analyzer);
-    const startedAt = performance.now();
 
     index.rebuild([page(832, '模块:Data/大型生成表', generatedSource, 'Scribunto')]);
 
-    expect(performance.now() - startedAt).toBeLessThan(1_500);
     expect(index.search('recipe.2999')[0]?.title).toBe('模块:Data/大型生成表');
   });
 

@@ -31,6 +31,13 @@ describe('wikitext content search', () => {
     expect(extracted).not.toContain('隐藏来源文字');
   });
 
+  it('extracts deeply nested BSON without exhausting the JavaScript call stack', () => {
+    const depth = 12_000;
+    const source = `${'{"level":'.repeat(depth)}"deepMarker"${'}'.repeat(depth)}`;
+
+    expect(extractContent('BSON', source)).toContain('deepMarker');
+  });
+
   it('indexes extracted body text and returns a useful snippet', () => {
     const index = new ContentIndex(analyzer);
     index.rebuild([
@@ -43,6 +50,18 @@ describe('wikitext content search', () => {
       title: '医疗指导',
       snippet: expect.stringContaining('紧急救治'),
     });
+  });
+
+  it('centers snippets on traditional and full-width query matches', () => {
+    const index = new ContentIndex(analyzer);
+    const distantPrefix = '无关前言'.repeat(30);
+    index.rebuild([
+      page(1, '繁简页面', `${distantPrefix}紧急救治发生在这里。`),
+      page(2, '全角页面', `${distantPrefix}设备编号 ABC123 位于这里。`),
+    ]);
+
+    expect(index.search('緊急救治')[0]?.snippet).toContain('紧急救治');
+    expect(index.search('ＡＢＣ１２３')[0]?.snippet).toContain('ABC123');
   });
 
   it('fetches wikitext and BSON in ordinary-user-sized batches and resumes from cache', async () => {
