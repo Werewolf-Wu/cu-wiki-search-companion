@@ -1,0 +1,29 @@
+{
+  "name": "cu-chs-wiki-local-search",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tampermonkey local full-text search for the Casualties Unknown Chinese Wiki",
+  "license": "MPL-2.0",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "install:userscript": "bash scripts/install-userscript.sh",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "dexie": "4.4.5",
+    "jieba-wasm": "2.4.0",
+    "minisearch": "7.2.0",
+    "opencc-js": "1.4.2"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.4",
+    "jsdom": "30.0.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vite-plugin-monkey": "8.1.1",
+    "vitest": "4.1.11"
+  }
+}

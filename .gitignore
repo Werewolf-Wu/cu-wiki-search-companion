@@ -1,0 +1,19 @@
+node_modules/
+dist/
+coverage/
+.vite/
+.playwright-cli/
+*.tsbuildinfo
+
+# Local-only research, handoff notes, raw site captures and prototype artifacts.
+HANDOFF.md
+bench/
+data/
+docs/research/
+p0b.user.js
+
+# Credentials and machine-local logs must never become release inputs.
+.env
+.env.*
+!.env.example
+*.log

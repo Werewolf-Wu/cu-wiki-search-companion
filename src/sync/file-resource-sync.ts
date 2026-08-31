@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: MPL-2.0
+import type { Analyzer } from '../analyzer/analyzer';
+import type { WikiSearchDatabase } from '../storage/database';
+import type {
+  PageRecord,
+  SyncStateRecord,
+  TitleSyncProgress,
+  TitleSyncState,
+} from '../types';
+import { delay, WikiApi } from './wiki-api';
+
+const FILE_RESOURCE_SYNC_KEY = 'file-resource-sync';
+const LOCAL_SEQUENCE_KEY = 'local-sequence';
+const FILE_NAMESPACE = 6;
+
+interface AllFilesResponse {
+  continue?: { gapcontinue?: string };
+  query?: {
+    pages: Array<{
+      pageid: number;
+      ns: number;
+      title: string;
+      redirect?: boolean;
+      lastrevid?: number;
+      contentmodel?: string;
+    }>;
+  };
+}
+
+export interface FileResourceSyncOptions {
+  force?: boolean;
+  requestIntervalMs?: number;
+  onProgress?: (progress: TitleSyncProgress) => void;
+  onBatch?: (files: PageRecord[]) => void | Promise<void>;
+}
+
+export async function readFileResourceSyncState(
+  database: WikiSearchDatabase,
+): Promise<TitleSyncState | undefined> {
+  return (await database.syncState.get(FILE_RESOURCE_SYNC_KEY))?.value as
+    | TitleSyncState
+    | undefined;
+}
+
+export async function syncFileResources(
+  database: WikiSearchDatabase,
+  api: WikiApi,
+  analyzer: Analyzer,
+  options: FileResourceSyncOptions = {},
+): Promise<TitleSyncState> {
+  const existing = await readFileResourceSyncState(database);
+  if (existing?.status === 'complete' && !options.force) {
+    report(existing, options.onProgress);
+    return existing;
+  }
+
+  let state: TitleSyncState;
+  if (!existing || options.force || existing.status === 'failed') {
+    state = {
+      status: 'running',
+      namespaceIds: [FILE_NAMESPACE],
+      namespaceNames: { [FILE_NAMESPACE]: '文件' },
+      namespaceIndex: 0,
+      generation: Date.now(),
+      pagesFetched: 0,
+      startedAt: Date.now(),
+    };
+    await database.syncState.put({ key: FILE_RESOURCE_SYNC_KEY, value: state });
+  } else {
+    state = { ...existing, status: 'running', error: undefined };
+  }
+
+  try {
+    while (state.namespaceIndex === 0) {
+      report(state, options.onProgress);
+      const response = await api.query<AllFilesResponse>({
+        generator: 'allpages',
+        prop: 'info',
+        gaplimit: 500,
+        gapnamespace: FILE_NAMESPACE,
+        ...(state.apcontinue ? { gapcontinue: state.apcontinue } : {}),
+      });
+      const rawFiles = response.query?.pages ?? [];
+      const nextContinue = response.continue?.gapcontinue;
+      let storedBatch: PageRecord[] = [];
+
+      await database.transaction(
+        'rw',
+        database.fileResources,
+        database.pages,
+        database.syncState,
+        async () => {
+          const ids = rawFiles.map(({ pageid }) => pageid);
+          const existingFiles = new Map(
+            (await database.fileResources.bulkGet(ids))
+              .filter((file): file is PageRecord => file !== undefined)
+              .map((file) => [file.id, file]),
+          );
+          const sequenceRecord = (await database.syncState.get(
+            LOCAL_SEQUENCE_KEY,
+          )) as SyncStateRecord<number> | undefined;
+          const newestPage = sequenceRecord
+            ? undefined
+            : await database.pages.orderBy('localSeq').last();
+          let sequence = sequenceRecord?.value ?? newestPage?.localSeq ?? 0;
+          const initialSequence = sequence;
+          storedBatch = rawFiles.map((rawFile) => {
+            const oldFile = existingFiles.get(rawFile.pageid);
+            if (
+              oldFile &&
+              typeof oldFile.revisionId === 'number' &&
+              typeof rawFile.lastrevid === 'number' &&
+              oldFile.revisionId > rawFile.lastrevid
+            ) {
+              return {
+                ...oldFile,
+                seenInTitleSync: state.generation,
+              };
+            }
+            const nextFile: PageRecord = {
+              ...oldFile,
+              id: rawFile.pageid,
+              title: rawFile.title,
+              normalizedTitle: analyzer.normalize(rawFile.title),
+              namespace: FILE_NAMESPACE,
+              namespaceName: '文件',
+              isRedirect: Boolean(rawFile.redirect),
+              revisionId: rawFile.lastrevid,
+              contentModel: rawFile.contentmodel,
+              localSeq: oldFile?.localSeq ?? rawFile.lastrevid ?? rawFile.pageid,
+              seenInTitleSync: state.generation,
+              deleted: false,
+            };
+            if (fileFactChanged(oldFile, nextFile)) {
+              sequence += 1;
+              nextFile.writerSeq = sequence;
+            }
+            return nextFile;
+          });
+          const nextState: TitleSyncState = {
+            ...state,
+            pagesFetched: state.pagesFetched + rawFiles.length,
+            namespaceIndex: nextContinue ? 0 : 1,
+            ...(nextContinue ? { apcontinue: nextContinue } : { apcontinue: undefined }),
+          };
+          await database.fileResources.bulkPut(storedBatch);
+          await database.syncState.bulkPut([
+            { key: FILE_RESOURCE_SYNC_KEY, value: nextState },
+            ...(sequence === initialSequence
+              ? []
+              : [{ key: LOCAL_SEQUENCE_KEY, value: sequence }]),
+          ]);
+          state = nextState;
+        },
+      );
+
+      await options.onBatch?.(storedBatch);
+      report(state, options.onProgress);
+      if (state.namespaceIndex === 0) await delay(options.requestIntervalMs ?? 300);
+    }
+
+    await database.transaction(
+      'rw',
+      database.fileResources,
+      database.pages,
+      database.syncState,
+      async () => {
+        const staleIds = await database.fileResources
+          .filter((file) => file.seenInTitleSync !== state.generation)
+          .primaryKeys();
+        const sequenceRecord = (await database.syncState.get(
+          LOCAL_SEQUENCE_KEY,
+        )) as SyncStateRecord<number> | undefined;
+        const newestPage = sequenceRecord
+          ? undefined
+          : await database.pages.orderBy('localSeq').last();
+        const sequence =
+          (sequenceRecord?.value ?? newestPage?.localSeq ?? 0) + staleIds.length;
+        await database.fileResources.bulkDelete(staleIds);
+        state = { ...state, status: 'complete', completedAt: Date.now() };
+        await database.syncState.bulkPut([
+          { key: FILE_RESOURCE_SYNC_KEY, value: state },
+          ...(staleIds.length
+            ? [{ key: LOCAL_SEQUENCE_KEY, value: sequence }]
+            : []),
+        ]);
+      },
+    );
+    report(state, options.onProgress);
+    return state;
+  } catch (error) {
+    state = {
+      ...state,
+      status: 'failed',
+      error: error instanceof Error ? error.message : String(error),
+    };
+    await database.syncState.put({ key: FILE_RESOURCE_SYNC_KEY, value: state });
+    report(state, options.onProgress);
+    throw error;
+  }
+}
+
+function fileFactChanged(oldFile: PageRecord | undefined, nextFile: PageRecord): boolean {
+  return (
+    !oldFile ||
+    oldFile.title !== nextFile.title ||
+    oldFile.namespace !== nextFile.namespace ||
+    oldFile.isRedirect !== nextFile.isRedirect ||
+    oldFile.revisionId !== nextFile.revisionId ||
+    oldFile.contentModel !== nextFile.contentModel ||
+    Boolean(oldFile.deleted) !== Boolean(nextFile.deleted)
+  );
+}
+
+function report(
+  state: TitleSyncState,
+  callback: FileResourceSyncOptions['onProgress'],
+): void {
+  callback?.({
+    status: state.status,
+    pagesFetched: state.pagesFetched,
+    namespaceIndex: state.namespaceIndex,
+    namespaceCount: 1,
+    namespaceName: '文件',
+    error: state.error,
+  });
+}
