@@ -1026,8 +1026,10 @@ async function start(): Promise<void> {
       debugApi.indexedDataCodes = dataCodeIndex.size;
       if (typeof dataState?.rulesSource === 'string') {
         try {
-          parseDataFieldRules(dataState.rulesSource);
-          dataCodeRulesSource = dataState.rulesSource;
+          const source =
+            upgradeDefaultDataCodeRules(dataState.rulesSource) ?? dataState.rulesSource;
+          parseDataFieldRules(source);
+          dataCodeRulesSource = source;
           panel.setDataCodeRules(dataCodeRulesSource, DEFAULT_DATA_CODE_RULES);
         } catch (error) {
           console.warn('[CU Wiki Search] ignored invalid broadcast Data code rules', error);

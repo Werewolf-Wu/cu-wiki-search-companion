@@ -30,7 +30,7 @@ export function changeBroadcastEffect(message: unknown): ChangeBroadcastEffect {
     return {
       type: 'refresh',
       invalidation: { data: true },
-      dataRefresh: 'complete',
+      dataRefresh: 'pending',
     };
   }
   return {

@@ -17,11 +17,11 @@ describe('changeBroadcastEffect', () => {
     });
   });
 
-  it('clears pending work when another tab commits refreshed Data records', () => {
+  it('rechecks committed Data records against this tab rules', () => {
     expect(changeBroadcastEffect({ type: 'data-committed' })).toEqual({
       type: 'refresh',
       invalidation: { data: true },
-      dataRefresh: 'complete',
+      dataRefresh: 'pending',
     });
   });
 
