@@ -315,7 +315,7 @@ export class SearchPanel {
       this.resultList.append(
         this.messageItem(
           this.codeMode
-            ? '输入已配置字段的值查找代码'
+            ? '输入中文名、英文代码片段或已配置字段值查找代码'
             : this.fileMode
               ? '输入文件名、片段或扩展名开始搜索'
             : this.luaMode
@@ -456,23 +456,28 @@ export class SearchPanel {
     refresh.setAttribute('aria-label', refreshHelp);
     if (this.codeMode) {
       heading.textContent = '查找 Data 代码名';
-      this.input.placeholder = '输入已配置字段的值，例如：手枪';
+      this.input.placeholder = '中文名、英文代码片段或已配置字段值';
+      this.input.setAttribute('aria-label', '搜索 Data 代码');
       this.namespaceSelect.hidden = true;
     } else if (this.fileMode) {
       heading.textContent = '查找文件资源';
       this.input.placeholder = '文件名、片段或扩展名';
+      this.input.setAttribute('aria-label', '搜索文件资源');
       this.namespaceSelect.hidden = true;
     } else if (this.luaMode) {
       heading.textContent = '查找 Lua 模块';
       this.input.placeholder = '函数名、返回键、字符串或 require 目标';
+      this.input.setAttribute('aria-label', '搜索 Lua 模块');
       this.namespaceSelect.hidden = true;
     } else if (this.contentMode) {
       heading.textContent = '搜索页面正文';
       this.input.placeholder = '输入正文关键词';
+      this.input.setAttribute('aria-label', '搜索页面正文');
       this.namespaceSelect.hidden = false;
     } else {
       heading.textContent = this.insertMode ? '插入维基链接' : '搜索并复制标题';
       this.input.placeholder = '标题、片段或英文中缀';
+      this.input.setAttribute('aria-label', '搜索页面标题');
       this.namespaceSelect.hidden = false;
     }
     this.configure.hidden = !this.codeMode;
@@ -774,7 +779,7 @@ const markup = `
       <button class="icon close" type="button" title="关闭">✕</button>
     </header>
     <div class="controls">
-      <input class="query" type="search" autocomplete="off" placeholder="标题、片段或英文中缀" aria-label="搜索标题">
+      <input class="query" type="search" autocomplete="off" placeholder="标题、片段或英文中缀" aria-label="搜索页面标题">
       <select class="mode" aria-label="搜索类型">
         <option value="title">页面标题</option>
         <option value="content">页面正文</option>
@@ -787,7 +792,7 @@ const markup = `
     <section class="settings" hidden>
       <label class="settings-label" for="cu-data-rules">Data 代码检索字段</label>
       <textarea class="data-rules" id="cu-data-rules" spellcheck="false" aria-label="Data 代码检索字段"></textarea>
-      <span class="settings-help">每行“类型 = 路径”；所选路径的标量值用于查找顶层 id 代码名。支持 []、*、**；保存后刷新 Data 代码缓存，不影响页面正文。</span>
+      <span class="settings-help">每行“类型 = 路径”；所选路径的标量值用于查找顶层 id 代码名，英文 id 本身始终可搜索。支持 []、*、**；保存后刷新 Data 代码缓存，不影响页面正文。</span>
       <div class="settings-actions">
         <button class="settings-action reset-rules" type="button">恢复默认</button>
         <button class="settings-action save-rules" type="button">保存并刷新</button>

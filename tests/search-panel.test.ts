@@ -114,8 +114,9 @@ describe('SearchPanel lazy search preparation', () => {
     const callbacks = maintenanceCallbacks();
     const panel = new SearchPanel(callbacks);
     const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    const input = root?.querySelector<HTMLInputElement>('.query');
     const mode = root?.querySelector<HTMLSelectElement>('.mode');
-    if (!root || !mode) throw new Error('搜索面板没有挂载');
+    if (!root || !input || !mode) throw new Error('搜索面板没有挂载');
 
     panel.open();
     expect(callbacks.prepareSearch).toHaveBeenLastCalledWith('title');
@@ -127,11 +128,20 @@ describe('SearchPanel lazy search preparation', () => {
     mode.value = 'data-code';
     mode.dispatchEvent(new Event('change'));
     expect(callbacks.prepareSearch).toHaveBeenCalledTimes(2);
+    expect(input.placeholder).toBe('中文名、英文代码片段或已配置字段值');
+    expect(input.getAttribute('aria-label')).toBe('搜索 Data 代码');
+    expect(root.querySelector('.results')?.textContent).toContain(
+      '输入中文名、英文代码片段或已配置字段值查找代码',
+    );
+    expect(root.querySelector('.settings-help')?.textContent).toContain(
+      '英文 id 本身始终可搜索',
+    );
 
     mode.value = 'files';
     mode.dispatchEvent(new Event('change'));
     expect(callbacks.prepareFiles).toHaveBeenCalledOnce();
     expect(callbacks.prepareSearch).toHaveBeenCalledTimes(2);
+    expect(input.getAttribute('aria-label')).toBe('搜索文件资源');
   });
 });
 
