@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { ReconciliationSyncState } from '../types';
+import { isNonNegativeSafeInteger } from '../storage/sync-state';
 import type { StorageInvalidationRequest } from './runtime-lifecycle-coordinator';
 
 export interface ReconciliationCommitBroadcast {
@@ -84,7 +85,5 @@ export class CommittedReconciliationRefresh {
 }
 
 function normalizeSequence(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
-    ? value
-    : fallback;
+  return isNonNegativeSafeInteger(value) ? value : fallback;
 }

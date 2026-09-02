@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { WikiSearchDatabase } from '../storage/database';
+import { isIncrementalSyncScheduleState } from '../storage/sync-state';
 
 const LOCK_NAME = 'cu-wiki-local-search:incremental-sync:v1';
 const SCHEDULE_STATE_KEY = 'incremental-sync-schedule';
@@ -60,9 +61,10 @@ export class IncrementalSyncCoordinator {
       async (lock) => {
         if (!lock) return 'lock-unavailable';
 
-        const stored = (await this.database.syncState.get(SCHEDULE_STATE_KEY))?.value as
-          | IncrementalSyncScheduleState
-          | undefined;
+        const rawStored = (await this.database.syncState.get(SCHEDULE_STATE_KEY))?.value;
+        const stored = isIncrementalSyncScheduleState(rawStored)
+          ? rawStored
+          : undefined;
         if (stored && this.now() < stored.nextDueAt) return 'not-due';
 
         const completed = await task();

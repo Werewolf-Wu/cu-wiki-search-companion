@@ -270,6 +270,89 @@ describe('wikitext content search', () => {
     await database.delete();
   });
 
+  it('recovers a missing sequence from page and file writer facts inside the content commit', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put({
+      ...page(1, '旧库正文页', undefined, 10),
+      localSeq: 7,
+    });
+    await database.fileResources.put({
+      ...page(6_001, '文件:旧库资源.png', undefined, 60),
+      namespace: 6,
+      namespaceName: '文件',
+      localSeq: 600,
+      writerSeq: 9,
+    });
+    const api = new WikiApi({
+      retries: 0,
+      fetcher: vi.fn(async () =>
+        json({
+          query: {
+            pages: [
+              {
+                pageid: 1,
+                revisions: [
+                  {
+                    revid: 10,
+                    slots: { main: { contentmodel: 'wikitext', content: '恢复后正文' } },
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+      ) as typeof fetch,
+    });
+
+    await syncContent(database, api, { requestIntervalMs: 0 });
+
+    expect(await database.pages.get(1)).toMatchObject({
+      content: '恢复后正文',
+      localSeq: 10,
+    });
+    expect((await database.syncState.get('local-sequence'))?.value).toBe(10);
+
+    database.close();
+    await database.delete();
+  });
+
+  it('streams a large queue repair and leaves equivalent jobs untouched', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    const pages = Array.from({ length: 240 }, (_, offset) =>
+      page(
+        offset + 1,
+        `已缓存页面 ${offset + 1}`,
+        `不应被整表保留的正文 ${offset + 1} ${'内容'.repeat(100)}`,
+        (offset + 1) * 10,
+      ),
+    );
+    await database.pages.bulkPut(pages);
+    await database.jobs.bulkPut(
+      pages.map(({ id, revisionId }) => ({
+        type: 'wikitext-content',
+        pageId: id,
+        status: 'done' as const,
+        targetRevisionId: revisionId,
+        updatedAt: 123,
+      })),
+    );
+    const pagesToArray = vi.spyOn(database.pages, 'toArray');
+    const jobsWhere = vi.spyOn(database.jobs, 'where');
+    const jobsBulkPut = vi.spyOn(database.jobs, 'bulkPut');
+
+    await prepareContentJobs(database, false);
+
+    expect(pagesToArray).not.toHaveBeenCalled();
+    expect(jobsWhere).toHaveBeenCalledWith('type');
+    expect(jobsBulkPut).not.toHaveBeenCalled();
+    expect((await database.jobs.get(1))?.updatedAt).toBe(123);
+
+    database.close();
+    await database.delete();
+  });
+
   it('rolls back both content and sequence when their commit fails', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();
@@ -329,15 +412,12 @@ describe('wikitext content search', () => {
       status: 'done',
       targetRevisionId: 10,
     });
-    const originalFilter = database.jobs.filter.bind(database.jobs);
+    const originalEach = database.pages.each.bind(database.pages);
     let concurrentWrite: Promise<void> | undefined;
-    vi.spyOn(database.jobs, 'filter').mockImplementation((predicate) => {
-      const collection = originalFilter(predicate);
-      if (concurrentWrite) return collection;
-      const originalToArray = collection.toArray.bind(collection);
-      vi.spyOn(collection, 'toArray').mockImplementation(
-        (async () => {
-          const jobs = await originalToArray();
+    vi.spyOn(database.pages, 'each').mockImplementation(
+      (async (callback: Parameters<typeof originalEach>[0]) => {
+        await originalEach(callback);
+        if (!concurrentWrite) {
           concurrentWrite = writerDatabase.transaction(
             'rw',
             writerDatabase.pages,
@@ -353,11 +433,9 @@ describe('wikitext content search', () => {
               });
             },
           );
-          return jobs;
-        }) as never,
-      );
-      return collection;
-    });
+        }
+      }) as never,
+    );
 
     await prepareContentJobs(database, false);
     await concurrentWrite;
@@ -457,6 +535,65 @@ describe('wikitext content search', () => {
       [51, 51, 1],
     ]);
     expect(resumed).toEqual({ total: 51, done: 51, pending: 0, failed: 0 });
+
+    database.close();
+    await database.delete();
+  });
+
+  it('advances large-sync progress from batch transitions with linear job writes', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    const pages = Array.from({ length: 120 }, (_, offset) =>
+      page(offset + 1, `进度页面 ${offset + 1}`, undefined, (offset + 1) * 10),
+    );
+    await database.pages.bulkPut(pages);
+    await prepareContentJobs(database, false);
+    const jobsWhere = vi.spyOn(database.jobs, 'where');
+    const jobsBulkPut = vi.spyOn(database.jobs, 'bulkPut');
+    const onProgress = vi.fn();
+    const api = new WikiApi({
+      retries: 0,
+      fetcher: vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input), 'https://example.test');
+        const ids = (url.searchParams.get('pageids') ?? '').split('|').map(Number);
+        return json({
+          query: {
+            pages: ids.map((id) => ({
+              pageid: id,
+              revisions: [
+                {
+                  revid: id * 10,
+                  slots: {
+                    main: { contentmodel: 'wikitext', content: `批次正文 ${id}` },
+                  },
+                },
+              ],
+            })),
+          },
+        });
+      }) as typeof fetch,
+    });
+
+    const result = await syncContent(database, api, {
+      requestIntervalMs: 0,
+      onProgress,
+    });
+
+    expect(result).toEqual({ total: 120, done: 120, pending: 0, failed: 0 });
+    expect(onProgress.mock.calls.map(([progress]) => progress)).toEqual([
+      { total: 120, done: 0, pending: 120, failed: 0 },
+      { total: 120, done: 50, pending: 70, failed: 0 },
+      { total: 120, done: 100, pending: 20, failed: 0 },
+      { total: 120, done: 120, pending: 0, failed: 0 },
+      { total: 120, done: 120, pending: 0, failed: 0 },
+    ]);
+    expect(
+      jobsWhere.mock.calls.filter(([index]) => String(index) === 'type'),
+    ).toHaveLength(2);
+    expect(jobsBulkPut).toHaveBeenCalledTimes(6);
+    expect(
+      jobsBulkPut.mock.calls.reduce((count, [jobs]) => count + jobs.length, 0),
+    ).toBe(240);
 
     database.close();
     await database.delete();

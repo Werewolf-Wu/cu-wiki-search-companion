@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { Analyzer } from '../analyzer/analyzer';
 import type { WikiSearchDatabase } from '../storage/database';
+import {
+  isReconciliationSyncState,
+  LOCAL_SEQUENCE_KEY,
+  readLocalSequence,
+  readValidatedSyncState,
+} from '../storage/sync-state';
 import type {
   JobRecord,
   PageRecord,
@@ -8,8 +14,15 @@ import type {
   ReconciliationReason,
   ReconciliationSyncResult,
   ReconciliationSyncState,
-  SyncStateRecord,
 } from '../types';
+import {
+  CONTENT_JOB_TYPE,
+  contentJobFromProjection,
+  contentJobMatchesProjection,
+  isContentJobEligible,
+  projectContentJob,
+  searchablePageFactChanged,
+} from './content-job-policy';
 import { readFileResourceSyncState } from './file-resource-sync';
 import { readRecentChangeSyncState } from './recent-change-sync';
 import { readTitleSyncState } from './title-sync';
@@ -17,9 +30,7 @@ import { delay, isWikiLoginRequired, type WikiApi } from './wiki-api';
 
 const RECONCILIATION_SYNC_KEY = 'reconciliation-sync';
 const RECENT_CHANGES_SYNC_KEY = 'recent-changes-sync';
-const LOCAL_SEQUENCE_KEY = 'local-sequence';
 const DATA_CODE_SYNC_KEY = 'data-code-sync';
-const CONTENT_JOB_TYPE = 'wikitext-content';
 const FILE_NAMESPACE = 6;
 const RECONCILIATION_SCAN_PROTOCOL = 2;
 const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1_000;
@@ -56,9 +67,11 @@ export interface ReconciliationSyncOptions {
 export async function readReconciliationSyncState(
   database: WikiSearchDatabase,
 ): Promise<ReconciliationSyncState | undefined> {
-  return (await database.syncState.get(RECONCILIATION_SYNC_KEY))?.value as
-    | ReconciliationSyncState
-    | undefined;
+  return readValidatedSyncState(
+    database,
+    RECONCILIATION_SYNC_KEY,
+    isReconciliationSyncState,
+  );
 }
 
 export async function reconcileWikiMirror(
@@ -69,17 +82,14 @@ export async function reconcileWikiMirror(
 ): Promise<ReconciliationSyncResult> {
   const now = options.now ?? Date.now;
   const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
-  const [titleState, fileState, recentState, existingState, sequenceRecord] =
+  const [titleState, fileState, recentState, existingState, initialSequence] =
     await Promise.all([
       readTitleSyncState(database),
       readFileResourceSyncState(database),
       readRecentChangeSyncState(database),
       readReconciliationSyncState(database),
-      database.syncState.get(LOCAL_SEQUENCE_KEY) as Promise<
-        SyncStateRecord<number> | undefined
-      >,
+      readLocalSequence(database),
     ]);
-  const initialSequence = sequenceRecord?.value ?? 0;
   if (titleState?.status !== 'complete') {
     return inactiveResult('no-baseline', initialSequence);
   }
@@ -174,10 +184,7 @@ export async function reconcileWikiMirror(
               .filter((page): page is PageRecord => page !== undefined)
               .map((page) => [page.id, page]),
           );
-          const currentSequenceRecord = (await database.syncState.get(
-            LOCAL_SEQUENCE_KEY,
-          )) as SyncStateRecord<number> | undefined;
-          let sequence = currentSequenceRecord?.value ?? state.startLocalSeq;
+          let sequence = await readLocalSequence(database);
           let changed = 0;
           let dataChanged = false;
           const storedPages = rawPages.map((rawPage): PageRecord => {
@@ -217,7 +224,7 @@ export async function reconcileWikiMirror(
                 ? { content: undefined, contentRevisionId: undefined }
                 : {}),
             };
-            if (pageChanged(oldPage, nextPage)) {
+            if (searchablePageFactChanged(oldPage, nextPage)) {
               sequence += 1;
               nextPage.localSeq = sequence;
               if (isFileBatch) nextPage.writerSeq = sequence;
@@ -305,10 +312,7 @@ async function finalizeReconciliation(
     database.jobs,
     database.syncState,
     async () => {
-      const sequenceRecord = (await database.syncState.get(
-        LOCAL_SEQUENCE_KEY,
-      )) as SyncStateRecord<number> | undefined;
-      let sequence = sequenceRecord?.value ?? state.startLocalSeq;
+      let sequence = await readLocalSequence(database);
       const stalePages = await database.pages
         .filter(
           (page) =>
@@ -345,39 +349,29 @@ async function finalizeReconciliation(
         if (staleFiles.length) await database.fileResources.bulkPut(staleFiles);
       }
 
-      const [pages, existingJobs] = await Promise.all([
-        database.pages
-          .filter(
-            (page) =>
-              !page.deleted &&
-              !page.isRedirect &&
-              isSearchableContentModel(page.contentModel),
-          )
-          .toArray(),
-        database.jobs.filter((job) => job.type === CONTENT_JOB_TYPE).toArray(),
-      ]);
+      const existingJobs = await database.jobs
+        .where('type')
+        .equals(CONTENT_JOB_TYPE)
+        .toArray();
       const existingByPage = new Map(existingJobs.map((job) => [job.pageId, job]));
-      const eligibleIds = new Set(pages.map((page) => page.id));
-      const jobs = pages.map((page): JobRecord => {
+      const eligibleIds = new Set<number>();
+      const jobsToPut: JobRecord[] = [];
+      await database.pages.each((page) => {
+        if (!isContentJobEligible(page)) return;
+        eligibleIds.add(page.id);
         const existing = existingByPage.get(page.id);
-        const upToDate =
-          typeof page.content === 'string' &&
-          page.contentRevisionId === page.revisionId;
-        return {
-          ...existing,
-          type: CONTENT_JOB_TYPE,
-          pageId: page.id,
-          status: upToDate ? 'done' : 'pending',
-          targetRevisionId: page.revisionId,
-          error: undefined,
-          updatedAt: completedAt,
-        };
+        const projection = projectContentJob(page, false);
+        if (!contentJobMatchesProjection(existing, page.id, projection)) {
+          jobsToPut.push(
+            contentJobFromProjection(page.id, projection, existing, completedAt),
+          );
+        }
       });
       const staleJobIds = existingJobs.flatMap((job) =>
         !eligibleIds.has(job.pageId) && job.id !== undefined ? [job.id] : [],
       );
       if (staleJobIds.length) await database.jobs.bulkDelete(staleJobIds);
-      if (jobs.length) await database.jobs.bulkPut(jobs);
+      if (jobsToPut.length) await database.jobs.bulkPut(jobsToPut);
 
       const pagesChanged = state.pagesChanged + stalePages.length;
       const filesChanged = state.filesChanged || staleFiles.length > 0;
@@ -440,26 +434,6 @@ function reconciliationReason(
   if (now - lastCompletedAt >= intervalMs) return 'scheduled';
   if (recentThrough && now - Date.parse(recentThrough) >= intervalMs) return 'rc-gap';
   return undefined;
-}
-
-function pageChanged(previous: PageRecord | undefined, next: PageRecord): boolean {
-  if (!previous) return true;
-  return (
-    previous.title !== next.title ||
-    previous.namespace !== next.namespace ||
-    previous.namespaceName !== next.namespaceName ||
-    previous.isRedirect !== next.isRedirect ||
-    previous.deleted !== next.deleted ||
-    previous.revisionId !== next.revisionId ||
-    previous.contentModel !== next.contentModel ||
-    previous.contentRevisionId !== next.contentRevisionId ||
-    previous.content !== next.content
-  );
-}
-
-function isSearchableContentModel(contentModel: string | undefined): boolean {
-  const normalized = contentModel?.toLocaleLowerCase();
-  return normalized === 'wikitext' || normalized === 'bson' || normalized === 'scribunto';
 }
 
 function inactiveResult(

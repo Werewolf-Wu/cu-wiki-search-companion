@@ -43,8 +43,35 @@ describe('LocalDataMaintenance', () => {
     ]);
     await database.syncState.bulkPut([
       { key: 'local-sequence', value: 4 },
-      { key: 'recent-changes-sync', value: { through: 'cursor', completedAt: 10 } },
-      { key: 'reconciliation-sync', value: { status: 'complete', completedAt: 20 } },
+      {
+        key: 'recent-changes-sync',
+        value: {
+          through: '2026-08-31T03:10:00Z',
+          completedAt: 10,
+          recentChanges: [],
+        },
+      },
+      {
+        key: 'reconciliation-sync',
+        value: {
+          status: 'complete',
+          scanProtocol: 2,
+          reason: 'scheduled',
+          namespaceIds: [0],
+          namespaceNames: { 0: '（主）' },
+          namespaceIndex: 1,
+          generation: 1,
+          startLocalSeq: 1,
+          throughLocalSeq: 4,
+          serverStartedAt: '2026-08-31T03:10:00Z',
+          pagesFetched: 3,
+          pagesChanged: 0,
+          filesChanged: false,
+          dataCodesInvalidated: false,
+          startedAt: 10,
+          completedAt: 20,
+        },
+      },
     ]);
     const cache = new VersionedSearchIndexCache(database, {
       storage: { estimate: async () => ({ usage: 2_000, quota: 10_000 }) },
@@ -67,12 +94,16 @@ describe('LocalDataMaintenance', () => {
       luaSources: 1,
     });
     expect(diagnostics.jobs).toEqual({ done: 1, pending: 1, running: 1, failed: 1 });
-    expect(diagnostics.recentChanges).toMatchObject({ through: 'cursor', completedAt: 10 });
+    expect(diagnostics.recentChanges).toMatchObject({
+      through: '2026-08-31T03:10:00Z',
+      completedAt: 10,
+    });
     expect(diagnostics.reconciliation).toMatchObject({ status: 'complete', completedAt: 20 });
     expect(diagnostics.snapshots.find(({ kind }) => kind === 'title')).toMatchObject({
       status: 'available',
     });
     expect(diagnostics.storage).toEqual({ usage: 2_000, quota: 10_000, persisted: true });
+    expect(diagnostics.warnings).toEqual([]);
 
     database.close();
     await database.delete();
@@ -92,6 +123,84 @@ describe('LocalDataMaintenance', () => {
 
     expect(await database.jobs.toArray()).toEqual([
       expect.objectContaining({ pageId: 1, status: 'pending' }),
+    ]);
+
+    database.close();
+    await database.delete();
+  });
+
+  it('streams large diagnostic counts without materializing page bodies', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.bulkPut(
+      Array.from({ length: 240 }, (_, offset) =>
+        page(
+          offset + 1,
+          `诊断页面 ${offset + 1}`,
+          `${'大段正文'.repeat(100)} ${offset + 1}`,
+          offset % 3 === 0 ? 'Scribunto' : 'wikitext',
+        ),
+      ),
+    );
+    await database.fileResources.bulkPut(
+      Array.from({ length: 20 }, (_, offset) =>
+        page(10_000 + offset, `文件:诊断 ${offset}.png`, undefined, undefined),
+      ),
+    );
+    await database.jobs.bulkPut([
+      { type: 'wikitext-content', pageId: 1, status: 'done' },
+      { type: 'wikitext-content', pageId: 2, status: 'pending' },
+    ]);
+    const pagesToArray = vi.spyOn(database.pages, 'toArray');
+    const filesToArray = vi.spyOn(database.fileResources, 'toArray');
+    const jobsWhere = vi.spyOn(database.jobs, 'where');
+    const maintenance = new LocalDataMaintenance(
+      database,
+      new VersionedSearchIndexCache(database),
+    );
+
+    const diagnostics = await maintenance.inspect();
+
+    expect(diagnostics.counts).toMatchObject({
+      pages: 240,
+      files: 20,
+      contentSources: 160,
+      luaSources: 80,
+    });
+    expect(diagnostics.jobs).toEqual({ done: 1, pending: 1, running: 0, failed: 0 });
+    expect(pagesToArray).not.toHaveBeenCalled();
+    expect(filesToArray).not.toHaveBeenCalled();
+    expect(jobsWhere).toHaveBeenCalledWith('type');
+
+    database.close();
+    await database.delete();
+  });
+
+  it('keeps diagnostics available when derived sync state is malformed', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.syncState.bulkPut([
+      {
+        key: 'recent-changes-sync',
+        value: { through: 123, completedAt: 'broken', recentChanges: [] },
+      },
+      {
+        key: 'reconciliation-sync',
+        value: { status: 'running', namespaceIndex: -1 },
+      },
+    ]);
+    const maintenance = new LocalDataMaintenance(
+      database,
+      new VersionedSearchIndexCache(database),
+    );
+
+    const diagnostics = await maintenance.inspect();
+
+    expect(diagnostics.recentChanges).toBeUndefined();
+    expect(diagnostics.reconciliation).toBeUndefined();
+    expect(diagnostics.warnings).toEqual([
+      expect.stringContaining('recent-changes-sync'),
+      expect.stringContaining('reconciliation-sync'),
     ]);
 
     database.close();

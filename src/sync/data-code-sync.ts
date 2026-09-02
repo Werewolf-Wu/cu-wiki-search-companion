@@ -8,6 +8,7 @@ import {
   type DataFieldRules,
 } from '../data/data-field-rules';
 import type { WikiSearchDatabase } from '../storage/database';
+import { isDataCodeSyncState } from '../storage/sync-state';
 import type { DataCodeRecord, DataCodeSyncState } from '../types';
 import {
   DEFAULT_REQUEST_TIMEOUT_MS,
@@ -50,9 +51,8 @@ export interface DataCodeSyncResult {
 export async function readDataCodeSyncState(
   database: WikiSearchDatabase,
 ): Promise<DataCodeSyncState | undefined> {
-  return (await database.syncState.get(DATA_CODE_SYNC_KEY))?.value as
-    | DataCodeSyncState
-    | undefined;
+  const value = (await database.syncState.get(DATA_CODE_SYNC_KEY))?.value;
+  return isDataCodeSyncState(value) ? value : undefined;
 }
 
 export async function syncDataCodes(

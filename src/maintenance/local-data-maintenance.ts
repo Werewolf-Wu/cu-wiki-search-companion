@@ -16,10 +16,11 @@ import {
   CACHE_VERSION_CONTRACT_KEY,
   type CacheVersionContract,
 } from '../storage/version-contract';
+import { CONTENT_JOB_TYPE } from '../sync/content-job-policy';
 import { prepareContentJobs } from '../sync/content-sync';
+import { readRecentChangeSyncState } from '../sync/recent-change-sync';
+import { readReconciliationSyncState } from '../sync/reconciliation-sync';
 import type { RecentChangeSyncState, ReconciliationSyncState } from '../types';
-
-const CONTENT_JOB_TYPE = 'wikitext-content';
 
 interface MaintenanceStorage {
   estimate?(): Promise<StorageEstimate>;
@@ -52,6 +53,7 @@ export interface LocalDataDiagnostics {
   versionContract?: CacheVersionContract;
   snapshots: SnapshotInspection[];
   storage: { usage?: number; quota?: number; persisted?: boolean };
+  warnings?: string[];
 }
 
 export type PersistenceRequestResult =
@@ -96,54 +98,46 @@ export class LocalDataMaintenance {
   }
 
   async inspect(): Promise<LocalDataDiagnostics> {
-    const [pages, files, dataCodes, jobs, recentRecord, reconciliationRecord, versionRecord, snapshots] =
+    const counts = { pages: 0, files: 0, dataCodes: 0, contentSources: 0, luaSources: 0 };
+    const jobs = { done: 0, pending: 0, running: 0, failed: 0 };
+    const [dataCodes, recentState, reconciliationState, versionRecord, snapshots] =
       await Promise.all([
-        this.database.pages.toArray(),
-        this.database.fileResources.toArray(),
         this.database.dataCodes.count(),
-        this.database.jobs.filter((job) => job.type === CONTENT_JOB_TYPE).toArray(),
-        this.database.syncState.get('recent-changes-sync'),
-        this.database.syncState.get('reconciliation-sync'),
+        diagnosticState(() => readRecentChangeSyncState(this.database)),
+        diagnosticState(() => readReconciliationSyncState(this.database)),
         this.database.syncState.get(CACHE_VERSION_CONTRACT_KEY),
         this.indexCache.inspect(),
+        this.database.pages.each((page) => {
+          if (page.deleted) return;
+          counts.pages += 1;
+          if (page.isRedirect || typeof page.content !== 'string') return;
+          const model = page.contentModel?.toLocaleLowerCase();
+          if (model === 'scribunto') counts.luaSources += 1;
+          else if (model === 'wikitext' || model === 'bson') counts.contentSources += 1;
+        }),
+        this.database.fileResources.each((file) => {
+          if (!file.deleted) counts.files += 1;
+        }),
+        this.database.jobs
+          .where('type')
+          .equals(CONTENT_JOB_TYPE)
+          .each((job) => {
+            jobs[job.status] += 1;
+          }),
       ]);
-    const activePages = pages.filter((page) => !page.deleted);
-    const contentSources = activePages.filter((page) => {
-      const model = page.contentModel?.toLocaleLowerCase();
-      return (
-        !page.isRedirect &&
-        typeof page.content === 'string' &&
-        (model === 'wikitext' || model === 'bson')
-      );
-    }).length;
-    const luaSources = activePages.filter(
-      (page) =>
-        !page.isRedirect &&
-        typeof page.content === 'string' &&
-        page.contentModel?.toLocaleLowerCase() === 'scribunto',
-    ).length;
+    counts.dataCodes = dataCodes;
     const storage = await this.inspectStorage();
     return {
-      counts: {
-        pages: activePages.length,
-        files: files.filter((file) => !file.deleted).length,
-        dataCodes,
-        contentSources,
-        luaSources,
-      },
-      jobs: {
-        done: jobs.filter((job) => job.status === 'done').length,
-        pending: jobs.filter((job) => job.status === 'pending').length,
-        running: jobs.filter((job) => job.status === 'running').length,
-        failed: jobs.filter((job) => job.status === 'failed').length,
-      },
-      recentChanges: recentRecord?.value as RecentChangeSyncState | undefined,
-      reconciliation: reconciliationRecord?.value as
-        | ReconciliationSyncState
-        | undefined,
+      counts,
+      jobs,
+      recentChanges: recentState.value,
+      reconciliation: reconciliationState.value,
       versionContract: versionRecord?.value as CacheVersionContract | undefined,
       snapshots,
       storage,
+      warnings: [recentState.warning, reconciliationState.warning].filter(
+        (warning): warning is string => warning !== undefined,
+      ),
     };
   }
 
@@ -229,6 +223,19 @@ export class LocalDataMaintenance {
       }
     }
     return result;
+  }
+}
+
+async function diagnosticState<T>(
+  read: () => Promise<T | undefined>,
+): Promise<{ value: T | undefined; warning?: string }> {
+  try {
+    return { value: await read() };
+  } catch (error) {
+    return {
+      value: undefined,
+      warning: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 

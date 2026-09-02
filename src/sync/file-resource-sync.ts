@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { Analyzer } from '../analyzer/analyzer';
 import type { WikiSearchDatabase } from '../storage/database';
+import {
+  isTitleSyncState,
+  LOCAL_SEQUENCE_KEY,
+  readLocalSequence,
+  readValidatedSyncState,
+} from '../storage/sync-state';
 import type {
   PageRecord,
-  SyncStateRecord,
   TitleSyncProgress,
   TitleSyncState,
 } from '../types';
 import { delay, WikiApi } from './wiki-api';
 
 const FILE_RESOURCE_SYNC_KEY = 'file-resource-sync';
-const LOCAL_SEQUENCE_KEY = 'local-sequence';
 const RECENT_CHANGES_SYNC_KEY = 'recent-changes-sync';
 const FILE_NAMESPACE = 6;
 
@@ -38,9 +42,11 @@ export interface FileResourceSyncOptions {
 export async function readFileResourceSyncState(
   database: WikiSearchDatabase,
 ): Promise<TitleSyncState | undefined> {
-  return (await database.syncState.get(FILE_RESOURCE_SYNC_KEY))?.value as
-    | TitleSyncState
-    | undefined;
+  return readValidatedSyncState(
+    database,
+    FILE_RESOURCE_SYNC_KEY,
+    isTitleSyncState,
+  );
 }
 
 export async function syncFileResources(
@@ -97,13 +103,7 @@ export async function syncFileResources(
               .filter((file): file is PageRecord => file !== undefined)
               .map((file) => [file.id, file]),
           );
-          const sequenceRecord = (await database.syncState.get(
-            LOCAL_SEQUENCE_KEY,
-          )) as SyncStateRecord<number> | undefined;
-          const newestPage = sequenceRecord
-            ? undefined
-            : await database.pages.orderBy('localSeq').last();
-          let sequence = sequenceRecord?.value ?? newestPage?.localSeq ?? 0;
+          let sequence = await readLocalSequence(database);
           const initialSequence = sequence;
           storedBatch = rawFiles.map((rawFile) => {
             const oldFile = existingFiles.get(rawFile.pageid);
@@ -180,14 +180,7 @@ export async function syncFileResources(
         const staleIds = await database.fileResources
           .filter((file) => file.seenInTitleSync !== state.generation)
           .primaryKeys();
-        const sequenceRecord = (await database.syncState.get(
-          LOCAL_SEQUENCE_KEY,
-        )) as SyncStateRecord<number> | undefined;
-        const newestPage = sequenceRecord
-          ? undefined
-          : await database.pages.orderBy('localSeq').last();
-        const sequence =
-          (sequenceRecord?.value ?? newestPage?.localSeq ?? 0) + staleIds.length;
+        const sequence = (await readLocalSequence(database)) + staleIds.length;
         const recentChangeRecord = staleIds.length
           ? await database.syncState.get(RECENT_CHANGES_SYNC_KEY)
           : undefined;

@@ -65,6 +65,13 @@ describe('full mirror reconciliation', () => {
     ]);
     await database.jobs.bulkAdd([
       { type: 'wikitext-content', pageId: 1, status: 'done', targetRevisionId: 10 },
+      {
+        type: 'wikitext-content',
+        pageId: 3,
+        status: 'done',
+        targetRevisionId: 30,
+        updatedAt: 123,
+      },
       { type: 'wikitext-content', pageId: 999, status: 'failed', targetRevisionId: 1 },
     ]);
     const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
@@ -107,6 +114,7 @@ describe('full mirror reconciliation', () => {
         pageId: 3,
         status: 'done',
         targetRevisionId: 30,
+        updatedAt: 123,
       }),
     ]);
     expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({

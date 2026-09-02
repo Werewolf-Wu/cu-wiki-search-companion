@@ -1,22 +1,34 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { Analyzer } from '../analyzer/analyzer';
 import type { WikiSearchDatabase } from '../storage/database';
+import {
+  isRecentChangeSyncState,
+  LOCAL_SEQUENCE_KEY,
+  readLocalSequence,
+  readValidatedSyncState,
+} from '../storage/sync-state';
 import type {
   PageRecord,
   RecentChangeMarker,
   RecentChangeSyncResult,
   RecentChangeSyncState,
-  SyncStateRecord,
 } from '../types';
+import {
+  CONTENT_JOB_TYPE,
+  contentJobFromProjection,
+  contentJobMatchesProjection,
+  isContentJobEligible,
+  isSearchableContentModel,
+  projectContentJob,
+  searchablePageFactChanged,
+} from './content-job-policy';
 import { readFileResourceSyncState } from './file-resource-sync';
 import { readTitleSyncState } from './title-sync';
 import { delay, isWikiLoginRequired, type WikiApi } from './wiki-api';
 
 const RECENT_CHANGES_SYNC_KEY = 'recent-changes-sync';
-const LOCAL_SEQUENCE_KEY = 'local-sequence';
 const DEFAULT_OVERLAP_MS = 5 * 60 * 1_000;
 const BATCH_SIZE = 50;
-const CONTENT_JOB_TYPE = 'wikitext-content';
 const PAGE_AFFECTING_LOG_TYPES = new Set([
   'contentmodel',
   'delete',
@@ -98,13 +110,12 @@ export async function syncRecentChanges(
   analyzer: Analyzer,
   options: RecentChangeSyncOptions = {},
 ): Promise<RecentChangeSyncResult> {
-  const [titleState, fileState, incrementalState, sequenceRecord] = await Promise.all([
+  const [titleState, fileState, incrementalState, initialSequence] = await Promise.all([
     readTitleSyncState(database),
     readFileResourceSyncState(database),
     readRecentChangeSyncState(database),
-    database.syncState.get(LOCAL_SEQUENCE_KEY) as Promise<SyncStateRecord<number> | undefined>,
+    readLocalSequence(database),
   ]);
-  const initialSequence = sequenceRecord?.value ?? 0;
   if (titleState?.status !== 'complete') return inactiveResult('no-baseline', initialSequence);
 
   const overlapMs = options.overlapMs ?? DEFAULT_OVERLAP_MS;
@@ -240,10 +251,7 @@ export async function syncRecentChanges(
     database.jobs,
     database.syncState,
     async () => {
-    const currentSequenceRecord = (await database.syncState.get(
-      LOCAL_SEQUENCE_KEY,
-    )) as SyncStateRecord<number> | undefined;
-    sequence = currentSequenceRecord?.value ?? initialSequence;
+    sequence = await readLocalSequence(database);
     const missingTitles = regularInfoPages
       .filter((page) => page.missing && typeof page.title === 'string')
       .map((page) => page.title as string);
@@ -263,7 +271,9 @@ export async function syncRecentChanges(
         .map((page) => [page.id, page]),
     );
     const existingJobs = await database.jobs
-      .filter((job) => job.type === CONTENT_JOB_TYPE && pageIds.has(job.pageId))
+      .where('type')
+      .equals(CONTENT_JOB_TYPE)
+      .filter((job) => pageIds.has(job.pageId))
       .toArray();
     const jobsByPageId = new Map(existingJobs.map((job) => [job.pageId, job]));
     const nextPages = new Map<number, PageRecord>();
@@ -308,7 +318,7 @@ export async function syncRecentChanges(
             : {}
           : { content: undefined, contentRevisionId: undefined }),
       };
-      if (pageChanged(oldPage, nextPage)) {
+      if (searchablePageFactChanged(oldPage, nextPage)) {
         sequence += 1;
         nextPage.localSeq = sequence;
         changedPages.push(nextPage);
@@ -326,7 +336,7 @@ export async function syncRecentChanges(
       const oldPage = currentPages.get(raw.pageid);
       if (!oldPage) continue;
       const deletedPage = tombstone(oldPage, titleState.generation);
-      if (pageChanged(oldPage, deletedPage)) {
+      if (searchablePageFactChanged(oldPage, deletedPage)) {
         sequence += 1;
         deletedPage.localSeq = sequence;
         changedPages.push(deletedPage);
@@ -337,7 +347,7 @@ export async function syncRecentChanges(
     for (const oldPage of pagesByMissingTitle) {
       if (activePageIds.has(oldPage.id) || nextPages.has(oldPage.id)) continue;
       const deletedPage = tombstone(oldPage, titleState.generation);
-      if (pageChanged(oldPage, deletedPage)) {
+      if (searchablePageFactChanged(oldPage, deletedPage)) {
         sequence += 1;
         deletedPage.localSeq = sequence;
         changedPages.push(deletedPage);
@@ -346,25 +356,20 @@ export async function syncRecentChanges(
       nextPages.set(deletedPage.id, deletedPage);
     }
     if (nextPages.size) await database.pages.bulkPut([...nextPages.values()]);
-    const jobsToPut = [...nextPages.values()].flatMap((page) => {
-      if (page.deleted || page.isRedirect || !isSearchableContentModel(page.contentModel)) {
-        return [];
+    const jobsToPut = [];
+    const retainedJobPageIds = new Set<number>();
+    const jobsUpdatedAt = Date.now();
+    for (const page of nextPages.values()) {
+      if (!isContentJobEligible(page)) continue;
+      retainedJobPageIds.add(page.id);
+      const existingJob = jobsByPageId.get(page.id);
+      const projection = projectContentJob(page, false);
+      if (!contentJobMatchesProjection(existingJob, page.id, projection)) {
+        jobsToPut.push(
+          contentJobFromProjection(page.id, projection, existingJob, jobsUpdatedAt),
+        );
       }
-      const upToDate =
-        typeof page.content === 'string' && page.contentRevisionId === page.revisionId;
-      return [
-        {
-          ...jobsByPageId.get(page.id),
-          type: CONTENT_JOB_TYPE,
-          pageId: page.id,
-          status: upToDate ? ('done' as const) : ('pending' as const),
-          targetRevisionId: page.revisionId,
-          error: undefined,
-          updatedAt: Date.now(),
-        },
-      ];
-    });
-    const retainedJobPageIds = new Set(jobsToPut.map(({ pageId }) => pageId));
+    }
     const staleJobIds = existingJobs.flatMap((job) =>
       !retainedJobPageIds.has(job.pageId) && job.id !== undefined ? [job.id] : [],
     );
@@ -432,7 +437,7 @@ export async function syncRecentChanges(
           revisionId: raw.lastrevid,
           contentModel: raw.contentmodel ?? oldFile?.contentModel,
         };
-        if (pageChanged(oldFile, nextFile)) {
+        if (searchablePageFactChanged(oldFile, nextFile)) {
           sequence += 1;
           nextFile.localSeq = sequence;
           nextFile.writerSeq = sequence;
@@ -517,9 +522,11 @@ export async function syncRecentChanges(
 export async function readRecentChangeSyncState(
   database: WikiSearchDatabase,
 ): Promise<RecentChangeSyncState | undefined> {
-  return (await database.syncState.get(RECENT_CHANGES_SYNC_KEY))?.value as
-    | RecentChangeSyncState
-    | undefined;
+  return readValidatedSyncState(
+    database,
+    RECENT_CHANGES_SYNC_KEY,
+    isRecentChangeSyncState,
+  );
 }
 
 async function collectRecentChanges(
@@ -700,26 +707,6 @@ function deduplicatePageInfo(pages: RawPageInfo[]): RawPageInfo[] {
     unique.set(key, page);
   }
   return [...unique.values()];
-}
-
-function isSearchableContentModel(contentModel: string | undefined): boolean {
-  const normalized = contentModel?.toLocaleLowerCase();
-  return normalized === 'wikitext' || normalized === 'bson' || normalized === 'scribunto';
-}
-
-function pageChanged(previous: PageRecord | undefined, next: PageRecord): boolean {
-  if (!previous) return true;
-  return (
-    previous.title !== next.title ||
-    previous.namespace !== next.namespace ||
-    previous.namespaceName !== next.namespaceName ||
-    previous.isRedirect !== next.isRedirect ||
-    previous.deleted !== next.deleted ||
-    previous.revisionId !== next.revisionId ||
-    previous.contentModel !== next.contentModel ||
-    previous.contentRevisionId !== next.contentRevisionId ||
-    previous.content !== next.content
-  );
 }
 
 function tombstone(page: PageRecord, generation: number): PageRecord {

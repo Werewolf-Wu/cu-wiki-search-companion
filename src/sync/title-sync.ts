@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { Analyzer } from '../analyzer/analyzer';
 import type { WikiSearchDatabase } from '../storage/database';
+import {
+  isTitleSyncState,
+  LOCAL_SEQUENCE_KEY,
+  readLocalSequence,
+  readValidatedSyncState,
+} from '../storage/sync-state';
 import type {
   PageRecord,
-  SyncStateRecord,
   TitleSyncProgress,
   TitleSyncState,
 } from '../types';
 import { delay, WikiApi } from './wiki-api';
 
 const TITLE_SYNC_KEY = 'title-sync';
-const SEQUENCE_KEY = 'local-sequence';
 
 interface SiteInfoResponse {
   query: {
@@ -42,9 +46,7 @@ export interface TitleSyncOptions {
 export async function readTitleSyncState(
   database: WikiSearchDatabase,
 ): Promise<TitleSyncState | undefined> {
-  return (await database.syncState.get(TITLE_SYNC_KEY))?.value as
-    | TitleSyncState
-    | undefined;
+  return readValidatedSyncState(database, TITLE_SYNC_KEY, isTitleSyncState);
 }
 
 export async function syncTitles(
@@ -101,17 +103,14 @@ export async function syncTitles(
       const nextContinue = response.continue?.gapcontinue;
       let storedBatch: PageRecord[] = [];
 
-      const committedState = await database.transaction('rw', database.pages, database.syncState, async () => {
+      const committedState = await database.transaction('rw', database.pages, database.fileResources, database.syncState, async () => {
         const ids = rawPages.map(({ pageid }) => pageid);
         const existingPages = new Map(
           (await database.pages.bulkGet(ids))
             .filter((page): page is PageRecord => page !== undefined)
             .map((page) => [page.id, page]),
         );
-        const sequenceRecord = (await database.syncState.get(SEQUENCE_KEY)) as
-          | SyncStateRecord<number>
-          | undefined;
-        let sequence = sequenceRecord?.value ?? 0;
+        let sequence = await readLocalSequence(database);
 
         storedBatch = rawPages.map((rawPage) => {
           const oldPage = existingPages.get(rawPage.pageid);
@@ -161,7 +160,7 @@ export async function syncTitles(
         };
         await database.pages.bulkPut(storedBatch);
         await database.syncState.bulkPut([
-          { key: SEQUENCE_KEY, value: sequence },
+          { key: LOCAL_SEQUENCE_KEY, value: sequence },
           { key: TITLE_SYNC_KEY, value: nextState },
         ]);
         return nextState;
@@ -178,15 +177,13 @@ export async function syncTitles(
     const completedState = await database.transaction(
       'rw',
       database.pages,
+      database.fileResources,
       database.syncState,
       async () => {
         const stalePages = await database.pages
           .filter((page) => !page.deleted && page.seenInTitleSync !== state.generation)
           .toArray();
-        const sequenceRecord = (await database.syncState.get(SEQUENCE_KEY)) as
-          | SyncStateRecord<number>
-          | undefined;
-        let sequence = sequenceRecord?.value ?? 0;
+        let sequence = await readLocalSequence(database);
         for (const page of stalePages) {
           sequence += 1;
           page.deleted = true;
@@ -201,7 +198,7 @@ export async function syncTitles(
           completedAt: Date.now(),
         };
         await database.syncState.bulkPut([
-          { key: SEQUENCE_KEY, value: sequence },
+          { key: LOCAL_SEQUENCE_KEY, value: sequence },
           { key: TITLE_SYNC_KEY, value: nextState },
         ]);
         return nextState;

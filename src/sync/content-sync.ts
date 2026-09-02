@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { WikiSearchDatabase } from '../storage/database';
+import { LOCAL_SEQUENCE_KEY, readLocalSequence } from '../storage/sync-state';
 import type {
   ContentSyncProgress,
   JobRecord,
   PageRecord,
-  SyncStateRecord,
 } from '../types';
+import {
+  CONTENT_JOB_TYPE,
+  contentJobFromProjection,
+  contentJobMatchesProjection,
+  isContentJobEligible,
+  isSearchableContentModel,
+  projectContentJob,
+} from './content-job-policy';
 import { delay, type WikiApi } from './wiki-api';
 
-const CONTENT_JOB_TYPE = 'wikitext-content';
-const LOCAL_SEQUENCE_KEY = 'local-sequence';
 const BATCH_SIZE = 50;
 
 interface ContentResponse {
@@ -39,7 +45,8 @@ export async function syncContent(
   options: ContentSyncOptions = {},
 ): Promise<ContentSyncProgress> {
   await prepareContentJobs(database, options.force ?? false);
-  reportProgress(await progress(database), options.onProgress);
+  let currentProgress = await progress(database);
+  reportProgress(currentProgress, options.onProgress);
   const claimedJobs = new Map<number, number>();
 
   try {
@@ -74,9 +81,10 @@ export async function syncContent(
       const rawById = new Map((response.query?.pages ?? []).map((page) => [page.pageid, page]));
       const updatedPages: PageRecord[] = [];
 
-      await database.transaction(
+      const progressDelta = await database.transaction(
         'rw',
         database.pages,
+        database.fileResources,
         database.jobs,
         database.syncState,
         async () => {
@@ -92,18 +100,17 @@ export async function syncContent(
         );
         const jobsToPut: JobRecord[] = [];
         const jobsToDelete: number[] = [];
-        const sequenceRecord = (await database.syncState.get(
-          LOCAL_SEQUENCE_KEY,
-        )) as SyncStateRecord<number> | undefined;
-        const newestPage = sequenceRecord
-          ? undefined
-          : await database.pages.orderBy('localSeq').last();
-        let sequence = sequenceRecord?.value ?? newestPage?.localSeq ?? 0;
+        const delta = emptyProgress();
+        let sequence = await readLocalSequence(database);
         const initialSequence = sequence;
         for (const requestedJob of batch) {
           const job =
             requestedJob.id === undefined ? undefined : currentJobs.get(requestedJob.id);
-          if (!job || (job.status !== 'running' && job.status !== 'pending')) continue;
+          if (!job) {
+            addJobTransition(delta, requestedJob.status, undefined);
+            continue;
+          }
+          if (job.status !== 'running' && job.status !== 'pending') continue;
           const stored = storedPages.get(job.pageId);
           if (
             !stored ||
@@ -112,6 +119,7 @@ export async function syncContent(
             !isSearchableContentModel(stored.contentModel)
           ) {
             if (job.id !== undefined) jobsToDelete.push(job.id);
+            addJobTransition(delta, job.status, undefined);
             continue;
           }
 
@@ -119,10 +127,12 @@ export async function syncContent(
           const revision = raw?.revisions?.[0];
           const slot = revision?.slots?.main;
           if (!revision || typeof slot?.content !== 'string') {
+            const previousStatus = job.status;
             job.status = 'failed';
             job.error = '页面或正文响应缺失';
             job.updatedAt = Date.now();
             jobsToPut.push(job);
+            addJobTransition(delta, previousStatus, job.status);
             continue;
           }
 
@@ -150,12 +160,14 @@ export async function syncContent(
             sequence += 1;
             stored.localSeq = sequence;
           }
+          const previousStatus = job.status;
           job.status = 'done';
           job.targetRevisionId = stored.revisionId;
           job.error = undefined;
           job.updatedAt = Date.now();
           updatedPages.push(stored);
           jobsToPut.push(job);
+          addJobTransition(delta, previousStatus, job.status);
         }
         await database.pages.bulkPut(updatedPages);
         if (jobsToDelete.length) await database.jobs.bulkDelete(jobsToDelete);
@@ -163,11 +175,13 @@ export async function syncContent(
         if (sequence !== initialSequence) {
           await database.syncState.put({ key: LOCAL_SEQUENCE_KEY, value: sequence });
         }
+        return delta;
         },
       );
 
       await options.onBatch?.(updatedPages);
-      reportProgress(await progress(database), options.onProgress);
+      currentProgress = applyProgressDelta(currentProgress, progressDelta);
+      reportProgress(currentProgress, options.onProgress);
       await delay(options.requestIntervalMs ?? 300);
     }
   } catch (error) {
@@ -189,9 +203,8 @@ export async function syncContent(
     throw error;
   }
 
-  const finalProgress = await progress(database);
-  reportProgress(finalProgress, options.onProgress);
-  return finalProgress;
+  reportProgress(currentProgress, options.onProgress);
+  return currentProgress;
 }
 
 export async function prepareContentJobs(
@@ -199,56 +212,79 @@ export async function prepareContentJobs(
   force: boolean,
 ): Promise<void> {
   await database.transaction('rw', database.pages, database.jobs, async () => {
-    const [pages, existingJobs] = await Promise.all([
-      database.pages
-        .filter(
-          (page) =>
-            !page.deleted && !page.isRedirect && isSearchableContentModel(page.contentModel),
-        )
-        .toArray(),
-      database.jobs.filter((job) => job.type === CONTENT_JOB_TYPE).toArray(),
-    ]);
+    const existingJobs = await database.jobs
+      .where('type')
+      .equals(CONTENT_JOB_TYPE)
+      .toArray();
     const existingByPage = new Map(existingJobs.map((job) => [job.pageId, job]));
-    const eligiblePageIds = new Set(pages.map((page) => page.id));
+    const eligiblePageIds = new Set<number>();
     const now = Date.now();
-    const jobs = pages.map((page) => {
+    const jobsToPut: JobRecord[] = [];
+    await database.pages.each((page) => {
+      if (!isContentJobEligible(page)) return;
+      eligiblePageIds.add(page.id);
       const existing = existingByPage.get(page.id);
-      const upToDate =
-        !force &&
-        typeof page.content === 'string' &&
-        page.contentRevisionId === page.revisionId;
-      return {
-        ...existing,
-        type: CONTENT_JOB_TYPE,
-        pageId: page.id,
-        status: upToDate ? 'done' : 'pending',
-        targetRevisionId: page.revisionId,
-        error: undefined,
-        updatedAt: now,
-      } satisfies JobRecord;
+      const projection = projectContentJob(page, force);
+      if (!contentJobMatchesProjection(existing, page.id, projection)) {
+        jobsToPut.push(contentJobFromProjection(page.id, projection, existing, now));
+      }
     });
     const staleJobIds = existingJobs
       .filter((job) => !eligiblePageIds.has(job.pageId) && job.id !== undefined)
       .map((job) => job.id as number);
     if (staleJobIds.length) await database.jobs.bulkDelete(staleJobIds);
-    if (jobs.length) await database.jobs.bulkPut(jobs);
+    if (jobsToPut.length) await database.jobs.bulkPut(jobsToPut);
   });
 }
 
 export const syncWikitextContent = syncContent;
 
-function isSearchableContentModel(contentModel: string | undefined): boolean {
-  const normalized = contentModel?.toLocaleLowerCase();
-  return normalized === 'wikitext' || normalized === 'bson' || normalized === 'scribunto';
+async function progress(database: WikiSearchDatabase): Promise<ContentSyncProgress> {
+  const result = emptyProgress();
+  await database.jobs
+    .where('type')
+    .equals(CONTENT_JOB_TYPE)
+    .each((job) => addJobTransition(result, undefined, job.status));
+  return result;
 }
 
-async function progress(database: WikiSearchDatabase): Promise<ContentSyncProgress> {
-  const jobs = await database.jobs.filter((job) => job.type === CONTENT_JOB_TYPE).toArray();
+function emptyProgress(): ContentSyncProgress {
+  return { total: 0, done: 0, pending: 0, failed: 0 };
+}
+
+function addJobTransition(
+  delta: ContentSyncProgress,
+  before: JobRecord['status'] | undefined,
+  after: JobRecord['status'] | undefined,
+): void {
+  if (before === after) return;
+  if (before === undefined) delta.total += 1;
+  else decrementStatus(delta, before);
+  if (after === undefined) delta.total -= 1;
+  else incrementStatus(delta, after);
+}
+
+function incrementStatus(progress: ContentSyncProgress, status: JobRecord['status']): void {
+  if (status === 'done') progress.done += 1;
+  else if (status === 'failed') progress.failed += 1;
+  else progress.pending += 1;
+}
+
+function decrementStatus(progress: ContentSyncProgress, status: JobRecord['status']): void {
+  if (status === 'done') progress.done -= 1;
+  else if (status === 'failed') progress.failed -= 1;
+  else progress.pending -= 1;
+}
+
+function applyProgressDelta(
+  progress: ContentSyncProgress,
+  delta: ContentSyncProgress,
+): ContentSyncProgress {
   return {
-    total: jobs.length,
-    done: jobs.filter((job) => job.status === 'done').length,
-    pending: jobs.filter((job) => job.status === 'pending' || job.status === 'running').length,
-    failed: jobs.filter((job) => job.status === 'failed').length,
+    total: progress.total + delta.total,
+    done: progress.done + delta.done,
+    pending: progress.pending + delta.pending,
+    failed: progress.failed + delta.failed,
   };
 }
 
