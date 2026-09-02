@@ -25,6 +25,18 @@ describe('browser tooling scripts', () => {
     expect(reset).toContain('toggle.click()');
   });
 
+  it('awaits asynchronous snapshot conditions outside waitForFunction', () => {
+    expect(testIndexSnapshotsSource).not.toMatch(/waitForFunction\(\s*async/);
+    expect([...testIndexSnapshotsSource.matchAll(/await waitForPage\(/g)]).toHaveLength(2);
+    const helper = testIndexSnapshotsSource.slice(
+      testIndexSnapshotsSource.indexOf('async function waitForPage'),
+      testIndexSnapshotsSource.indexOf('async function reloadCold'),
+    );
+    expect(helper).toContain('await page.evaluate(predicate)');
+    expect(helper).toContain('await page.waitForTimeout(200)');
+    expect(helper).toContain('throw new Error(`等待超时：${description}`)');
+  });
+
   it('installs through a dedicated edit page without touching existing reader or Tampermonkey pages', async () => {
     const context = new InstallContext();
     const reader = context.addInitial(

@@ -31,7 +31,7 @@ async page => {
     if (baselineJobs.pending || baselineJobs.running || baselineJobs.failed) {
       await openSearch();
       await activateMode('content');
-      await page.waitForFunction(
+      await waitForPage(
         async () => {
           const request = indexedDB.open('cu-wiki-local-search');
           const database = await new Promise((resolve, reject) => {
@@ -50,8 +50,8 @@ async page => {
             .filter(job => job.type === 'wikitext-content')
             .every(job => job.status === 'done');
         },
-        undefined,
-        { polling: 100, timeout: 360_000 },
+        '正文缓存任务完成',
+        360_000,
       );
       await reloadCold();
       await waitForColdReady();
@@ -112,7 +112,7 @@ async page => {
       if (maintenance?.hidden) root.querySelector('.maintenance-toggle')?.click();
       root.querySelector('.clear-snapshots')?.click();
     });
-    await page.waitForFunction(
+    await waitForPage(
       async () => {
         const database = await new Promise((resolve, reject) => {
           const request = indexedDB.open('cu-wiki-local-search');
@@ -129,8 +129,8 @@ async page => {
         database.close();
         return count === 0;
       },
-      undefined,
-      { polling: 100 },
+      '索引快照清空',
+      30_000,
     );
 
     await reloadCold();
@@ -176,6 +176,15 @@ async page => {
     };
   } finally {
     page.off('request', onRequest);
+  }
+
+  async function waitForPage(predicate, description, timeout) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (await page.evaluate(predicate)) return;
+      await page.waitForTimeout(200);
+    }
+    throw new Error(`等待超时：${description}`);
   }
 
   async function reloadCold() {
