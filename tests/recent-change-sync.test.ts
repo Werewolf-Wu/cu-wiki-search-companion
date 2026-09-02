@@ -1289,6 +1289,147 @@ describe('RecentChanges incremental sync', () => {
     await destroy(database);
   });
 
+  it('preserves an active page and its done job until a later delete change closes it', async () => {
+    let round = 0;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const parameters = new URL(
+        String(input),
+        'https://casualtiesunknown.huijiwiki.com',
+      ).searchParams;
+      if (parameters.get('curtimestamp') === '1') {
+        round += 1;
+        return json({
+          curtimestamp:
+            round === 1 ? '2026-08-31T03:10:00Z' : '2026-08-31T03:20:00Z',
+          query: { general: {} },
+        });
+      }
+      if (parameters.get('list') === 'recentchanges') {
+        return json({
+          query: {
+            recentchanges: [
+              round === 1
+                ? {
+                    type: 'edit',
+                    ns: 0,
+                    title: '删除竞态页',
+                    pageid: 5,
+                    revid: 51,
+                    old_revid: 50,
+                    rcid: 607,
+                    timestamp: '2026-08-31T03:06:00Z',
+                  }
+                : {
+                    type: 'log',
+                    ns: 0,
+                    title: '删除竞态页',
+                    pageid: 5,
+                    revid: 0,
+                    old_revid: 0,
+                    rcid: 608,
+                    timestamp: '2026-08-31T03:11:00Z',
+                    logtype: 'delete',
+                    logaction: 'delete',
+                    logparams: {},
+                  },
+            ],
+          },
+        });
+      }
+      if (parameters.get('prop') === 'info') {
+        return json({
+          query: {
+            pages: [
+              round === 1
+                ? {
+                    pageid: 5,
+                    ns: 0,
+                    title: '删除竞态页',
+                    contentmodel: 'wikitext',
+                    lastrevid: 51,
+                  }
+                : {
+                    pageid: 5,
+                    ns: 0,
+                    title: '删除竞态页',
+                    missing: true,
+                  },
+            ],
+          },
+        });
+      }
+      return json({
+        query: {
+          pages: [{ pageid: 5, ns: 0, title: '删除竞态页', missing: true }],
+        },
+      });
+    });
+    const activePage = page({
+      id: 5,
+      title: '删除竞态页',
+      normalizedTitle: analyzer.normalize('删除竞态页'),
+      revisionId: 50,
+      contentRevisionId: 50,
+      content: '删除前旧正文',
+    });
+    const database = await databaseWithBaseline([activePage]);
+    const jobId = await database.jobs.add({
+      type: 'wikitext-content',
+      pageId: 5,
+      status: 'done',
+      targetRevisionId: 50,
+      updatedAt: 123,
+    });
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+    const firstResult = await syncRecentChanges(database, api, analyzer, {
+      requestIntervalMs: 0,
+    });
+
+    expect(firstResult).toMatchObject({
+      status: 'complete',
+      through: '2026-08-31T03:10:00Z',
+      changedPages: [],
+      deferredContentPageIds: [],
+      throughLocalSeq: 1,
+    });
+    expect(await database.pages.get(5)).toEqual(activePage);
+    expect(await database.jobs.get(jobId)).toEqual({
+      id: jobId,
+      type: 'wikitext-content',
+      pageId: 5,
+      status: 'done',
+      targetRevisionId: 50,
+      updatedAt: 123,
+    });
+    expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
+      through: '2026-08-31T03:10:00Z',
+    });
+
+    const deleteResult = await syncRecentChanges(database, api, analyzer, {
+      requestIntervalMs: 0,
+    });
+
+    expect(deleteResult).toMatchObject({
+      status: 'complete',
+      through: '2026-08-31T03:20:00Z',
+      throughLocalSeq: 2,
+    });
+    expect(await database.pages.get(5)).toMatchObject({
+      revisionId: 50,
+      content: undefined,
+      contentRevisionId: undefined,
+      deleted: true,
+      localSeq: 2,
+    });
+    expect(await database.jobs.get(jobId)).toBeUndefined();
+    expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
+      through: '2026-08-31T03:20:00Z',
+    });
+
+    await destroy(database);
+  });
+
   it.each([
     ['missing its revision', { pageid: 1 }],
     [
