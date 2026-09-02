@@ -99,6 +99,54 @@ describe('wikitext content search', () => {
     expect(index.search('ＡＢＣ１２３')[0]?.snippet).toContain('ABC123');
   });
 
+  it('bounds snippet normalization by the result limit without changing ranking', () => {
+    const measuredAnalyzer = new Analyzer({ cut, cutForSearch: cut_for_search });
+    const index = new ContentIndex(measuredAnalyzer);
+    const content = `${'背景說明'.repeat(40)}醫療指南`;
+    index.rebuild([
+      page(20, '医疗首选', content),
+      ...Array.from({ length: 11 }, (_, offset) =>
+        page(offset + 1, `其他页面 ${offset + 1}`, content),
+      ),
+    ]);
+    const normalize = vi.spyOn(measuredAnalyzer, 'normalize');
+
+    const first = index.search('医疗', undefined, 1);
+
+    expect(first.map(({ id }) => id)).toEqual([20]);
+    expect(normalize.mock.calls.filter(([value]) => value.length > 100)).toHaveLength(1);
+
+    normalize.mockClear();
+    const firstThree = index.search('医疗', undefined, 3);
+
+    expect(firstThree.map(({ id }) => id)).toEqual([20, 1, 2]);
+    expect(firstThree[0]!.score).toBeCloseTo(firstThree[1]!.score * 3);
+    expect(firstThree[1]!.score).toBe(firstThree[2]!.score);
+    expect(normalize.mock.calls.filter(([value]) => value.length > 100)).toHaveLength(3);
+  });
+
+  it('keeps snippet offsets aligned when compatibility characters expand', () => {
+    const index = new ContentIndex(analyzer);
+    index.rebuild([page(1, '坐标页面', `${'ﬃ '.repeat(80)}TARGET 结尾`)]);
+
+    const snippet = index.search('target')[0]?.snippet;
+
+    expect(snippet).toContain('TARGET');
+    expect(snippet?.replace(/…/g, '').trim()).not.toBe('');
+  });
+
+  it('shows normalized text when only normalization can locate the query', () => {
+    const index = new ContentIndex(analyzer);
+    index.rebuild([
+      page(1, '归一化页面', `${'无关前言'.repeat(30)} ＴＡＲＧＥＴ 尾声`),
+    ]);
+
+    const snippet = index.search('target')[0]?.snippet;
+
+    expect(snippet).toContain('target');
+    expect(snippet).not.toContain('ＴＡＲＧＥＴ');
+  });
+
   it('fetches wikitext and BSON in ordinary-user-sized batches and resumes from cache', async () => {
     const calls: URL[] = [];
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {

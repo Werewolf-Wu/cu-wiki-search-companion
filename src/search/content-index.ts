@@ -178,7 +178,9 @@ export class ContentIndex {
     return results
       .map((result) => {
         const title = String(result.title);
-        const compactTitle = this.analyzer.compact(title);
+        const compactTitle = this.analyzer.compactNormalized(
+          String(result.normalizedTitle),
+        );
         const titleBoost = compactTitle.includes(compactQuery) ? 3 : 1;
         return {
           kind: 'content' as const,
@@ -186,16 +188,19 @@ export class ContentIndex {
           title,
           namespace: Number(result.namespace),
           namespaceName: String(result.namespaceName),
-          snippet: makeSnippet(
-            this.extractedById.get(Number(result.id)) ?? '',
-            normalizedQuery,
-            this.analyzer,
-          ),
           score: result.score * titleBoost,
         };
       })
       .sort((left, right) => right.score - left.score || left.id - right.id)
-      .slice(0, limit);
+      .slice(0, limit)
+      .map((result) => ({
+        ...result,
+        snippet: makeSnippet(
+          this.extractedById.get(result.id) ?? '',
+          normalizedQuery,
+          this.analyzer,
+        ),
+      }));
   }
 
   get size(): number {
@@ -257,11 +262,31 @@ function isStringMapEntries(value: unknown): value is Array<[number, string]> {
 function makeSnippet(text: string, normalizedQuery: string, analyzer: Analyzer): string {
   const compactText = text.replace(/\s+/g, ' ').trim();
   if (!compactText) return '';
-  const position = analyzer.normalize(compactText).indexOf(normalizedQuery);
+  const directPosition = compactText.indexOf(normalizedQuery);
+  const insensitiveMatch =
+    directPosition < 0
+      ? new RegExp(escapeRegExp(normalizedQuery), 'iu').exec(compactText)
+      : undefined;
+  const originalPosition =
+    directPosition >= 0 ? directPosition : (insensitiveMatch?.index ?? -1);
+  if (originalPosition >= 0) {
+    const matchLength =
+      directPosition >= 0 ? normalizedQuery.length : insensitiveMatch![0].length;
+    const start = Math.max(0, originalPosition - 36);
+    const end = Math.min(compactText.length, originalPosition + matchLength + 64);
+    return `${start > 0 ? '…' : ''}${compactText.slice(start, end)}${end < compactText.length ? '…' : ''}`;
+  }
+  const normalizedText = analyzer.normalize(compactText);
+  const displayText = normalizedText || compactText;
+  const position = normalizedText.indexOf(normalizedQuery);
   const start = Math.max(0, (position >= 0 ? position : 0) - 36);
   const end = Math.min(
-    compactText.length,
+    displayText.length,
     (position >= 0 ? position + normalizedQuery.length : 0) + 64,
   );
-  return `${start > 0 ? '…' : ''}${compactText.slice(start, end)}${end < compactText.length ? '…' : ''}`;
+  return `${start > 0 ? '…' : ''}${displayText.slice(start, end)}${end < displayText.length ? '…' : ''}`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
