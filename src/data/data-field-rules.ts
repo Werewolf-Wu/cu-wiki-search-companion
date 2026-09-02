@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-export const DEFAULT_DATA_CODE_RULES = `# jq 风格路径子集；所选路径的标量值会用于查找对应代码名
+const LEGACY_DEFAULT_DATA_CODE_RULES = `# jq 风格路径子集；所选路径的标量值会用于查找对应代码名
 Block = .locales["zh-CN"].name
 Entity = .locales["zh-CN"].name, .locales["zh-CN"].description
 Editor = .locales["zh-CN"].name, .locales["zh-CN"].description
@@ -9,6 +9,21 @@ Localization = .locales["zh-CN"].name, .locales["zh-CN"].description
 Moodle = .locales["zh-CN"].name, .locales["zh-CN"].description
 WorldFluid = .locales["zh-CN"].name, .locales["zh-CN"].description
 * = .locales["zh-CN"].name`;
+
+export const DEFAULT_DATA_CODE_RULES = `# jq 风格路径子集；所选路径的标量值会用于查找对应代码名
+Block = .locales["zh-CN"].name, .wiki.locales["zh-CN"].name
+Entity = .locales["zh-CN"].name, .locales["zh-CN"].description, .wiki.locales["zh-CN"].name
+Editor = .locales["zh-CN"].name, .locales["zh-CN"].description, .wiki.locales["zh-CN"].name
+Item = .locales["zh-CN"].name, .locales["zh-CN"].description, .wiki.locales["zh-CN"].name
+Liquid = .locales["zh-CN"].name, .wiki.locales["zh-CN"].name
+Localization = .locales["zh-CN"].name, .locales["zh-CN"].description, .wiki.locales["zh-CN"].name
+Moodle = .locales["zh-CN"].name, .locales["zh-CN"].description, .wiki.locales["zh-CN"].name
+WorldFluid = .locales["zh-CN"].name, .locales["zh-CN"].description, .wiki.locales["zh-CN"].name
+* = .locales["zh-CN"].name, .wiki.locales["zh-CN"].name`;
+
+export function upgradeDefaultDataCodeRules(source: string | undefined): string | undefined {
+  return source === LEGACY_DEFAULT_DATA_CODE_RULES ? DEFAULT_DATA_CODE_RULES : source;
+}
 
 type PathPattern = string[];
 

@@ -4,6 +4,7 @@ import { loadAnalyzer, type AnalyzerLoadResult } from './analyzer/load-jieba';
 import {
   DEFAULT_DATA_CODE_RULES,
   parseDataFieldRules,
+  upgradeDefaultDataCodeRules,
 } from './data/data-field-rules';
 import { insertAtEditorSelection, wikiLink } from './editor';
 import { LocalDataMaintenance } from './maintenance/local-data-maintenance';
@@ -373,14 +374,17 @@ async function start(): Promise<void> {
   ]);
   const preferenceRules = await dataRulesPreference.get();
   for (const [source, origin] of [
-    [preferenceRules, 'GM preference'],
-    [dataCodeSyncState?.rulesSource, 'data-code-sync'],
+    [upgradeDefaultDataCodeRules(preferenceRules), 'GM preference'],
+    [upgradeDefaultDataCodeRules(dataCodeSyncState?.rulesSource), 'data-code-sync'],
   ] as const) {
     if (typeof source !== 'string') continue;
     try {
       parseDataFieldRules(source);
       dataCodeRulesSource = source;
-      if (origin === 'data-code-sync' && preferenceRules === undefined) {
+      if (
+        (origin === 'GM preference' && source !== preferenceRules) ||
+        (origin === 'data-code-sync' && preferenceRules === undefined)
+      ) {
         await dataRulesPreference.set(source);
       }
       break;
@@ -784,7 +788,11 @@ async function start(): Promise<void> {
   async function readCanonicalDataRules(): Promise<string> {
     const preference = await dataRulesPreference.get();
     const stored = await readDataCodeSyncState(database);
-    for (const source of [preference, stored?.rulesSource, dataCodeRulesSource]) {
+    for (const source of [
+      upgradeDefaultDataCodeRules(preference),
+      upgradeDefaultDataCodeRules(stored?.rulesSource),
+      upgradeDefaultDataCodeRules(dataCodeRulesSource),
+    ]) {
       if (typeof source !== 'string') continue;
       try {
         parseDataFieldRules(source);
