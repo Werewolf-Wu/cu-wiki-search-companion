@@ -51,7 +51,7 @@ async page => {
             .every(job => job.status === 'done');
         },
         undefined,
-        { timeout: 360_000 },
+        { polling: 100, timeout: 360_000 },
       );
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
       await waitForColdReady();
@@ -112,22 +112,26 @@ async page => {
       if (maintenance?.hidden) root.querySelector('.maintenance-toggle')?.click();
       root.querySelector('.clear-snapshots')?.click();
     });
-    await page.waitForFunction(async () => {
-      const database = await new Promise((resolve, reject) => {
-        const request = indexedDB.open('cu-wiki-local-search');
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-      });
-      const count = await new Promise((resolve, reject) => {
-        const request = database.transaction('indexSnapshots', 'readonly')
-          .objectStore('indexSnapshots')
-          .count();
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-      });
-      database.close();
-      return count === 0;
-    });
+    await page.waitForFunction(
+      async () => {
+        const database = await new Promise((resolve, reject) => {
+          const request = indexedDB.open('cu-wiki-local-search');
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+        const count = await new Promise((resolve, reject) => {
+          const request = database.transaction('indexSnapshots', 'readonly')
+            .objectStore('indexSnapshots')
+            .count();
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+        database.close();
+        return count === 0;
+      },
+      undefined,
+      { polling: 100 },
+    );
 
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
     await waitForColdReady();
@@ -178,7 +182,7 @@ async page => {
     await page.waitForFunction(
       () => window.__CU_WIKI_SEARCH__?.ready === true,
       undefined,
-      { timeout: 60_000 },
+      { polling: 100, timeout: 60_000 },
     );
   }
 
@@ -198,7 +202,7 @@ async page => {
       await page.waitForFunction(
         () => window.__CU_WIKI_SEARCH__?.indexedContentPages >= 1_500,
         undefined,
-        { timeout },
+        { polling: 100, timeout },
       );
       await activateMode('lua');
       await page.waitForFunction(
@@ -214,7 +218,7 @@ async page => {
           );
         },
         undefined,
-        { timeout },
+        { polling: 100, timeout },
       );
     } catch (error) {
       throw new Error(`${description}未完成：${error instanceof Error ? error.message : String(error)}`);
@@ -243,7 +247,7 @@ async page => {
     await page.waitForFunction(
       () => window.__CU_WIKI_SEARCH__?.indexedFiles >= 1_500,
       undefined,
-      { timeout: 60_000 },
+      { polling: 100, timeout: 60_000 },
     );
   }
 
