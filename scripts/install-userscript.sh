@@ -4,13 +4,14 @@ set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 served_file="$(mktemp)"
+playwright_script="$(mktemp)"
 server_host="${CU_WIKI_DEV_SERVER_HOST:-127.0.0.1}"
 server_port="${CU_WIKI_DEV_SERVER_PORT:-8788}"
 server_url="${CU_WIKI_USERSCRIPT_URL:-http://${server_host}:${server_port}/cu-wiki-local-search.user.js}"
 server_unit="${CU_WIKI_DEV_SERVER_UNIT:-cu-wiki-search-dev-server}"
 
 cleanup() {
-  rm -f "$served_file"
+  rm -f "$served_file" "$playwright_script"
 }
 trap cleanup EXIT INT TERM
 
@@ -53,6 +54,15 @@ if ! cmp --silent "$served_file" "$project_dir/dist/cu-wiki-local-search.user.js
   exit 1
 fi
 
-export CU_WIKI_USERSCRIPT_URL="$server_url"
+node - "$project_dir/scripts/install-userscript.playwright.js" \
+  "$playwright_script" "$server_url" <<'NODE'
+const fs = require('node:fs');
+const [sourcePath, outputPath, userscriptUrl] = process.argv.slice(2);
+const source = fs.readFileSync(sourcePath, 'utf8');
+fs.writeFileSync(
+  outputPath,
+  `async page => (\n${source}\n)(page, ${JSON.stringify(userscriptUrl)})\n`,
+);
+NODE
 bash "$project_dir/scripts/run-edge-playwright.sh" \
-  "$project_dir/scripts/install-userscript.playwright.js"
+  "$playwright_script"

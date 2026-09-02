@@ -7,7 +7,7 @@ import testMaintenanceSource from '../scripts/test-maintenance.playwright.js?raw
 import testReconciliationSource from '../scripts/test-reconciliation.playwright.js?raw';
 import { WikiSearchDatabase } from '../src/storage/database';
 
-type RunCodeScript = (page: unknown) => Promise<unknown>;
+type RunCodeScript = (page: unknown, userscriptUrl?: string) => Promise<unknown>;
 const BrowserURL = globalThis.URL;
 
 describe('browser tooling scripts', () => {
@@ -28,6 +28,9 @@ describe('browser tooling scripts', () => {
     expect(reader.closed).toBe(false);
     expect(existingAsk.closed).toBe(false);
     expect(existingInstallation.closed).toBe(false);
+    expect(context.requestedUrls).toEqual([
+      'http://127.0.0.1:8788/cu-wiki-local-search.user.js',
+    ]);
     expect(context.createdPages).toHaveLength(3);
     const [dedicatedWikiPage, bridgePage, askPage] = context.createdPages;
     expect(dedicatedWikiPage?.navigations).toEqual([
@@ -80,6 +83,21 @@ describe('browser tooling scripts', () => {
     ]);
     expect(context.createdPages).toHaveLength(2);
     expect(context.createdPages.every((page) => page.closed)).toBe(true);
+  });
+
+  it('uses an explicit non-default userscript URL', async () => {
+    const context = new InstallContext();
+    const reader = context.addInitial(
+      'https://casualtiesunknown.huijiwiki.com/wiki/首页',
+    );
+    const install = await loadRunCodeScript('install-userscript.playwright.js');
+    const userscriptUrl =
+      'http://127.0.0.1:8790/cu-wiki-local-search.user.js';
+
+    await install(reader, userscriptUrl);
+
+    expect(context.requestedUrls).toEqual([userscriptUrl]);
+    expect(context.createdPages[1]?.navigations).toEqual([userscriptUrl]);
   });
 
   it('runs reconciliation after removing the probe page and completes the acceptance flow', async () => {
@@ -217,13 +235,17 @@ async function loadRunCodeScript(name: string): Promise<RunCodeScript> {
 
 class InstallContext {
   readonly createdPages: InstallPage[] = [];
+  readonly requestedUrls: string[] = [];
   readonly request = {
-    get: async (_url: string) => ({
-      ok: () => true,
-      status: () => 200,
-      text: async () =>
-        '// @version      0.2.0\nconst marker = "CU_WIKI_BUILD_ID:test-build";',
-    }),
+    get: async (url: string) => {
+      this.requestedUrls.push(url);
+      return {
+        ok: () => true,
+        status: () => 200,
+        text: async () =>
+          '// @version      0.2.0\nconst marker = "CU_WIKI_BUILD_ID:test-build";',
+      };
+    },
   };
   private readonly allPages: InstallPage[] = [];
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-async page => {
+async (page, configuredUserscriptUrl) => {
   const environment = globalThis.process?.env ?? {};
   const wikiOrigin = (
     environment.CU_WIKI_ORIGIN ?? 'https://casualtiesunknown.huijiwiki.com'
@@ -9,7 +9,9 @@ async page => {
   const editUrl = /^https?:\/\//i.test(editTarget)
     ? editTarget
     : `${wikiOrigin.replace(/\/+$/, '')}/${editTarget.replace(/^\/+/, '')}`;
-  const userscriptUrl = environment.CU_WIKI_USERSCRIPT_URL ??
+  const userscriptUrl =
+    configuredUserscriptUrl ??
+    environment.CU_WIKI_USERSCRIPT_URL ??
     'http://127.0.0.1:8788/cu-wiki-local-search.user.js';
   const context = page.context();
   const sourceResponse = await context.request.get(userscriptUrl);
