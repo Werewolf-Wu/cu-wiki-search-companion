@@ -13,6 +13,7 @@ describe('MirrorSyncOrchestrator', () => {
       },
       facts: { reconcile, catchUp },
       committed: {
+        refreshStorage: vi.fn(async () => undefined),
         refreshReconciliation: vi.fn(),
         refreshRecentChanges: vi.fn(),
       },
@@ -44,6 +45,22 @@ describe('MirrorSyncOrchestrator', () => {
     });
     expect(options.facts.reconcile).not.toHaveBeenCalled();
     expect(options.facts.catchUp).not.toHaveBeenCalled();
+  });
+
+  it('reports a scheduled storage refresh rejection as an error instead of leaving the request running', async () => {
+    const refreshError = new Error('IndexedDB refresh failed');
+    const options = baseOptions();
+    options.coordinator.runIfDue = vi.fn(async () => 'not-due' as const);
+    options.committed.refreshStorage = vi.fn(async () => {
+      throw refreshError;
+    });
+
+    await expect(new MirrorSyncOrchestrator(options).runScheduled()).resolves.toEqual({
+      request: 'scheduled',
+      status: 'error',
+      coordination: 'not-due',
+      errors: { committedRefresh: refreshError },
+    });
   });
 
   it('returns an exact manual lock-unavailable outcome', async () => {
@@ -174,6 +191,22 @@ describe('MirrorSyncOrchestrator', () => {
       'lock-released',
       'committed-refresh',
     ]);
+  });
+
+  it('reports a manual committed refresh rejection as an error', async () => {
+    const refreshError = new Error('derived refresh failed');
+    const options = baseOptions();
+    options.facts.reconcile = vi.fn(async () => completeReconciliation());
+    options.facts.catchUp = vi.fn(async () => completeRecentChanges());
+    options.committed.refreshReconciliation = vi.fn(async () => {
+      throw refreshError;
+    });
+
+    await expect(new MirrorSyncOrchestrator(options).reconcileNow()).resolves.toMatchObject({
+      request: 'manual',
+      status: 'error',
+      errors: { committedRefresh: refreshError },
+    });
   });
 
   it.each([
@@ -420,6 +453,7 @@ function baseOptions(): ConstructorParameters<typeof MirrorSyncOrchestrator>[0] 
       catchUp: vi.fn(),
     },
     committed: {
+      refreshStorage: vi.fn(async () => undefined),
       refreshReconciliation: vi.fn(),
       refreshRecentChanges: vi.fn(),
     },

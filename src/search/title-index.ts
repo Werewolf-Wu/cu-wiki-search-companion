@@ -53,21 +53,29 @@ interface PendingTitleRebuild {
  * keystroke.
  */
 export class LinearTitleIndex implements TitleSearchBackend {
-  private readonly titles: LinearTitle[];
+  private readonly titles = new Map<number, LinearTitle>();
 
   constructor(
     private readonly analyzer: Analyzer,
     pages: PageRecord[],
   ) {
-    this.titles = pages
-      .filter((page) => !page.deleted)
-      .map((page) => ({
+    this.update(pages);
+  }
+
+  update(pages: PageRecord[]): void {
+    for (const page of pages) {
+      if (page.deleted) {
+        this.titles.delete(page.id);
+        continue;
+      }
+      this.titles.set(page.id, {
         id: page.id,
         title: page.title,
         namespace: page.namespace,
         namespaceName: page.namespaceName,
-        compactTitle: analyzer.compactNormalized(page.normalizedTitle),
-      }));
+        compactTitle: this.analyzer.compactNormalized(page.normalizedTitle),
+      });
+    }
   }
 
   search(query: string, namespace?: number, limit = 20): TitleSearchResult[] {
@@ -83,7 +91,7 @@ export class LinearTitleIndex implements TitleSearchBackend {
       namespace: pageNamespace,
       namespaceName,
       compactTitle,
-    } of this.titles) {
+    } of this.titles.values()) {
       if (namespace !== undefined && pageNamespace !== namespace) continue;
       const position = compactTitle.indexOf(compactQuery);
       if (position < 0) continue;
@@ -105,7 +113,7 @@ export class LinearTitleIndex implements TitleSearchBackend {
   }
 
   get size(): number {
-    return this.titles.length;
+    return this.titles.size;
   }
 }
 

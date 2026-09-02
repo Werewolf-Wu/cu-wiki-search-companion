@@ -161,7 +161,7 @@ async function start(): Promise<void> {
   let searchBackend: TitleSearchBackend | undefined;
   let bootstrapIndex: LinearTitleIndex | undefined;
   let titleIndex: TitleIndex | undefined;
-  let fileSearchBackend: TitleSearchBackend | undefined;
+  let fileSearchBackend: LinearTitleIndex | undefined;
   let dataCodeIndex: DataCodeIndex | undefined;
   let contentIndex: ContentIndex | undefined;
   let luaModuleIndex: LuaModuleIndex | undefined;
@@ -441,6 +441,7 @@ async function start(): Promise<void> {
         catchUp: () => syncRecentChanges(database, api, fallbackAnalyzer),
       },
       committed: {
+        refreshStorage: () => refreshIndexesFromStorage(),
         refreshReconciliation: () => committedReconciliationRefresh.apply(),
         refreshRecentChanges: (result) => committedRecentChangeRefresh.apply(result),
       },
@@ -658,19 +659,15 @@ async function start(): Promise<void> {
     if (!ensureWritesAllowed()) return;
     if (fileSyncPromise) return fileSyncPromise;
     const task = (async () => {
-      const rebuildFileIndex = async (): Promise<void> => {
-        const files = await database.fileResources
-          .filter((file) => !file.deleted)
-          .toArray();
-        fileSearchBackend = new LinearTitleIndex(fallbackAnalyzer, files);
-        debugApi.indexedFiles = fileSearchBackend.size;
-        panel.refreshResults();
-      };
       let finalState: Awaited<ReturnType<typeof syncFileResources>> | undefined;
       const run = async (): Promise<void> => {
         finalState = await syncFileResources(database, api, fallbackAnalyzer, {
           force,
-          onBatch: rebuildFileIndex,
+          onBatch: (batch) => {
+            fileSearchBackend?.update(batch);
+            debugApi.indexedFiles = fileSearchBackend?.size ?? 0;
+            panel.refreshResults();
+          },
           onProgress: (progress) => {
             if (progress.status === 'running') {
               panel.setStatus(`同步文件资源 ${progress.pagesFetched} 页…`);
@@ -685,7 +682,6 @@ async function start(): Promise<void> {
         throw new Error('无法取得跨标签写入锁，请确认浏览器支持 Web Locks 后重试');
       }
       if (!finalState) throw new Error('文件资源同步未返回结果');
-      await rebuildFileIndex();
       await refreshIndexesFromStorage({ files: true });
       incrementalChannel?.postMessage({ type: 'files-committed' });
       panel.setStatus(
@@ -814,20 +810,27 @@ async function start(): Promise<void> {
     if (!ensureWritesAllowed()) return;
     const orchestrator = mirrorSyncOrchestrator;
     if (!orchestrator) return;
-    const outcome = await orchestrator.runScheduled();
-    if (outcome.status === 'lock-unavailable' || outcome.status === 'not-due') {
-      await refreshIndexesFromStorage();
+    try {
+      const outcome = await orchestrator.runScheduled();
+      await applyMirrorSyncOutcome(outcome);
+    } catch (error) {
+      debugApi.incrementalStatus = 'error';
+      throw error;
     }
-    await applyMirrorSyncOutcome(outcome);
   }
 
   async function requestManualReconciliation(): Promise<void> {
     if (!ensureWritesAllowed()) throw new Error('本地数据版本不兼容');
     const orchestrator = mirrorSyncOrchestrator;
     if (!orchestrator) throw new Error('全量对账协调器尚未就绪');
-    const outcome = await orchestrator.reconcileNow();
-    await applyMirrorSyncOutcome(outcome);
-    if (outcome.status !== 'complete') throw mirrorSyncOutcomeError(outcome);
+    try {
+      const outcome = await orchestrator.reconcileNow();
+      await applyMirrorSyncOutcome(outcome);
+      if (outcome.status !== 'complete') throw mirrorSyncOutcomeError(outcome);
+    } catch (error) {
+      debugApi.reconciliationStatus = 'error';
+      throw error;
+    }
   }
 
   function handleMirrorSyncEvent(event: MirrorSyncEvent): void {
@@ -887,6 +890,10 @@ async function start(): Promise<void> {
       debugApi.reconciliationStatus === 'running'
     ) {
       debugApi.reconciliationStatus = 'error';
+    }
+    if (outcome.errors?.committedRefresh) {
+      if (outcome.request === 'scheduled') debugApi.incrementalStatus = 'error';
+      else debugApi.reconciliationStatus = 'error';
     }
 
     for (const [phase, error] of Object.entries(outcome.errors ?? {})) {

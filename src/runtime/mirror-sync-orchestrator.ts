@@ -30,6 +30,7 @@ export interface CommittedReconciliationResult {
 }
 
 export interface MirrorSyncCommittedRefresh {
+  refreshStorage(): Promise<void>;
   refreshReconciliation(): Promise<CommittedReconciliationResult | undefined>;
   refreshRecentChanges(
     result: Extract<RecentChangeSyncResult, { status: 'complete' }>,
@@ -153,7 +154,21 @@ export class MirrorSyncOrchestrator {
     } catch (error) {
       synchronizationError ??= error;
     }
-    if (coordination !== 'ran') return { request, status: coordination, coordination };
+    if (coordination !== 'ran') {
+      if (request === 'scheduled') {
+        try {
+          await this.options.committed.refreshStorage();
+        } catch (error) {
+          return {
+            request,
+            status: 'error',
+            coordination,
+            errors: { committedRefresh: error },
+          };
+        }
+      }
+      return { request, status: coordination, coordination };
+    }
 
     let committedReconciliation: CommittedReconciliationResult | undefined;
     let committedRefreshError: unknown;

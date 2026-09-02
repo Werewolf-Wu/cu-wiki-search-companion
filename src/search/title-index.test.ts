@@ -55,6 +55,25 @@ describe('LinearTitleIndex', () => {
       namespaceName: '',
     });
   });
+
+  it('applies added, renamed, and deleted title rows incrementally', () => {
+    const index = new LinearTitleIndex(analyzer, [
+      page(6, '文件:旧名称.png', 6, '文件'),
+      page(7, '文件:待删除.png', 6, '文件'),
+    ]);
+
+    index.update([
+      page(6, '文件:新名称.png', 6, '文件'),
+      page(8, '文件:新增.png', 6, '文件'),
+      { ...page(7, '文件:待删除.png', 6, '文件'), deleted: true },
+    ]);
+
+    expect(index.search('旧名称')).toEqual([]);
+    expect(index.search('新名称')[0]?.id).toBe(6);
+    expect(index.search('新增')[0]?.id).toBe(8);
+    expect(index.search('待删除')).toEqual([]);
+    expect(index.size).toBe(2);
+  });
 });
 
 function page(id: number, title: string, namespace: number, namespaceName: string): PageRecord {

@@ -10,16 +10,16 @@ export interface DataCodeSyncSessionOptions<T> {
   apply(value: T): Promise<void> | void;
 }
 
-/** Coalesces refreshes while preserving a failure-isolated FIFO for rule saves. */
+/** Coalesces refreshes while preserving one failure-isolated operation FIFO. */
 export class DataCodeSyncSession<T> {
   private refreshRequest: Promise<DataCodeSessionResult<T>> | undefined;
-  private saveQueue: Promise<void> = Promise.resolve();
+  private operationQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: DataCodeSyncSessionOptions<T>) {}
 
   refresh(force: boolean): Promise<DataCodeSessionResult<T>> {
     if (this.refreshRequest) return this.refreshRequest;
-    const request = this.execute(() => this.options.refresh(force));
+    const request = this.enqueue(() => this.options.refresh(force));
     const tracked = request.finally(() => {
       if (this.refreshRequest === tracked) this.refreshRequest = undefined;
     });
@@ -28,10 +28,12 @@ export class DataCodeSyncSession<T> {
   }
 
   save(source: string): Promise<DataCodeSessionResult<T>> {
-    const request = this.saveQueue.then(() =>
-      this.execute(() => this.options.save(source)),
-    );
-    this.saveQueue = request.then(() => undefined);
+    return this.enqueue(() => this.options.save(source));
+  }
+
+  private enqueue(task: () => Promise<T>): Promise<DataCodeSessionResult<T>> {
+    const request = this.operationQueue.then(() => this.execute(task));
+    this.operationQueue = request.then(() => undefined);
     return request;
   }
 

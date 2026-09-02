@@ -51,6 +51,61 @@ describe('DataCodeSyncSession', () => {
     expect(applied).toEqual(['A', 'B']);
   });
 
+  it('does not let a delayed refresh apply overwrite a later save', async () => {
+    let markRefreshApplyStarted!: () => void;
+    const refreshApplyStarted = new Promise<void>((resolve) => {
+      markRefreshApplyStarted = resolve;
+    });
+    let releaseRefreshApply!: () => void;
+    const refreshApplyHeld = new Promise<void>((resolve) => {
+      releaseRefreshApply = resolve;
+    });
+    const applied: string[] = [];
+    const saveTask = vi.fn(async (source: string) => source);
+    const session = new DataCodeSyncSession<string>({
+      refresh: async () => 'refresh',
+      save: saveTask,
+      apply: async (value) => {
+        if (value === 'refresh') {
+          markRefreshApplyStarted();
+          await refreshApplyHeld;
+        }
+        applied.push(value);
+      },
+    });
+
+    const refresh = session.refresh(false);
+    await refreshApplyStarted;
+    const save = session.save('save');
+    await Promise.resolve();
+    expect(saveTask).not.toHaveBeenCalled();
+    expect(applied).toEqual([]);
+    releaseRefreshApply();
+
+    await Promise.all([refresh, save]);
+    expect(applied).toEqual(['refresh', 'save']);
+  });
+
+  it('continues the shared operation queue after an apply failure', async () => {
+    const applyError = new Error('render failed');
+    const applied: string[] = [];
+    const session = new DataCodeSyncSession<string>({
+      refresh: async () => 'refresh',
+      save: async (source) => source,
+      apply: async (value) => {
+        applied.push(value);
+        if (value === 'save') throw applyError;
+      },
+    });
+
+    const save = session.save('save');
+    const refresh = session.refresh(false);
+
+    await expect(save).resolves.toEqual({ status: 'error', error: applyError });
+    await expect(refresh).resolves.toEqual({ status: 'complete', value: 'refresh' });
+    expect(applied).toEqual(['save', 'refresh']);
+  });
+
   it('coalesces overlapping background and manual refresh requests', async () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => {

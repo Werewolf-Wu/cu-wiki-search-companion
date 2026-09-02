@@ -421,6 +421,87 @@ describe('file resource search', () => {
     database.close();
     await database.delete();
   });
+
+  it('applies file batches incrementally and closes once after final pruning', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      if (!url.searchParams.has('gapcontinue')) {
+        return json({
+          continue: { gapcontinue: '文件:第二批.png' },
+          query: {
+            pages: [
+              {
+                pageid: 6001,
+                ns: 6,
+                title: '文件:第一批.png',
+                lastrevid: 61,
+                contentmodel: 'wikitext',
+              },
+            ],
+          },
+        });
+      }
+      return json({
+        query: {
+          pages: [
+            {
+              pageid: 6002,
+              ns: 6,
+              title: '文件:第二批.png',
+              lastrevid: 62,
+              contentmodel: 'wikitext',
+            },
+          ],
+        },
+      });
+    });
+    const stale = {
+      id: 6000,
+      title: '文件:应被清理.png',
+      normalizedTitle: analyzer.normalize('文件:应被清理.png'),
+      namespace: 6,
+      namespaceName: '文件',
+      isRedirect: false,
+      localSeq: 60,
+      writerSeq: 1,
+      seenInTitleSync: 1,
+      deleted: false,
+      revisionId: 60,
+      contentModel: 'wikitext',
+    };
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.fileResources.put(stale);
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+    let index = new LinearTitleIndex(analyzer, [stale]);
+    let batchUpdates = 0;
+
+    await syncFileResources(database, api, analyzer, {
+      requestIntervalMs: 0,
+      onBatch: (batch) => {
+        batchUpdates += 1;
+        index.update(batch);
+      },
+    });
+
+    expect(batchUpdates).toBe(2);
+    expect(index.search('第一批')[0]?.id).toBe(6001);
+    expect(index.search('第二批')[0]?.id).toBe(6002);
+    expect(index.search('应被清理')[0]?.id).toBe(6000);
+
+    const finalFiles = await database.fileResources
+      .filter((file) => !file.deleted)
+      .toArray();
+    index = new LinearTitleIndex(analyzer, finalFiles);
+
+    expect(index.search('应被清理')).toEqual([]);
+    expect(index.search('第一批')[0]?.id).toBe(6001);
+    expect(index.search('第二批')[0]?.id).toBe(6002);
+
+    database.close();
+    await database.delete();
+  });
 });
 
 function json(value: unknown): Response {
