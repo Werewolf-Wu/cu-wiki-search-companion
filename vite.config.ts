@@ -7,7 +7,10 @@ const environment =
     process?: { env?: Record<string, string | undefined> };
   }).process?.env ?? {};
 const buildId =
-  environment.CU_WIKI_BUILD_ID ?? environment.GITHUB_SHA ?? 'development';
+  environment.CU_WIKI_BUILD_ID ??
+  environment.GITHUB_SHA ??
+  environment.VERCEL_GIT_COMMIT_SHA ??
+  'development';
 const buildMarker = `CU_WIKI_BUILD_ID:${buildId}`;
 const wikiOrigin = 'https://casualtiesunknown.huijiwiki.com';
 const userscriptMatches = (['edit', 'submit'] as const).flatMap((action) => [
