@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 async page => {
+  page = page.context().pages().find(candidate =>
+    /[?&]action=(?:edit|submit)(?:[&#]|$)/.test(candidate.url()),
+  );
+  if (!page) throw new Error('找不到已激活的维基编辑页（action=edit/submit）');
+
   const contentRequestUrls = [];
   const onRequest = request => {
     const value = request.url();

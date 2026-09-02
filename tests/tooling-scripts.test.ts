@@ -2,6 +2,7 @@
 // @vitest-environment jsdom
 import 'fake-indexeddb/auto';
 
+import benchmarkContentSearchSource from '../scripts/benchmark-content-search.playwright.js?raw';
 import installUserscriptSource from '../scripts/install-userscript.playwright.js?raw';
 import testIndexSnapshotsSource from '../scripts/test-index-snapshots.playwright.js?raw';
 import testMaintenanceSource from '../scripts/test-maintenance.playwright.js?raw';
@@ -12,6 +13,41 @@ type RunCodeScript = (page: unknown, userscriptUrl?: string) => Promise<unknown>
 const BrowserURL = globalThis.URL;
 
 describe('browser tooling scripts', () => {
+  it.each([
+    ['snapshot', testIndexSnapshotsSource, 'https://example.test/?action=edit'],
+    ['benchmark', benchmarkContentSearchSource, 'https://example.test/?action=submit'],
+  ])('runs the %s harness on the activated edit page', async (_name, source, editorUrl) => {
+    let wrongPageUsed = false;
+    let pages: unknown[] = [];
+    const context = { pages: () => pages };
+    const reader = {
+      url: () => 'https://example.test/wiki/首页',
+      context: () => context,
+      on: () => { wrongPageUsed = true; },
+      off: () => undefined,
+      evaluate: async () => {
+        wrongPageUsed = true;
+        throw new Error('wrong-page-probe');
+      },
+    };
+    const editor = {
+      url: () => editorUrl,
+      context: () => context,
+      on: () => undefined,
+      off: () => undefined,
+      evaluate: async () => { throw new Error('selected-page-probe'); },
+    };
+    pages = [reader, editor];
+    const run = Function(`return (${source}\n)`)() as RunCodeScript;
+    vi.stubGlobal('URL', undefined);
+
+    await expect(run(reader)).rejects.toThrow('selected-page-probe');
+    expect(wrongPageUsed).toBe(false);
+
+    pages = [reader];
+    await expect(run(reader)).rejects.toThrow('找不到已激活的维基编辑页');
+  });
+
   it('resets deep search state before every snapshot reload', () => {
     expect([...testIndexSnapshotsSource.matchAll(/await reloadCold\(\)/g)]).toHaveLength(4);
     expect([...testIndexSnapshotsSource.matchAll(/await page\.reload/g)]).toHaveLength(1);

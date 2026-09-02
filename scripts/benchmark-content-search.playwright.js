@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 async page => {
+  page = page.context().pages().find(candidate =>
+    /[?&]action=(?:edit|submit)(?:[&#]|$)/.test(candidate.url()),
+  );
+  if (!page) throw new Error('找不到已激活的维基编辑页（action=edit/submit）');
+
   const debug = await page.evaluate(() => window.__CU_WIKI_SEARCH__);
   if (!debug || debug.indexedContentPages < 1_500) {
     throw new Error('正文索引尚未恢复到 P2b 全量状态');
