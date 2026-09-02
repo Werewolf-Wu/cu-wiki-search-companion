@@ -417,13 +417,17 @@ export class VersionedSearchIndexCache {
         runtime?.validatedSnapshotFingerprint &&
           hasFingerprint(record, runtime.validatedSnapshotFingerprint),
       );
+      const hasValidCurrentPayload = await hasValidPayload(
+        record,
+        !matchesValidatedSnapshot,
+      );
       const structurallyCorrupt =
         record.key !== snapshotKey(kind) ||
         record.kind !== kind ||
         !isNonNegativeSafeInteger(record.throughLocalSeq) ||
         record.throughLocalSeq > currentSequence ||
         !isNonNegativeSafeInteger(record.documentCount) ||
-        (!matchesValidatedSnapshot && !(await hasValidPayload(record)));
+        !hasValidCurrentPayload;
       if (structurallyCorrupt) status = 'corrupt';
       else if (record.snapshotFormatVersion !== SNAPSHOT_FORMAT_VERSION) status = 'outdated';
       else if (!runtime?.compatibilityKey) status = 'not-started';
@@ -639,13 +643,19 @@ async function validateSnapshot(
   return payload;
 }
 
-async function hasValidPayload(record: IndexSnapshotRecord): Promise<boolean> {
+async function hasValidPayload(
+  record: IndexSnapshotRecord,
+  parsePayload: boolean,
+): Promise<boolean> {
   const encodedPayload = new TextEncoder().encode(record.json);
-  return (
-    encodedPayload.byteLength === record.payloadBytes &&
-    (await sha256(encodedPayload)) === record.sha256 &&
-    isJsonObject(record.json)
-  );
+  const actualSha256 = await sha256(encodedPayload);
+  if (
+    encodedPayload.byteLength !== record.payloadBytes ||
+    actualSha256 !== record.sha256
+  ) {
+    return false;
+  }
+  return !parsePayload || isJsonObject(record.json);
 }
 
 async function sha256(value: BufferSource): Promise<string> {

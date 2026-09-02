@@ -271,7 +271,7 @@ describe('VersionedSearchIndexCache', () => {
     await database.delete();
   });
 
-  it('parses once on restore and keeps only a metadata fingerprint for warm inspect', async () => {
+  it('skips only JSON parsing for a warm metadata fingerprint', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();
     await database.pages.put(page(1, '单次解析', '正文', 'wikitext', 1));
@@ -289,16 +289,27 @@ describe('VersionedSearchIndexCache', () => {
 
     expect(restored.source).toBe('snapshot');
     expect(parse).toHaveBeenCalledTimes(1);
-    const replacement = await database.indexSnapshots.get(snapshotKey('title'));
-    if (!replacement) throw new Error('测试快照未发布');
-    replacement.json = '{runtime-must-not-retain-this-payload';
-    await database.indexSnapshots.put(replacement);
+    const sha = vi.spyOn(crypto.subtle, 'digest');
     parse.mockClear();
     expect((await cache.inspect()).find(({ kind }) => kind === 'title')).toMatchObject({
       status: 'available',
     });
+    expect(sha).toHaveBeenCalledTimes(1);
     expect(parse).not.toHaveBeenCalled();
 
+    const replacement = await database.indexSnapshots.get(snapshotKey('title'));
+    if (!replacement) throw new Error('测试快照未发布');
+    replacement.json = '{runtime-must-not-retain-this-payload';
+    await database.indexSnapshots.put(replacement);
+    sha.mockClear();
+    parse.mockClear();
+    expect((await cache.inspect()).find(({ kind }) => kind === 'title')).toMatchObject({
+      status: 'corrupt',
+    });
+    expect(sha).toHaveBeenCalledTimes(1);
+    expect(parse).not.toHaveBeenCalled();
+
+    sha.mockRestore();
     parse.mockRestore();
     database.close();
     await database.delete();
