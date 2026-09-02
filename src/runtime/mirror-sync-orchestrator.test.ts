@@ -46,6 +46,18 @@ describe('MirrorSyncOrchestrator', () => {
     expect(options.facts.catchUp).not.toHaveBeenCalled();
   });
 
+  it('returns an exact manual lock-unavailable outcome', async () => {
+    const options = baseOptions();
+    options.coordinator.runExclusive = vi.fn(async () => 'lock-unavailable' as const);
+
+    await expect(new MirrorSyncOrchestrator(options).reconcileNow()).resolves.toEqual({
+      request: 'manual',
+      status: 'lock-unavailable',
+      coordination: 'lock-unavailable',
+    });
+    expect(options.facts.reconcile).not.toHaveBeenCalled();
+  });
+
   it('reports login-required and applies partially committed reconciliation after lock release', async () => {
     const order: string[] = [];
     const options = baseOptions();
@@ -188,6 +200,49 @@ describe('MirrorSyncOrchestrator', () => {
     },
   );
 
+  it('orders catch-up, committed refreshes, then loaded derived content after lock release', async () => {
+    const order: string[] = [];
+    const options = baseOptions();
+    options.coordinator.runIfDue = vi.fn(async (task) => {
+      order.push('lock-acquired');
+      await task();
+      order.push('lock-released');
+      return 'ran' as const;
+    });
+    options.facts.reconcile = vi.fn(async () => {
+      order.push('reconcile');
+      return completeReconciliation();
+    });
+    options.facts.catchUp = vi.fn(async () => {
+      order.push('catch-up');
+      return completeRecentChanges([42]);
+    });
+    options.committed.refreshReconciliation = vi.fn(async () => {
+      order.push('reconciliation-refresh');
+      return { dataCodesInvalidated: false };
+    });
+    options.committed.refreshRecentChanges = vi.fn(async () => {
+      order.push('rc-refresh');
+      return { dataCodesInvalidated: false };
+    });
+    options.derived.hasLoadedContentIndex = () => true;
+    options.derived.refreshContent = vi.fn(async () => {
+      order.push('content');
+    });
+
+    await new MirrorSyncOrchestrator(options).runScheduled();
+
+    expect(order).toEqual([
+      'lock-acquired',
+      'reconcile',
+      'catch-up',
+      'lock-released',
+      'reconciliation-refresh',
+      'rc-refresh',
+      'content',
+    ]);
+  });
+
   it('returns Data failure independently after a successful catch-up', async () => {
     const dataError = new Error('Mongo unavailable');
     const options = baseOptions();
@@ -206,6 +261,27 @@ describe('MirrorSyncOrchestrator', () => {
       status: 'data-error',
       dataRefresh: { status: 'error', error: dataError },
       errors: { data: dataError },
+    });
+  });
+
+  it('propagates a no-baseline catch-up outcome after reconciliation is not due', async () => {
+    const options = baseOptions();
+    options.facts.reconcile = vi.fn(async () => reconciliationResult('not-due'));
+    options.facts.catchUp = vi.fn(async () => ({
+      status: 'no-baseline' as const,
+      eventsSeen: 0 as const,
+      candidates: 0 as const,
+      changedPages: [] as [],
+      deferredContentPageIds: [],
+      filesChanged: false as const,
+      dataCodesInvalidated: false as const,
+      throughLocalSeq: 0,
+    }));
+    options.committed.refreshReconciliation = vi.fn(async () => undefined);
+
+    await expect(new MirrorSyncOrchestrator(options).runScheduled()).resolves.toMatchObject({
+      status: 'no-baseline',
+      recentChanges: { status: 'no-baseline' },
     });
   });
 

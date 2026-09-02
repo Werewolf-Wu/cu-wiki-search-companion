@@ -254,9 +254,10 @@ function outcomeStatus(input: OutcomeStatusInput): MirrorSyncOutcome['status'] {
   if (input.reconciliation?.status === 'login-required') return 'login-required';
   if (input.catchUpError) return 'catch-up-error';
   if (input.recentChanges?.status === 'login-required') return 'login-required';
+  if (input.recentChanges?.status === 'no-baseline') return 'no-baseline';
   if (
     input.reconciliation?.status === 'no-baseline' &&
-    (!input.recentChanges || input.recentChanges.status === 'no-baseline')
+    !input.recentChanges
   ) {
     return 'no-baseline';
   }

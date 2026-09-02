@@ -10,8 +10,15 @@ import { LocalDataMaintenance } from './maintenance/local-data-maintenance';
 import { AnalyzerPreparationCoordinator } from './runtime/analyzer-preparation';
 import { changeBroadcastEffect } from './runtime/change-broadcast';
 import { browserTaskScheduler } from './runtime/cooperative-task-scheduler';
+import { DataCodeSyncSession } from './runtime/data-code-sync-session';
 import { ContentSyncSession } from './runtime/content-sync-session';
 import { InitialBackgroundRefreshCoordinator } from './runtime/initial-background-refresh';
+import {
+  MirrorSyncOrchestrator,
+  type MirrorSyncEvent,
+  type MirrorSyncOutcome,
+  type SyncAttemptResult,
+} from './runtime/mirror-sync-orchestrator';
 import { CommittedRecentChangeRefresh } from './runtime/recent-change-commit-refresh';
 import { CommittedReconciliationRefresh } from './runtime/reconciliation-commit-refresh';
 import {
@@ -38,6 +45,7 @@ import {
 } from './search/title-index';
 import { readActivePageHeaders, WikiSearchDatabase } from './storage/database';
 import { dataRulesPreference } from './storage/data-rules-preference';
+import { readLocalSequence } from './storage/sync-state';
 import { initializeVersionContract } from './storage/version-contract';
 import { syncContent } from './sync/content-sync';
 import { readDataCodeSyncState, syncDataCodes } from './sync/data-code-sync';
@@ -118,21 +126,11 @@ type ReconciliationRuntimeStatus =
   | 'lock-unavailable'
   | 'error';
 
-type SyncAttemptResult =
-  | { status: 'complete' }
-  | { status: 'error'; error: unknown };
-
-type ReconciliationRequestResult =
-  | { status: 'complete' | 'not-due' }
-  | {
-      status:
-        | 'no-baseline'
-        | 'login-required'
-        | 'lock-unavailable'
-        | 'catch-up-error'
-        | 'error';
-      error?: unknown;
-    };
+interface DataCodeCommit {
+  origin: 'refresh' | 'save';
+  rulesSource: string;
+  result: Awaited<ReturnType<typeof syncDataCodes>>;
+}
 
 const pageWindow = unsafeWindow as unknown as MediaWikiWindow;
 const bootStartedAt = performance.now();
@@ -141,8 +139,7 @@ let startupPanel: SearchPanel | undefined;
 
 if (shouldActivate()) {
   void start().catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    startupPanel?.setStartupFailure(message, () => pageWindow.location.reload());
+    startupPanel?.setStartupFailure(errorMessage(error), () => pageWindow.location.reload());
     console.error('[CU Wiki Search] startup failed', error);
   });
 }
@@ -173,11 +170,10 @@ async function start(): Promise<void> {
   let luaHandle: SearchIndexHandle<'lua'> | undefined;
   let syncPromise: Promise<SyncAttemptResult> | undefined;
   let fileSyncPromise: Promise<void> | undefined;
-  let dataCodeSyncPromise: Promise<SyncAttemptResult | void> | undefined;
-  let incrementalSyncPromise: Promise<void> | undefined;
-  let reconciliationSyncPromise: Promise<ReconciliationRequestResult> | undefined;
   let incrementalCoordinator: IncrementalSyncCoordinator | undefined;
   let runtimeLifecycle: RuntimeLifecycleCoordinator | undefined;
+  let dataCodeSyncSession: DataCodeSyncSession<DataCodeCommit> | undefined;
+  let mirrorSyncOrchestrator: MirrorSyncOrchestrator | undefined;
   let writesCompatible = true;
   let lastAppliedLocalSeq = 0;
   let lastAppliedFileChangeSeq = 0;
@@ -205,18 +201,18 @@ async function start(): Promise<void> {
         kind === 'title'
           ? ensureEnhancedTitleStarted()
           : ensureDerivedSearchStarted(kind);
-      void preparation.catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        panel.setStatus(`${searchKindLabel(kind)}加载失败，已有本地搜索仍可用：${message}`, 'error');
-        console.error('[CU Wiki Search] enhanced search startup failed', error);
-      });
+      observeRuntimeTask(
+        preparation,
+        'enhanced search startup',
+        `${searchKindLabel(kind)}加载失败，已有本地搜索仍可用`,
+      );
     },
     prepareFiles: () => {
-      void ensureFileSearchStarted(false).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        panel.setStatus(`文件资源加载失败，本地缓存仍可用：${message}`, 'error');
-        console.error('[CU Wiki Search] file resource startup failed', error);
-      });
+      observeRuntimeTask(
+        ensureFileSearchStarted(false),
+        'file resource startup',
+        '文件资源加载失败，本地缓存仍可用',
+      );
     },
     search: (query, namespace) => searchBackend?.search(query, namespace) ?? [],
     searchFiles: (query) => fileSearchBackend?.search(query) ?? [],
@@ -263,20 +259,23 @@ async function start(): Promise<void> {
     refresh: () => {
       const lifecycle = runtimeLifecycle;
       if (!lifecycle) return;
-      void lifecycle
-        .refreshMirror({
+      observeRuntimeTask(
+        lifecycle.refreshMirror({
           syncTitles: () => requestSync(false),
           reconcile: () => requestManualReconciliation(),
           syncData: () => requestManualDataCodeSync(),
           syncContent: () => requestContentSync(false),
-        })
-        .catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
-          panel.setStatus(`重新同步本地数据暂停：${message}`, 'error');
-        });
+        }),
+        'manual mirror refresh',
+        '重新同步本地数据暂停',
+      );
     },
     refreshFiles: () => {
-      void ensureFileSearchStarted(true);
+      observeRuntimeTask(
+        ensureFileSearchStarted(true),
+        'manual file refresh',
+        '文件资源同步暂停，本地缓存仍可搜索',
+      );
     },
     saveDataCodeRules: (source) => saveDataCodeRules(source),
     loadMaintenance: () => maintenance.inspect(),
@@ -425,6 +424,34 @@ async function start(): Promise<void> {
   bootstrapIndex = new LinearTitleIndex(fallbackAnalyzer, pages);
   searchBackend = bootstrapIndex;
   dataCodeIndex = new DataCodeIndex(fallbackAnalyzer, dataCodes);
+  dataCodeSyncSession = new DataCodeSyncSession<DataCodeCommit>({
+    refresh: (force) => performDataCodeRefresh(force),
+    save: (source) => performDataCodeSave(source),
+    apply: (commit) => applyDataCodeCommit(commit),
+  });
+  if (incrementalCoordinator) {
+    mirrorSyncOrchestrator = new MirrorSyncOrchestrator({
+      coordinator: incrementalCoordinator,
+      facts: {
+        reconcile: (force, onProgress) =>
+          reconcileWikiMirror(database, api, fallbackAnalyzer, {
+            force,
+            onProgress,
+          }),
+        catchUp: () => syncRecentChanges(database, api, fallbackAnalyzer),
+      },
+      committed: {
+        refreshReconciliation: () => committedReconciliationRefresh.apply(),
+        refreshRecentChanges: (result) => committedRecentChangeRefresh.apply(result),
+      },
+      derived: {
+        refreshData: () => requestDataCodeSync(false),
+        hasLoadedContentIndex: () => Boolean(contentIndex || luaModuleIndex),
+        refreshContent: () => runContentSync(false),
+      },
+      onEvent: (event) => handleMirrorSyncEvent(event),
+    });
+  }
   collectNamespaces(pages, namespaces);
   panel.setNamespaces(namespaceOptions(namespaces));
   debugApi.ready = true;
@@ -459,26 +486,45 @@ async function start(): Promise<void> {
         runtimeLifecycle?.deferStorageRefresh(effect.invalidation);
         return;
       }
-      void refreshIndexesFromStorage(effect.invalidation);
-      if (effect.dataRefresh === 'pending') void initialBackgroundRefresh.request();
+      observeRuntimeTask(
+        refreshIndexesFromStorage(effect.invalidation),
+        'broadcast storage refresh',
+        '本地索引刷新暂停，稍后将自动重试',
+      );
+      if (effect.dataRefresh === 'pending') {
+        observeRuntimeTask(
+          initialBackgroundRefresh.request(),
+          'broadcast Data refresh',
+        );
+      }
     });
   }
 
   const requestVisibleIncrementalSync = (): void => {
     if (document.visibilityState !== 'visible') return;
-    void runtimeLifecycle?.resumeStorageRefresh();
-    void initialBackgroundRefresh.request();
-    void requestIncrementalSync();
+    if (runtimeLifecycle) {
+      observeRuntimeTask(
+        runtimeLifecycle.resumeStorageRefresh(),
+        'visible storage refresh',
+        '本地索引刷新暂停，稍后将自动重试',
+      );
+    }
+    observeRuntimeTask(initialBackgroundRefresh.request(), 'visible Data refresh');
+    observeRuntimeTask(requestIncrementalSync(), 'visible incremental sync');
   };
   window.addEventListener('focus', requestVisibleIncrementalSync);
   document.addEventListener('visibilitychange', requestVisibleIncrementalSync);
   window.setInterval(requestVisibleIncrementalSync, 30_000);
 
   if (writesCompatible) {
-    void (async () => {
-      await whenPageIdle();
-      await initialBackgroundRefresh.request();
-    })();
+    observeRuntimeTask(
+      (async () => {
+        await whenPageIdle();
+        await initialBackgroundRefresh.request();
+      })(),
+      'initial background refresh',
+      '后台首次刷新暂停，稍后将自动重试',
+    );
   }
 
   function ensureEnhancedTitleStarted(): Promise<void> {
@@ -611,47 +657,48 @@ async function start(): Promise<void> {
   async function runFileSync(force: boolean): Promise<void> {
     if (!ensureWritesAllowed()) return;
     if (fileSyncPromise) return fileSyncPromise;
-    fileSyncPromise = (async () => {
-      try {
-        const rebuildFileIndex = async (): Promise<void> => {
-          const files = await database.fileResources
-            .filter((file) => !file.deleted)
-            .toArray();
-          fileSearchBackend = new LinearTitleIndex(fallbackAnalyzer, files);
-          debugApi.indexedFiles = fileSearchBackend.size;
-          panel.refreshResults();
-        };
-        let finalState: Awaited<ReturnType<typeof syncFileResources>> | undefined;
-        const run = async (): Promise<void> => {
-          finalState = await syncFileResources(database, api, fallbackAnalyzer, {
-            force,
-            onBatch: rebuildFileIndex,
-            onProgress: (progress) => {
-              if (progress.status === 'running') {
-                panel.setStatus(`同步文件资源 ${progress.pagesFetched} 页…`);
-              }
-            },
-          });
-        };
-        if (incrementalCoordinator) await incrementalCoordinator.runExclusive(run);
-        else await run();
-        if (!finalState) throw new Error('文件资源同步未完成');
-        await rebuildFileIndex();
-        await refreshIndexesFromStorage({ files: true });
-        incrementalChannel?.postMessage({ type: 'files-committed' });
-        panel.setStatus(
-          `文件资源同步完成 · ${finalState.pagesFetched} 项可独立搜索`,
-          'success',
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        panel.setStatus(`文件资源同步暂停，本地缓存仍可搜索：${message}`, 'error');
-        console.error('[CU Wiki Search] file resource sync failed', error);
-      } finally {
-        fileSyncPromise = undefined;
+    const task = (async () => {
+      const rebuildFileIndex = async (): Promise<void> => {
+        const files = await database.fileResources
+          .filter((file) => !file.deleted)
+          .toArray();
+        fileSearchBackend = new LinearTitleIndex(fallbackAnalyzer, files);
+        debugApi.indexedFiles = fileSearchBackend.size;
+        panel.refreshResults();
+      };
+      let finalState: Awaited<ReturnType<typeof syncFileResources>> | undefined;
+      const run = async (): Promise<void> => {
+        finalState = await syncFileResources(database, api, fallbackAnalyzer, {
+          force,
+          onBatch: rebuildFileIndex,
+          onProgress: (progress) => {
+            if (progress.status === 'running') {
+              panel.setStatus(`同步文件资源 ${progress.pagesFetched} 页…`);
+            }
+          },
+        });
+      };
+      const coordinated = incrementalCoordinator
+        ? await incrementalCoordinator.runExclusive(run)
+        : (await run(), 'ran' as const);
+      if (coordinated === 'lock-unavailable') {
+        throw new Error('无法取得跨标签写入锁，请确认浏览器支持 Web Locks 后重试');
       }
+      if (!finalState) throw new Error('文件资源同步未返回结果');
+      await rebuildFileIndex();
+      await refreshIndexesFromStorage({ files: true });
+      incrementalChannel?.postMessage({ type: 'files-committed' });
+      panel.setStatus(
+        `文件资源同步完成 · ${finalState.pagesFetched} 项可独立搜索`,
+        'success',
+      );
     })();
-    return fileSyncPromise;
+    fileSyncPromise = task;
+    try {
+      await task;
+    } finally {
+      if (fileSyncPromise === task) fileSyncPromise = undefined;
+    }
   }
 
   async function requestSync(force: boolean): Promise<void> {
@@ -666,35 +713,10 @@ async function start(): Promise<void> {
   async function saveDataCodeRules(source: string): Promise<void> {
     assertWritesAllowed();
     parseDataFieldRules(source);
-    if (dataCodeSyncPromise) await dataCodeSyncPromise;
-
-    const task = (async () => {
-      let result: Awaited<ReturnType<typeof syncDataCodes>> | undefined;
-      await runCoordinatedWriter('data', async () => {
-        result = await syncDataCodes(database, fallbackAnalyzer, {
-          force: true,
-          rulesSource: source,
-        });
-        // Keep the durable preference and its matching cache commit inside the
-        // same cross-tab writer window so a stale tab cannot win afterwards.
-        await dataRulesPreference.set(source);
-      });
-      if (!result) throw new Error('Data 代码规则保存未返回结果');
-      dataCodeIndex = new DataCodeIndex(fallbackAnalyzer, result.records);
-      dataCodeRulesSource = source;
-      debugApi.indexedDataCodes = dataCodeIndex.size;
-      panel.setDataCodeRules(dataCodeRulesSource, DEFAULT_DATA_CODE_RULES);
-      panel.refreshResults();
-      initialBackgroundRefresh.markComplete();
-      incrementalChannel?.postMessage({ type: 'data-committed' });
-      panel.setStatus(`Data 代码检索字段已保存 · ${dataCodeIndex.size} 条`, 'success');
-    })();
-    dataCodeSyncPromise = task;
-    try {
-      await task;
-    } finally {
-      if (dataCodeSyncPromise === task) dataCodeSyncPromise = undefined;
-    }
+    const session = dataCodeSyncSession;
+    if (!session) throw new Error('Data 代码同步尚未就绪');
+    const outcome = await session.save(source);
+    if (outcome.status === 'error') throw outcome.error;
   }
 
   async function requestDataCodeSync(force: boolean): Promise<SyncAttemptResult> {
@@ -702,48 +724,64 @@ async function start(): Promise<void> {
       initialBackgroundRefresh.markPending();
       return { status: 'error', error: new Error('本地数据版本不兼容') };
     }
-    if (dataCodeSyncPromise) {
-      return (await dataCodeSyncPromise) ?? { status: 'complete' };
+    const session = dataCodeSyncSession;
+    if (!session) {
+      return { status: 'error', error: new Error('Data 代码同步尚未就绪') };
     }
-    const task = (async (): Promise<SyncAttemptResult> => {
-      try {
-        let result: Awaited<ReturnType<typeof syncDataCodes>> | undefined;
-        let canonicalRules = dataCodeRulesSource;
-        await runCoordinatedWriter('data', async () => {
-          canonicalRules = await readCanonicalDataRules();
-          result = await syncDataCodes(database, fallbackAnalyzer, {
-            force,
-            rulesSource: canonicalRules,
-          });
-        });
-        if (!result) throw new Error('Data 代码同步未返回结果');
-        dataCodeIndex = new DataCodeIndex(fallbackAnalyzer, result.records);
-        dataCodeRulesSource = canonicalRules;
-        debugApi.indexedDataCodes = dataCodeIndex.size;
-        panel.setDataCodeRules(dataCodeRulesSource, DEFAULT_DATA_CODE_RULES);
-        panel.refreshResults();
-        initialBackgroundRefresh.markComplete();
-        if (result.refreshed) {
-          incrementalChannel?.postMessage({ type: 'data-committed' });
-          panel.setStatus(`Data 代码更新完成 · ${dataCodeIndex.size} 条`, 'success');
-        }
-        return { status: 'complete' } as const;
-      } catch (error) {
-        initialBackgroundRefresh.markPending();
-        const message = error instanceof Error ? error.message : String(error);
-        panel.setStatus(
-          `Data 代码更新失败，${dataCodeIndex?.size ? '继续使用本地缓存' : '标题搜索仍可用'}：${message}`,
-          'error',
-        );
-        console.error('[CU Wiki Search] Data code sync failed', error);
-        return { status: 'error', error } as const;
-      }
-    })();
-    dataCodeSyncPromise = task;
-    try {
-      return await task;
-    } finally {
-      if (dataCodeSyncPromise === task) dataCodeSyncPromise = undefined;
+    const outcome = await session.refresh(force);
+    if (outcome.status === 'complete') return { status: 'complete' };
+    initialBackgroundRefresh.markPending();
+    const message = errorMessage(outcome.error);
+    panel.setStatus(
+      `Data 代码更新失败，${dataCodeIndex?.size ? '继续使用本地缓存' : '标题搜索仍可用'}：${message}`,
+      'error',
+    );
+    console.error('[CU Wiki Search] Data code sync failed', outcome.error);
+    return outcome;
+  }
+
+  async function performDataCodeRefresh(force: boolean): Promise<DataCodeCommit> {
+    let result: Awaited<ReturnType<typeof syncDataCodes>> | undefined;
+    let canonicalRules = dataCodeRulesSource;
+    await runCoordinatedWriter('data-refresh', async () => {
+      canonicalRules = await readCanonicalDataRules();
+      result = await syncDataCodes(database, fallbackAnalyzer, {
+        force,
+        rulesSource: canonicalRules,
+      });
+    });
+    if (!result) throw new Error('Data 代码同步未返回结果');
+    return { origin: 'refresh', rulesSource: canonicalRules, result };
+  }
+
+  async function performDataCodeSave(source: string): Promise<DataCodeCommit> {
+    let result: Awaited<ReturnType<typeof syncDataCodes>> | undefined;
+    await runCoordinatedWriter('data-save', async () => {
+      result = await syncDataCodes(database, fallbackAnalyzer, {
+        force: true,
+        rulesSource: source,
+      });
+      // Keep the preference and matching cache commit under the same writer lock.
+      await dataRulesPreference.set(source);
+    });
+    if (!result) throw new Error('Data 代码规则保存未返回结果');
+    return { origin: 'save', rulesSource: source, result };
+  }
+
+  function applyDataCodeCommit(commit: DataCodeCommit): void {
+    dataCodeIndex = new DataCodeIndex(fallbackAnalyzer, commit.result.records);
+    dataCodeRulesSource = commit.rulesSource;
+    debugApi.indexedDataCodes = dataCodeIndex.size;
+    panel.setDataCodeRules(dataCodeRulesSource, DEFAULT_DATA_CODE_RULES);
+    panel.refreshResults();
+    initialBackgroundRefresh.markComplete();
+    if (commit.result.refreshed || commit.origin === 'save') {
+      incrementalChannel?.postMessage({ type: 'data-committed' });
+    }
+    if (commit.origin === 'save') {
+      panel.setStatus(`Data 代码检索字段已保存 · ${dataCodeIndex.size} 条`, 'success');
+    } else if (commit.result.refreshed) {
+      panel.setStatus(`Data 代码更新完成 · ${dataCodeIndex.size} 条`, 'success');
     }
   }
 
@@ -772,279 +810,131 @@ async function start(): Promise<void> {
     return runContentSync(force);
   }
 
-  async function applyCommittedReconciliationAfterRelease(): Promise<
-    SyncAttemptResult | undefined
-  > {
-    try {
-      const committed = await committedReconciliationRefresh.apply();
-      if (committed?.refreshError) {
-        console.error(
-          '[CU Wiki Search] committed reconciliation refresh failed',
-          committed.refreshError,
-        );
-      }
-      if (committed?.dataCodesInvalidated) {
-        return requestDataCodeSync(false);
-      }
-    } catch (error) {
-      console.error('[CU Wiki Search] committed reconciliation refresh failed', error);
-    }
-    return undefined;
-  }
-
   async function requestIncrementalSync(): Promise<void> {
     if (!ensureWritesAllowed()) return;
-    if (incrementalSyncPromise) return incrementalSyncPromise;
-    if (!incrementalCoordinator) return;
-    const coordinator = incrementalCoordinator;
-    const task = (async () => {
-      let syncResult: Awaited<ReturnType<typeof syncRecentChanges>> | undefined;
-      let reconciliationResult:
-        | Awaited<ReturnType<typeof reconcileWikiMirror>>
-        | undefined;
-      let dataRefreshResult: SyncAttemptResult | undefined;
-      try {
-        debugApi.incrementalStatus = 'running';
-        const coordinated = await coordinator.runIfDue(async () => {
-          debugApi.reconciliationStatus = 'running';
-          reconciliationResult = await reconcileWikiMirror(
-            database,
-            api,
-            fallbackAnalyzer,
-            {
-              onProgress: (state) => {
-                debugApi.reconciliationStatus = 'running';
-                panel.setStatus(
-                  `全量对账 ${state.pagesFetched} 页 · ${Math.min(state.namespaceIndex + 1, state.namespaceIds.length)}/${state.namespaceIds.length}`,
-                );
-              },
-            },
-          );
-          if (reconciliationResult.status === 'login-required') return false;
-          syncResult = await syncRecentChanges(database, api, fallbackAnalyzer);
-          return syncResult.status === 'complete';
-        });
-        if (
-          reconciliationResult?.status === 'complete' ||
-          reconciliationResult?.status === 'login-required'
-        ) {
-          dataRefreshResult = await applyCommittedReconciliationAfterRelease();
-        }
-        if (coordinated === 'lock-unavailable') {
-          debugApi.incrementalStatus = 'lock-unavailable';
-          await refreshIndexesFromStorage();
-          return;
-        }
-        if (coordinated === 'not-due') {
-          debugApi.incrementalStatus = 'idle';
-          await refreshIndexesFromStorage();
-          return;
-        }
-        if (reconciliationResult) {
-          debugApi.reconciliationStatus = reconciliationResult.status;
-          if (reconciliationResult.status === 'complete') {
-            debugApi.reconciliationCompletedAt = (
-              await readReconciliationSyncState(database)
-            )?.completedAt;
-          } else if (reconciliationResult.status === 'login-required') {
-            debugApi.incrementalStatus = 'login-required';
-            panel.setStatus(
-              '全量对账与增量同步暂停：请登录灰机账号，本地已有内容仍可搜索',
-              'error',
-            );
-            return;
-          }
-        }
-        if (!syncResult) return;
-        if (syncResult.status !== 'complete') {
-          debugApi.incrementalStatus = syncResult.status;
-          if (syncResult.status === 'login-required') {
-            panel.setStatus('增量同步暂停：请登录灰机账号，本地已有内容仍可搜索', 'error');
-          }
-          return;
-        }
-
-        debugApi.incrementalStatus = 'complete';
-        debugApi.incrementalThrough = syncResult.through;
-        const committedRecentChanges = await committedRecentChangeRefresh.apply(syncResult);
-        if (committedRecentChanges.dataCodesInvalidated) {
-          dataRefreshResult = await requestDataCodeSync(false);
-        }
-        if (
-          reconciliationResult?.status === 'complete' &&
-          dataRefreshResult?.status !== 'error' &&
-          (contentIndex || luaModuleIndex)
-        ) {
-          await runContentSync(false);
-        }
-        if (
-          dataRefreshResult?.status !== 'error' &&
-          (syncResult.changedPages.length || syncResult.filesChanged)
-        ) {
-          panel.setStatus(
-            `增量同步完成 · ${syncResult.changedPages.length} 个页面` +
-              (syncResult.filesChanged ? ' · 文件资源已更新' : ''),
-            'success',
-          );
-        }
-      } catch (error) {
-        await applyCommittedReconciliationAfterRelease();
-        const committedReconciliation = await readReconciliationSyncState(database);
-        if (
-          reconciliationResult?.status === 'complete' &&
-          committedReconciliation?.status === 'complete'
-        ) {
-          debugApi.reconciliationStatus = 'complete';
-          debugApi.reconciliationCompletedAt = committedReconciliation.completedAt;
-        } else if (debugApi.reconciliationStatus === 'running') {
-          debugApi.reconciliationStatus = 'error';
-        }
-        debugApi.incrementalStatus = 'error';
-        const message = error instanceof Error ? error.message : String(error);
-        panel.setStatus(`增量同步暂停，本地已有内容仍可搜索：${message}`, 'error');
-        console.error('[CU Wiki Search] incremental sync failed', error);
-      }
-    })();
-    incrementalSyncPromise = task;
-    try {
-      await task;
-    } finally {
-      if (incrementalSyncPromise === task) incrementalSyncPromise = undefined;
+    const orchestrator = mirrorSyncOrchestrator;
+    if (!orchestrator) return;
+    const outcome = await orchestrator.runScheduled();
+    if (outcome.status === 'lock-unavailable' || outcome.status === 'not-due') {
+      await refreshIndexesFromStorage();
     }
-  }
-
-  async function requestReconciliationSync(
-    force: boolean,
-  ): Promise<ReconciliationRequestResult> {
-    if (!ensureWritesAllowed()) {
-      return { status: 'error', error: new Error('本地数据版本不兼容') };
-    }
-    if (reconciliationSyncPromise) return reconciliationSyncPromise;
-    if (!incrementalCoordinator) return { status: 'lock-unavailable' };
-    const coordinator = incrementalCoordinator;
-    const task = (async () => {
-      try {
-        debugApi.reconciliationStatus = 'running';
-        let result: Awaited<ReturnType<typeof reconcileWikiMirror>> | undefined;
-        let catchUpResult: Awaited<ReturnType<typeof syncRecentChanges>> | undefined;
-        let catchUpError: unknown;
-        let committedDataResult: SyncAttemptResult | undefined;
-        let catchUpDataResult: SyncAttemptResult | undefined;
-        const coordinated = await coordinator.runExclusive(async () => {
-          result = await reconcileWikiMirror(database, api, fallbackAnalyzer, {
-            force,
-            onProgress: (state) => {
-              panel.setStatus(
-                `全量对账 ${state.pagesFetched} 页 · ${Math.min(state.namespaceIndex + 1, state.namespaceIds.length)}/${state.namespaceIds.length}`,
-              );
-            },
-          });
-          if (result.status === 'complete') {
-            try {
-              catchUpResult = await syncRecentChanges(database, api, fallbackAnalyzer);
-            } catch (error) {
-              catchUpError = error;
-            }
-          }
-        });
-        if (result?.status === 'complete' || result?.status === 'login-required') {
-          committedDataResult = await applyCommittedReconciliationAfterRelease();
-        }
-        if (catchUpResult?.status === 'complete') {
-          const committedCatchUp = await committedRecentChangeRefresh.apply(catchUpResult);
-          if (committedCatchUp.dataCodesInvalidated) {
-            catchUpDataResult = await requestDataCodeSync(false);
-          }
-        }
-        if (coordinated === 'lock-unavailable') {
-          debugApi.reconciliationStatus = 'lock-unavailable';
-          return { status: 'lock-unavailable' } as const;
-        }
-        if (!result) {
-          return {
-            status: 'error',
-            error: new Error('全量对账未返回结果'),
-          } as const;
-        }
-        debugApi.reconciliationStatus = result.status;
-        if (result.status === 'login-required') {
-          panel.setStatus(
-            '全量对账暂停：请登录灰机账号，本地已有内容仍可搜索',
-            'error',
-          );
-          return { status: 'login-required' } as const;
-        }
-        if (result.status !== 'complete') return { status: result.status };
-        if (catchUpResult?.status === 'login-required') {
-          debugApi.incrementalStatus = 'login-required';
-          panel.setStatus(
-            '全量对账已提交，收尾增量同步暂停：请登录灰机账号',
-            'error',
-          );
-        } else if (catchUpResult?.status === 'complete') {
-          debugApi.incrementalStatus = 'complete';
-          debugApi.incrementalThrough = catchUpResult.through;
-        }
-        debugApi.reconciliationCompletedAt = (
-          await readReconciliationSyncState(database)
-        )?.completedAt;
-        const finalDataResult = catchUpDataResult ?? committedDataResult;
-        if (finalDataResult?.status === 'error') return finalDataResult;
-        if (catchUpError) {
-          debugApi.incrementalStatus = 'error';
-          const message =
-            catchUpError instanceof Error ? catchUpError.message : String(catchUpError);
-          panel.setStatus(
-            `全量对账已完成，收尾增量同步稍后重试：${message}`,
-            'error',
-          );
-          console.error('[CU Wiki Search] reconciliation catch-up failed', catchUpError);
-          return { status: 'catch-up-error', error: catchUpError } as const;
-        } else if (catchUpResult?.status === 'login-required') {
-          return { status: 'login-required' } as const;
-        } else {
-          panel.setStatus(
-            `全量对账完成 · ${result.pagesFetched} 页 · ${result.pagesChanged} 个页面变化` +
-              (result.filesChanged ? ' · 文件资源已更新' : ''),
-            'success',
-          );
-        }
-        return { status: 'complete' } as const;
-      } catch (error) {
-        await applyCommittedReconciliationAfterRelease();
-        debugApi.reconciliationStatus = 'error';
-        const message = error instanceof Error ? error.message : String(error);
-        panel.setStatus(`全量对账暂停，本地已有内容仍可搜索：${message}`, 'error');
-        console.error('[CU Wiki Search] reconciliation failed', error);
-        return { status: 'error', error } as const;
-      }
-    })();
-    reconciliationSyncPromise = task;
-    try {
-      return await task;
-    } finally {
-      if (reconciliationSyncPromise === task) reconciliationSyncPromise = undefined;
-    }
+    await applyMirrorSyncOutcome(outcome);
   }
 
   async function requestManualReconciliation(): Promise<void> {
-    const result = await requestReconciliationSync(true);
-    if (result.status === 'complete') {
-      if (contentIndex || luaModuleIndex) await runContentSync(false);
+    if (!ensureWritesAllowed()) throw new Error('本地数据版本不兼容');
+    const orchestrator = mirrorSyncOrchestrator;
+    if (!orchestrator) throw new Error('全量对账协调器尚未就绪');
+    const outcome = await orchestrator.reconcileNow();
+    await applyMirrorSyncOutcome(outcome);
+    if (outcome.status !== 'complete') throw mirrorSyncOutcomeError(outcome);
+  }
+
+  function handleMirrorSyncEvent(event: MirrorSyncEvent): void {
+    if (event.type === 'started') {
+      if (event.request === 'scheduled') debugApi.incrementalStatus = 'running';
+      else debugApi.reconciliationStatus = 'running';
       return;
     }
-    if ('error' in result && result.error) throw result.error;
-    const message =
-      result.status === 'login-required'
-        ? '请先登录灰机账号'
-        : result.status === 'lock-unavailable'
-          ? '另一个标签页正在写入本地镜像，请稍后重试'
-          : result.status === 'no-baseline'
-            ? '尚无完整标题基线，请先重试标题同步'
-            : result.status === 'catch-up-error'
-              ? '收尾增量同步失败，请稍后重试'
-              : '全量对账尚未执行';
-    throw new Error(message);
+    debugApi.reconciliationStatus = 'running';
+    if (event.type === 'reconciliation-started') return;
+    panel.setStatus(
+      `全量对账 ${event.state.pagesFetched} 页 · ${Math.min(event.state.namespaceIndex + 1, event.state.namespaceIds.length)}/${event.state.namespaceIds.length}`,
+    );
+  }
+
+  async function applyMirrorSyncOutcome(outcome: MirrorSyncOutcome): Promise<void> {
+    const reconciliation = outcome.reconciliation;
+    if (reconciliation) {
+      debugApi.reconciliationStatus =
+        reconciliation.status === 'complete'
+          ? 'complete'
+          : reconciliation.status;
+      if (reconciliation.status === 'complete') {
+        debugApi.reconciliationCompletedAt = (
+          await readReconciliationSyncState(database)
+        )?.completedAt;
+      }
+    }
+    const recentChanges = outcome.recentChanges;
+    if (recentChanges?.status === 'complete') {
+      debugApi.incrementalStatus = 'complete';
+      debugApi.incrementalThrough = recentChanges.through;
+    } else if (recentChanges) {
+      debugApi.incrementalStatus = recentChanges.status;
+    } else if (outcome.request === 'scheduled') {
+      debugApi.incrementalStatus =
+        outcome.status === 'not-due'
+          ? 'idle'
+          : outcome.status === 'catch-up-error' ||
+              outcome.status === 'data-error' ||
+              outcome.status === 'content-error'
+            ? 'error'
+            : outcome.status;
+    } else if (outcome.status === 'catch-up-error') {
+      debugApi.incrementalStatus = 'error';
+    }
+    if (!reconciliation && outcome.request === 'manual') {
+      debugApi.reconciliationStatus =
+        outcome.status === 'data-error' ||
+        outcome.status === 'content-error' ||
+        outcome.status === 'catch-up-error'
+          ? 'error'
+          : outcome.status;
+    } else if (
+      !reconciliation &&
+      outcome.errors?.synchronization &&
+      debugApi.reconciliationStatus === 'running'
+    ) {
+      debugApi.reconciliationStatus = 'error';
+    }
+
+    for (const [phase, error] of Object.entries(outcome.errors ?? {})) {
+      console.error(`[CU Wiki Search] mirror sync ${phase} failed`, error);
+    }
+    if (outcome.status === 'complete') {
+      if (outcome.request === 'manual' && reconciliation?.status === 'complete') {
+        panel.setStatus(
+          `全量对账完成 · ${reconciliation.pagesFetched} 页 · ${reconciliation.pagesChanged} 个页面变化` +
+            (reconciliation.filesChanged ? ' · 文件资源已更新' : ''),
+          'success',
+        );
+      } else if (
+        recentChanges?.status === 'complete' &&
+        (recentChanges.changedPages.length || recentChanges.filesChanged)
+      ) {
+        panel.setStatus(
+          `增量同步完成 · ${recentChanges.changedPages.length} 个页面` +
+            (recentChanges.filesChanged ? ' · 文件资源已更新' : ''),
+          'success',
+        );
+      }
+      return;
+    }
+    if (outcome.status === 'not-due') return;
+    const message = mirrorSyncOutcomeError(outcome).message;
+    const prefix = outcome.request === 'manual' ? '全量对账' : '增量同步';
+    panel.setStatus(`${prefix}暂停，本地已有内容仍可搜索：${message}`, 'error');
+  }
+
+  function mirrorSyncOutcomeError(outcome: MirrorSyncOutcome): Error {
+    const cause =
+      outcome.errors?.synchronization ??
+      outcome.errors?.catchUp ??
+      outcome.errors?.data ??
+      outcome.errors?.content ??
+      outcome.errors?.committedRefresh;
+    if (cause instanceof Error) return cause;
+    if (cause !== undefined) return new Error(String(cause));
+    if (outcome.status === 'login-required') return new Error('请先登录灰机账号');
+    if (outcome.status === 'lock-unavailable') {
+      return new Error('无法取得跨标签写入锁，请确认浏览器支持 Web Locks 后重试');
+    }
+    if (outcome.status === 'no-baseline') {
+      return new Error('尚无完整标题基线，请先重试标题同步');
+    }
+    if (outcome.status === 'not-due') return new Error('全量对账尚未到期');
+    return new Error('同步未完成，请稍后重试');
   }
 
   async function refreshIndexesFromStorage(
@@ -1061,14 +951,13 @@ async function start(): Promise<void> {
   async function applyStorageInvalidation(
     invalidation: StorageInvalidation,
   ): Promise<void> {
-    const [sequenceRecord, incrementalState, dataState] = await Promise.all([
-      invalidation.pages ? database.syncState.get('local-sequence') : undefined,
+    const [sequence, incrementalState, dataState] = await Promise.all([
+      invalidation.pages ? readLocalSequence(database) : 0,
       invalidation.pages || invalidation.files
         ? readRecentChangeSyncState(database)
         : undefined,
       invalidation.data ? readDataCodeSyncState(database) : undefined,
     ]);
-    const sequence = typeof sequenceRecord?.value === 'number' ? sequenceRecord.value : 0;
     let indexChanged = false;
     const sequenceAdvanced = invalidation.pages && sequence > lastAppliedLocalSeq;
     const handleBehind = [titleHandle, contentHandle, luaHandle].some(
@@ -1084,13 +973,8 @@ async function start(): Promise<void> {
             .toArray()
         : [];
       if (titleHandle) await indexCache.refresh(titleHandle);
-      else if (sequenceAdvanced) titleIndex?.update(changedPages);
       if (contentHandle) await indexCache.refresh(contentHandle);
-      else if (sequenceAdvanced && contentIndex) await contentIndex.updateAsync(changedPages);
       if (luaHandle) await indexCache.refresh(luaHandle);
-      else if (sequenceAdvanced && luaModuleIndex) {
-        await luaModuleIndex.updateAsync(changedPages);
-      }
       if (sequenceAdvanced) {
         const allPages = await readActivePageHeaders(database);
         bootstrapIndex = new LinearTitleIndex(fallbackAnalyzer, allPages);
@@ -1342,6 +1226,17 @@ async function start(): Promise<void> {
     }
   }
 
+  function observeRuntimeTask(
+    task: Promise<unknown>,
+    context: string,
+    userMessage?: string,
+  ): void {
+    void task.catch((error: unknown) => {
+      if (userMessage) panel.setStatus(`${userMessage}：${errorMessage(error)}`, 'error');
+      console.error(`[CU Wiki Search] ${context} failed`, error);
+    });
+  }
+
   function snapshotPublishWarning(result: SnapshotPublishResult): string | undefined {
     if (result.status === 'published') return undefined;
     if (result.reason === 'too-large') {
@@ -1368,6 +1263,10 @@ function progressMessage(progress: TitleSyncProgress): string {
   if (progress.status === 'failed') return `标题同步失败：${progress.error ?? '未知错误'}`;
   if (progress.status === 'complete') return `标题同步完成 · ${progress.pagesFetched} 页`;
   return `同步标题 ${progress.pagesFetched} 页 · ${progress.namespaceName ?? '命名空间'} (${Math.min(progress.namespaceIndex + 1, progress.namespaceCount)}/${progress.namespaceCount})`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function searchKindLabel(kind: 'title' | 'content' | 'lua'): string {
