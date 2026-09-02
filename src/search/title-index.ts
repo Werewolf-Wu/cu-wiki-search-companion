@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
-import MiniSearch, { type Options, type SearchResult } from 'minisearch';
+import MiniSearch, {
+  type AsPlainObject,
+  type Options,
+  type SearchResult,
+} from 'minisearch';
 
 import type { Analyzer } from '../analyzer/analyzer';
 import {
@@ -204,8 +208,8 @@ export class TitleIndex implements TitleSearchBackend {
     const pending: PendingTitleRebuild = { updates: [] };
     this.pendingRebuilds.add(pending);
     try {
-      const restored = await MiniSearch.loadJSONAsync<IndexedTitle>(
-        JSON.stringify(payload.miniSearch),
+      const restored = await MiniSearch.loadJSAsync<IndexedTitle>(
+        payload.miniSearch as AsPlainObject,
         this.indexOptions(),
       );
       for (const update of pending.updates) this.applyPages(restored, update);

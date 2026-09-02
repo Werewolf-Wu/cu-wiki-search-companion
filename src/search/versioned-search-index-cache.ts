@@ -9,12 +9,15 @@ import {
   createCompatibilityKey,
   type SearchIndexKind,
 } from '../storage/version-contract';
+import {
+  isNonNegativeSafeInteger,
+  readLocalSequence,
+} from '../storage/sync-state';
 import type { IndexSnapshotRecord, PageRecord, SyncStateRecord } from '../types';
 import { ContentIndex } from './content-index';
 import { LuaModuleIndex } from './lua-module-index';
 import { TitleIndex } from './title-index';
 
-const LOCAL_SEQUENCE_KEY = 'local-sequence';
 const SNAPSHOT_GENERATION_KEY = 'search-index-generation';
 const SNAPSHOT_FORMAT_VERSION = 2;
 const MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
@@ -103,6 +106,7 @@ interface RuntimeState {
   status: SnapshotInspectionStatus;
   restoreMs?: number;
   message?: string;
+  validatedSnapshot?: IndexSnapshotRecord;
 }
 
 export class VersionedSearchIndexCache {
@@ -146,6 +150,7 @@ export class VersionedSearchIndexCache {
       ? 'corrupt'
       : 'missing';
     let runtimeMessage: string | undefined;
+    let validatedSnapshot: IndexSnapshotRecord | undefined;
 
     if (bundle.snapshot) {
       if (bundle.snapshot.compatibilityKey !== compatibilityKey) {
@@ -162,6 +167,7 @@ export class VersionedSearchIndexCache {
           if (index.size !== bundle.snapshot.documentCount) {
             throw new Error('快照文档数量不一致');
           }
+          validatedSnapshot = bundle.snapshot;
           const changedPages = bundle.pages
             .filter((page) => page.localSeq > bundle.snapshot!.throughLocalSeq)
             .sort((left, right) => left.localSeq - right.localSeq);
@@ -194,6 +200,7 @@ export class VersionedSearchIndexCache {
       status: runtimeStatus,
       restoreMs,
       message: runtimeMessage,
+      validatedSnapshot,
     });
     return {
       kind,
@@ -236,11 +243,9 @@ export class VersionedSearchIndexCache {
       'r',
       this.database.pages,
       this.database.syncState,
+      this.database.fileResources,
       async () => {
-        const sequenceRecord = (await this.database.syncState.get(
-          LOCAL_SEQUENCE_KEY,
-        )) as SyncStateRecord<number> | undefined;
-        const currentSequence = sequenceRecord?.value ?? handle.throughLocalSeq;
+        const currentSequence = await readLocalSequence(this.database);
         const pages =
           currentSequence > handle.throughLocalSeq
             ? await this.database.pages
@@ -284,7 +289,8 @@ export class VersionedSearchIndexCache {
     const json = JSON.stringify(handle.index.exportSnapshot());
     const candidateDocumentCount = handle.index.size;
     const serializationMs = Math.max(0, this.clock() - serializationStartedAt);
-    const payloadBytes = new TextEncoder().encode(json).byteLength;
+    const encodedPayload = new TextEncoder().encode(json);
+    const payloadBytes = encodedPayload.byteLength;
     if (payloadBytes > MAX_PAYLOAD_BYTES) {
       return { status: 'skipped', reason: 'too-large' };
     }
@@ -300,7 +306,7 @@ export class VersionedSearchIndexCache {
       createdAt: this.now(),
       documentCount: candidateDocumentCount,
       payloadBytes,
-      sha256: await sha256(json),
+      sha256: await sha256(encodedPayload),
       json,
       serializationMs,
     };
@@ -308,14 +314,14 @@ export class VersionedSearchIndexCache {
       'rw',
       this.database.indexSnapshots,
       this.database.syncState,
+      this.database.pages,
+      this.database.fileResources,
       async (): Promise<SnapshotPublishResult> => {
         if (this.publishingSuppressed) {
           return { status: 'skipped', reason: 'cleared-this-session' };
         }
-        const [sequenceRecord, generationRecord] = await Promise.all([
-          this.database.syncState.get(LOCAL_SEQUENCE_KEY) as Promise<
-            SyncStateRecord<number> | undefined
-          >,
+        const [currentSequence, generationRecord] = await Promise.all([
+          readLocalSequence(this.database),
           this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
             SyncStateRecord<number> | undefined
           >,
@@ -323,7 +329,6 @@ export class VersionedSearchIndexCache {
         if (snapshotGenerationOf(generationRecord) !== candidateGeneration) {
           return { status: 'skipped', reason: 'cleared-this-session' };
         }
-        const currentSequence = sequenceRecord?.value ?? 0;
         if (currentSequence !== record.throughLocalSeq) {
           return { status: 'skipped', reason: 'sequence-changed' };
         }
@@ -344,6 +349,7 @@ export class VersionedSearchIndexCache {
         compatibilityKey: handle.compatibilityKey,
         status: 'available',
         message: undefined,
+        validatedSnapshot: record,
       });
     }
     return result;
@@ -358,8 +364,9 @@ export class VersionedSearchIndexCache {
         .then(async () => {
           const result = await this.publish(handle);
           if (result.status === 'skipped' && result.reason === 'sequence-changed') {
+            const previousSequence = handle.throughLocalSeq;
             await this.refresh(handle);
-            this.schedulePublish(handle);
+            if (handle.throughLocalSeq > previousSequence) this.schedulePublish(handle);
           }
         })
         .catch((error: unknown) => {
@@ -370,13 +377,17 @@ export class VersionedSearchIndexCache {
   }
 
   async inspect(): Promise<SnapshotInspection[]> {
-    const [records, sequenceRecord] = await Promise.all([
-      this.database.indexSnapshots.toArray(),
-      this.database.syncState.get(LOCAL_SEQUENCE_KEY) as Promise<
-        SyncStateRecord<number> | undefined
-      >,
-    ]);
-    const currentSequence = sequenceRecord?.value ?? 0;
+    const { records, currentSequence } = await this.database.transaction(
+      'r',
+      this.database.indexSnapshots,
+      this.database.syncState,
+      this.database.pages,
+      this.database.fileResources,
+      async () => ({
+        records: await this.database.indexSnapshots.toArray(),
+        currentSequence: await readLocalSequence(this.database),
+      }),
+    );
     return Promise.all((['title', 'content', 'lua'] as const).map(async (kind) => {
       const record = records.find((candidate) => candidate.key === snapshotKey(kind));
       const runtime = this.runtime.get(kind);
@@ -389,15 +400,17 @@ export class VersionedSearchIndexCache {
         };
       }
       let status: SnapshotInspectionStatus;
+      const matchesValidatedSnapshot = Boolean(
+        runtime?.validatedSnapshot &&
+          isSameSnapshot(record, runtime.validatedSnapshot),
+      );
       const structurallyCorrupt =
         record.key !== snapshotKey(kind) ||
         record.kind !== kind ||
+        !isNonNegativeSafeInteger(record.throughLocalSeq) ||
         record.throughLocalSeq > currentSequence ||
-        new TextEncoder().encode(record.json).byteLength !== record.payloadBytes ||
-        (await sha256(record.json)) !== record.sha256 ||
-        !isJsonObject(record.json) ||
-        !Number.isSafeInteger(record.documentCount) ||
-        record.documentCount < 0;
+        !isNonNegativeSafeInteger(record.documentCount) ||
+        (!matchesValidatedSnapshot && !(await hasValidPayload(record)));
       if (structurallyCorrupt) status = 'corrupt';
       else if (record.snapshotFormatVersion !== SNAPSHOT_FORMAT_VERSION) status = 'outdated';
       else if (!runtime?.compatibilityKey) status = 'not-started';
@@ -466,20 +479,15 @@ export class VersionedSearchIndexCache {
       this.database.indexSnapshots,
       this.database.syncState,
       this.database.pages,
+      this.database.fileResources,
       async () => {
-        const [snapshot, sequenceRecord, generationRecord] = await Promise.all([
+        const [snapshot, currentSequence, generationRecord] = await Promise.all([
           this.database.indexSnapshots.get(snapshotKey(kind)),
-          this.database.syncState.get(LOCAL_SEQUENCE_KEY) as Promise<
-            SyncStateRecord<number> | undefined
-          >,
+          readLocalSequence(this.database),
           this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
             SyncStateRecord<number> | undefined
           >,
         ]);
-        const currentSequence =
-          sequenceRecord?.value ??
-          (await this.database.pages.orderBy('localSeq').last())?.localSeq ??
-          0;
         const pagesAreDelta = Boolean(
           snapshot &&
             snapshot.compatibilityKey === compatibilityKey &&
@@ -511,19 +519,19 @@ export class VersionedSearchIndexCache {
       'r',
       this.database.indexSnapshots,
       this.database.syncState,
+      this.database.pages,
+      this.database.fileResources,
       async () => {
-        const [snapshot, sequenceRecord, generationRecord] = await Promise.all([
+        const [snapshot, currentSequence, generationRecord] = await Promise.all([
           this.database.indexSnapshots.get(snapshotKey(kind)),
-          this.database.syncState.get(LOCAL_SEQUENCE_KEY) as Promise<
-            SyncStateRecord<number> | undefined
-          >,
+          readLocalSequence(this.database),
           this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
             SyncStateRecord<number> | undefined
           >,
         ]);
         return {
           snapshot,
-          currentSequence: sequenceRecord?.value ?? 0,
+          currentSequence,
           snapshotGeneration: snapshotGenerationOf(generationRecord),
         };
       },
@@ -603,10 +611,11 @@ async function validateSnapshot(
   ) {
     throw new Error('快照序列范围无效');
   }
-  if (new TextEncoder().encode(record.json).byteLength !== record.payloadBytes) {
+  const encodedPayload = new TextEncoder().encode(record.json);
+  if (encodedPayload.byteLength !== record.payloadBytes) {
     throw new Error('快照长度校验失败');
   }
-  if ((await sha256(record.json)) !== record.sha256) {
+  if ((await sha256(encodedPayload)) !== record.sha256) {
     throw new Error('快照 SHA-256 校验失败');
   }
   const payload: unknown = JSON.parse(record.json);
@@ -617,8 +626,17 @@ async function validateSnapshot(
   return payload;
 }
 
-async function sha256(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+async function hasValidPayload(record: IndexSnapshotRecord): Promise<boolean> {
+  const encodedPayload = new TextEncoder().encode(record.json);
+  return (
+    encodedPayload.byteLength === record.payloadBytes &&
+    (await sha256(encodedPayload)) === record.sha256 &&
+    isJsonObject(record.json)
+  );
+}
+
+async function sha256(value: BufferSource): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', value);
   return [...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, '0'))
     .join('');
@@ -656,5 +674,5 @@ function snapshotGenerationOf(
   record: SyncStateRecord<number> | undefined,
 ): number {
   const value = record?.value;
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  return isNonNegativeSafeInteger(value) ? value : 0;
 }

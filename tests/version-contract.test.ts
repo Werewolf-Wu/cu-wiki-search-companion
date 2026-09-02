@@ -95,6 +95,45 @@ describe('cache version contract', () => {
     );
   });
 
+  it('does not rewrite an equivalent contract whose keys were stored in another order', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    const current = CURRENT_VERSION_CONTRACT;
+    const reordered: CacheVersionContract = {
+      libraries: {
+        jieba: current.libraries.jieba,
+        minisearch: current.libraries.minisearch,
+      },
+      dataCodeFormat: current.dataCodeFormat,
+      indexes: {
+        lua: current.indexes.lua,
+        content: current.indexes.content,
+        title: current.indexes.title,
+      },
+      extractors: {
+        lua: current.extractors.lua,
+        bson: current.extractors.bson,
+        wikitext: current.extractors.wikitext,
+      },
+      analyzerPipeline: current.analyzerPipeline,
+      contentJobFormat: current.contentJobFormat,
+      pageFacts: current.pageFacts,
+      databaseSchema: current.databaseSchema,
+    };
+    await database.syncState.put({ key: CACHE_VERSION_CONTRACT_KEY, value: reordered });
+    const put = vi.spyOn(database.syncState, 'put');
+
+    await expect(initializeVersionContract(database)).resolves.toMatchObject({
+      status: 'compatible',
+      registeredLegacy: false,
+      migrated: false,
+    });
+    expect(put).not.toHaveBeenCalled();
+
+    database.close();
+    await database.delete();
+  });
+
   it('marks a newer local fact format incompatible without changing stored data', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();

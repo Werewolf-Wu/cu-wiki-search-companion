@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-import MiniSearch, { type Options } from 'minisearch';
+import MiniSearch, { type AsPlainObject, type Options } from 'minisearch';
 
 import type { Analyzer } from '../analyzer/analyzer';
 import { extractLua, type LuaExtraction } from '../content/extract-lua';
@@ -164,8 +164,8 @@ export class LuaModuleIndex {
       );
     }
     try {
-      const restored = await MiniSearch.loadJSONAsync<IndexedLuaModule>(
-        JSON.stringify(payload.miniSearch),
+      const restored = await MiniSearch.loadJSAsync<IndexedLuaModule>(
+        payload.miniSearch as AsPlainObject,
         this.indexOptions(),
       );
       if (restoredSymbolsById.size !== restored.documentCount) {
