@@ -32,7 +32,7 @@ export default defineConfig({
       userscript: {
         name: '未知伤亡维基 · 本地搜索',
         namespace: 'https://casualtiesunknown.huijiwiki.com/',
-        version: '0.3.0',
+        version: '0.3.1',
         description: '在编辑页本地同步并搜索未知伤亡中文维基标题',
         author: 'Werewolf-Wu and contributors',
         homepageURL: 'https://github.com/Werewolf-Wu/cu-wiki-search-companion',
