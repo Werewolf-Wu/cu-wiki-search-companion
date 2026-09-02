@@ -10,6 +10,32 @@ import type { PageRecord, TitleSyncState } from '../src/types';
 const analyzer = new Analyzer(createBootstrapSegmenter());
 
 describe('RecentChanges incremental sync', () => {
+  it('reports no deferred content when the incremental sync has no baseline', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.syncState.put({ key: 'local-sequence', value: 7 });
+    const fetcher = vi.fn();
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+    const result = await syncRecentChanges(database, api, analyzer, {
+      requestIntervalMs: 0,
+    });
+
+    expect(result).toEqual({
+      status: 'no-baseline',
+      eventsSeen: 0,
+      candidates: 0,
+      changedPages: [],
+      deferredContentPageIds: [],
+      filesChanged: false,
+      dataCodesInvalidated: false,
+      throughLocalSeq: 7,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+
+    await destroy(database);
+  });
+
   it('commits a changed page body and the frozen server cursor together', async () => {
     const requests: URL[] = [];
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
@@ -585,6 +611,7 @@ describe('RecentChanges incremental sync', () => {
       status: 'login-required',
       eventsSeen: 0,
       candidates: 0,
+      deferredContentPageIds: [],
     });
     expect(fetcher).toHaveBeenCalledOnce();
     expect(await database.pages.get(1)).toMatchObject({
@@ -662,7 +689,10 @@ describe('RecentChanges incremental sync', () => {
         requestIntervalMs: 0,
       });
 
-      expect(result).toMatchObject({ status: 'login-required' });
+      expect(result).toMatchObject({
+        status: 'login-required',
+        deferredContentPageIds: [],
+      });
       expect((await database.syncState.get('recent-changes-sync'))?.value).toEqual(
         priorState,
       );
@@ -961,10 +991,12 @@ describe('RecentChanges incremental sync', () => {
     await destroy(database);
   });
 
-  it('does not commit pages or cursor when a required body response is missing', async () => {
+  it('commits other pages and defers a body that advanced past its info snapshot', async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
-      const parameters = url.searchParams;
+      const parameters = new URL(
+        String(input),
+        'https://casualtiesunknown.huijiwiki.com',
+      ).searchParams;
       if (parameters.get('curtimestamp') === '1') {
         return json({ curtimestamp: '2026-08-31T03:10:00Z', query: { general: {} } });
       }
@@ -975,12 +1007,22 @@ describe('RecentChanges incremental sync', () => {
               {
                 type: 'edit',
                 ns: 0,
-                title: '缺正文页',
+                title: '竞态页面',
                 pageid: 1,
                 revid: 12,
                 old_revid: 11,
                 rcid: 601,
                 timestamp: '2026-08-31T03:06:00Z',
+              },
+              {
+                type: 'edit',
+                ns: 0,
+                title: '正常页面',
+                pageid: 2,
+                revid: 22,
+                old_revid: 21,
+                rcid: 602,
+                timestamp: '2026-08-31T03:07:00Z',
               },
             ],
           },
@@ -993,41 +1035,356 @@ describe('RecentChanges incremental sync', () => {
               {
                 pageid: 1,
                 ns: 0,
-                title: '缺正文页',
+                title: '竞态页面',
                 contentmodel: 'wikitext',
                 lastrevid: 12,
+              },
+              {
+                pageid: 2,
+                ns: 0,
+                title: '正常页面',
+                contentmodel: 'wikitext',
+                lastrevid: 22,
               },
             ],
           },
         });
       }
-      return json({ query: { pages: [{ pageid: 1 }] } });
+      return json({
+        query: {
+          pages: [
+            {
+              pageid: 1,
+              revisions: [
+                {
+                  revid: 13,
+                  slots: { main: { contentmodel: 'wikitext', content: '不可采用的正文' } },
+                },
+              ],
+            },
+            {
+              pageid: 2,
+              revisions: [
+                {
+                  revid: 22,
+                  slots: { main: { contentmodel: 'wikitext', content: '正常新正文' } },
+                },
+              ],
+            },
+          ],
+        },
+      });
     });
     const database = await databaseWithBaseline([
       page({
-        title: '缺正文页',
-        normalizedTitle: analyzer.normalize('缺正文页'),
+        title: '竞态页面',
+        normalizedTitle: analyzer.normalize('竞态页面'),
         revisionId: 11,
         contentRevisionId: 11,
-        content: '旧正文仍应保留',
+        content: '竞态旧正文',
+      }),
+      page({
+        id: 2,
+        title: '正常页面',
+        normalizedTitle: analyzer.normalize('正常页面'),
+        revisionId: 21,
+        contentRevisionId: 21,
+        content: '正常旧正文',
       }),
     ]);
     const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
 
-    await expect(
-      syncRecentChanges(database, api, analyzer, { requestIntervalMs: 0 }),
-    ).rejects.toThrow('页面正文响应缺失');
-
-    expect(await database.pages.get(1)).toMatchObject({
-      revisionId: 11,
-      contentRevisionId: 11,
-      content: '旧正文仍应保留',
+    const result = await syncRecentChanges(database, api, analyzer, {
+      requestIntervalMs: 0,
     });
-    expect(await database.syncState.get('recent-changes-sync')).toBeUndefined();
-    expect((await database.syncState.get('local-sequence'))?.value).toBe(1);
+
+    expect(result).toMatchObject({
+      status: 'complete',
+      through: '2026-08-31T03:10:00Z',
+      deferredContentPageIds: [1],
+    });
+    expect(await database.pages.get(1)).toMatchObject({
+      revisionId: 12,
+      contentRevisionId: 11,
+      content: '竞态旧正文',
+      deleted: false,
+    });
+    expect(await database.pages.get(2)).toMatchObject({
+      revisionId: 22,
+      contentRevisionId: 22,
+      content: '正常新正文',
+      deleted: false,
+    });
+    expect(
+      await database.jobs.filter((job) => job.pageId === 1).first(),
+    ).toMatchObject({
+      type: 'wikitext-content',
+      status: 'pending',
+      targetRevisionId: 12,
+    });
+    expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
+      through: '2026-08-31T03:10:00Z',
+    });
 
     await destroy(database);
   });
+
+  it('does not create or revive pages explicitly missing from the body response', async () => {
+    let round = 0;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const parameters = new URL(
+        String(input),
+        'https://casualtiesunknown.huijiwiki.com',
+      ).searchParams;
+      if (parameters.get('curtimestamp') === '1') {
+        round += 1;
+        return json({
+          curtimestamp:
+            round === 1 ? '2026-08-31T03:10:00Z' : '2026-08-31T03:20:00Z',
+          query: { general: {} },
+        });
+      }
+      if (parameters.get('list') === 'recentchanges') {
+        return json({
+          query: {
+            recentchanges:
+              round === 1
+                ? [
+                    {
+                      type: 'new',
+                      ns: 0,
+                      title: '瞬时新页',
+                      pageid: 3,
+                      revid: 30,
+                      old_revid: 0,
+                      rcid: 603,
+                      timestamp: '2026-08-31T03:06:00Z',
+                    },
+                    {
+                      type: 'new',
+                      ns: 0,
+                      title: '已有墓碑页',
+                      pageid: 4,
+                      revid: 40,
+                      old_revid: 0,
+                      rcid: 604,
+                      timestamp: '2026-08-31T03:07:00Z',
+                    },
+                  ]
+                : [
+                    {
+                      type: 'log',
+                      ns: 0,
+                      title: '瞬时新页',
+                      pageid: 3,
+                      revid: 0,
+                      old_revid: 0,
+                      rcid: 605,
+                      timestamp: '2026-08-31T03:11:00Z',
+                      logtype: 'delete',
+                      logaction: 'delete',
+                      logparams: {},
+                    },
+                    {
+                      type: 'log',
+                      ns: 0,
+                      title: '已有墓碑页',
+                      pageid: 4,
+                      revid: 0,
+                      old_revid: 0,
+                      rcid: 606,
+                      timestamp: '2026-08-31T03:12:00Z',
+                      logtype: 'delete',
+                      logaction: 'delete',
+                      logparams: {},
+                    },
+                  ],
+          },
+        });
+      }
+      if (parameters.get('prop') === 'info') {
+        return json({
+          query: {
+            pages:
+              round === 1
+                ? [
+                    {
+                      pageid: 3,
+                      ns: 0,
+                      title: '瞬时新页',
+                      contentmodel: 'wikitext',
+                      lastrevid: 30,
+                    },
+                    {
+                      pageid: 4,
+                      ns: 0,
+                      title: '已有墓碑页',
+                      contentmodel: 'wikitext',
+                      lastrevid: 40,
+                    },
+                  ]
+                : [
+                    { pageid: 3, ns: 0, title: '瞬时新页', missing: true },
+                    { pageid: 4, ns: 0, title: '已有墓碑页', missing: true },
+                  ],
+          },
+        });
+      }
+      return json({
+        query: {
+          pages: [
+            { pageid: 3, ns: 0, title: '瞬时新页', missing: true },
+            { pageid: 4, ns: 0, title: '已有墓碑页', missing: true },
+          ],
+        },
+      });
+    });
+    const tombstone = page({
+      id: 4,
+      title: '已有墓碑页',
+      normalizedTitle: analyzer.normalize('已有墓碑页'),
+      revisionId: 39,
+      contentRevisionId: undefined,
+      content: undefined,
+      deleted: true,
+    });
+    const database = await databaseWithBaseline([tombstone]);
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+    const firstResult = await syncRecentChanges(database, api, analyzer, {
+      requestIntervalMs: 0,
+    });
+
+    expect(firstResult).toMatchObject({
+      status: 'complete',
+      through: '2026-08-31T03:10:00Z',
+      deferredContentPageIds: [],
+    });
+    expect(await database.pages.get(3)).toBeUndefined();
+    expect(await database.pages.get(4)).toEqual(tombstone);
+    expect(
+      await database.jobs
+        .filter((job) => job.pageId === 3 || job.pageId === 4)
+        .count(),
+    ).toBe(0);
+    expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
+      through: '2026-08-31T03:10:00Z',
+    });
+
+    const deleteResult = await syncRecentChanges(database, api, analyzer, {
+      requestIntervalMs: 0,
+    });
+
+    expect(deleteResult).toMatchObject({
+      status: 'complete',
+      through: '2026-08-31T03:20:00Z',
+      deferredContentPageIds: [],
+    });
+    expect(await database.pages.get(3)).toBeUndefined();
+    expect(await database.pages.get(4)).toEqual(tombstone);
+    expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
+      through: '2026-08-31T03:20:00Z',
+    });
+
+    await destroy(database);
+  });
+
+  it.each([
+    ['missing its revision', { pageid: 1 }],
+    [
+      'older than the info snapshot',
+      {
+        pageid: 1,
+        revisions: [
+          {
+            revid: 11,
+            slots: { main: { contentmodel: 'wikitext', content: '过期正文' } },
+          },
+        ],
+      },
+    ],
+    [
+      'missing its content',
+      {
+        pageid: 1,
+        revisions: [
+          { revid: 12, slots: { main: { contentmodel: 'wikitext' } } },
+        ],
+      },
+    ],
+  ] as const)(
+    'does not commit pages or cursor when a required body response is %s',
+    async (_case, bodyPage) => {
+      const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+        const parameters = url.searchParams;
+        if (parameters.get('curtimestamp') === '1') {
+          return json({
+            curtimestamp: '2026-08-31T03:10:00Z',
+            query: { general: {} },
+          });
+        }
+        if (parameters.get('list') === 'recentchanges') {
+          return json({
+            query: {
+              recentchanges: [
+                {
+                  type: 'edit',
+                  ns: 0,
+                  title: '缺正文页',
+                  pageid: 1,
+                  revid: 12,
+                  old_revid: 11,
+                  rcid: 601,
+                  timestamp: '2026-08-31T03:06:00Z',
+                },
+              ],
+            },
+          });
+        }
+        if (parameters.get('prop') === 'info') {
+          return json({
+            query: {
+              pages: [
+                {
+                  pageid: 1,
+                  ns: 0,
+                  title: '缺正文页',
+                  contentmodel: 'wikitext',
+                  lastrevid: 12,
+                },
+              ],
+            },
+          });
+        }
+        return json({ query: { pages: [bodyPage] } });
+      });
+      const database = await databaseWithBaseline([
+        page({
+          title: '缺正文页',
+          normalizedTitle: analyzer.normalize('缺正文页'),
+          revisionId: 11,
+          contentRevisionId: 11,
+          content: '旧正文仍应保留',
+        }),
+      ]);
+      const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+      await expect(
+        syncRecentChanges(database, api, analyzer, { requestIntervalMs: 0 }),
+      ).rejects.toThrow('页面正文响应缺失');
+
+      expect(await database.pages.get(1)).toMatchObject({
+        revisionId: 11,
+        contentRevisionId: 11,
+        content: '旧正文仍应保留',
+      });
+      expect(await database.syncState.get('recent-changes-sync')).toBeUndefined();
+      expect((await database.syncState.get('local-sequence'))?.value).toBe(1);
+
+      await destroy(database);
+    },
+  );
 });
 
 async function databaseWithBaseline(pages: PageRecord[]): Promise<WikiSearchDatabase> {

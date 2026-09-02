@@ -171,6 +171,7 @@ export type RecentChangeSyncResult =
       eventsSeen: number;
       candidates: number;
       changedPages: PageRecord[];
+      deferredContentPageIds: number[];
       filesChanged: boolean;
       dataCodesInvalidated: boolean;
       throughLocalSeq: number;
@@ -180,6 +181,7 @@ export type RecentChangeSyncResult =
       eventsSeen: 0;
       candidates: 0;
       changedPages: [];
+      deferredContentPageIds: number[];
       filesChanged: false;
       dataCodesInvalidated: false;
       throughLocalSeq: number;

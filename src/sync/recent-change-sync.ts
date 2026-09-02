@@ -68,12 +68,18 @@ interface ContentResponse {
   query?: {
     pages?: Array<{
       pageid: number;
+      missing?: boolean;
       revisions?: Array<{
         revid: number;
         slots?: { main?: { contentmodel?: string; content?: string } };
       }>;
     }>;
   };
+}
+
+interface FetchedContent {
+  revisions: Map<number, { revid: number; contentModel?: string; content: string }>;
+  missingPageIds: Set<number>;
 }
 
 interface PageCandidates {
@@ -177,9 +183,9 @@ export async function syncRecentChanges(
         storedPages.get(page.pageid)?.contentRevisionId !== page.lastrevid,
     )
     .map((page) => page.pageid);
-  let revisions: Awaited<ReturnType<typeof fetchContent>>;
+  let fetchedContent: Awaited<ReturnType<typeof fetchContent>>;
   try {
-    revisions = await fetchContent(
+    fetchedContent = await fetchContent(
       api,
       contentPageIds,
       options.requestIntervalMs ?? 300,
@@ -188,6 +194,7 @@ export async function syncRecentChanges(
     if (isWikiLoginRequired(error)) return inactiveResult('login-required', initialSequence);
     throw error;
   }
+  const { revisions, missingPageIds: contentMissingPageIds } = fetchedContent;
   const contentPageIdSet = new Set(contentPageIds);
   const expectedRevisionByPageId = new Map(
     activeInfoPages.flatMap((page) =>
@@ -196,12 +203,25 @@ export async function syncRecentChanges(
         : [],
     ),
   );
+  const deferredContentPageIds: number[] = [];
   for (const [pageId, expectedRevision] of expectedRevisionByPageId) {
+    if (contentMissingPageIds.has(pageId)) continue;
     const received = revisions.get(pageId);
-    if (!received || received.revid !== expectedRevision) {
-      throw new Error(`页面正文响应缺失或版本不一致：${pageId}`);
+    if (received?.revid === expectedRevision) continue;
+    if (
+      received &&
+      typeof received.revid === 'number' &&
+      received.revid > expectedRevision
+    ) {
+      revisions.delete(pageId);
+      deferredContentPageIds.push(pageId);
+      continue;
     }
+    throw new Error(`页面正文响应缺失或版本不一致：${pageId}`);
   }
+  const activeInfoPagesToCommit = activeInfoPages.filter(
+    ({ pageid }) => !contentMissingPageIds.has(pageid),
+  );
   const recentChanges = retainedMarkers(
     incrementalState?.recentChanges ?? [],
     events,
@@ -231,7 +251,7 @@ export async function syncRecentChanges(
       ? await database.pages.where('title').anyOf(missingTitles).toArray()
       : [];
     const pageIds = new Set([
-      ...activeInfoPages.map(({ pageid }) => pageid),
+      ...activeInfoPagesToCommit.map(({ pageid }) => pageid),
       ...regularInfoPages.flatMap((page) =>
         page.missing && typeof page.pageid === 'number' ? [page.pageid] : [],
       ),
@@ -247,8 +267,8 @@ export async function syncRecentChanges(
       .toArray();
     const jobsByPageId = new Map(existingJobs.map((job) => [job.pageId, job]));
     const nextPages = new Map<number, PageRecord>();
-    const activePageIds = new Set(activeInfoPages.map(({ pageid }) => pageid));
-    for (const raw of activeInfoPages) {
+    const activePageIds = new Set(activeInfoPagesToCommit.map(({ pageid }) => pageid));
+    for (const raw of activeInfoPagesToCommit) {
       const oldPage = currentPages.get(raw.pageid);
       if (
         oldPage &&
@@ -487,6 +507,7 @@ export async function syncRecentChanges(
     eventsSeen: events.length,
     candidates: candidates.byPageId.size + candidates.titles.size,
     changedPages,
+    deferredContentPageIds,
     filesChanged,
     dataCodesInvalidated,
     throughLocalSeq: sequence,
@@ -589,8 +610,12 @@ async function fetchContent(
   api: WikiApi,
   pageIds: number[],
   requestIntervalMs: number,
-): Promise<Map<number, { revid: number; contentModel?: string; content: string }>> {
-  const result = new Map<number, { revid: number; contentModel?: string; content: string }>();
+): Promise<FetchedContent> {
+  const revisions = new Map<
+    number,
+    { revid: number; contentModel?: string; content: string }
+  >();
+  const missingPageIds = new Set<number>();
   const batches = chunks(pageIds, BATCH_SIZE);
   for (const [index, batch] of batches.entries()) {
     const response = await api.query<ContentResponse>({
@@ -600,10 +625,14 @@ async function fetchContent(
       rvslots: 'main',
     });
     for (const raw of response.query?.pages ?? []) {
+      if (raw.missing) {
+        missingPageIds.add(raw.pageid);
+        continue;
+      }
       const revision = raw.revisions?.[0];
       const slot = revision?.slots?.main;
       if (revision && typeof slot?.content === 'string') {
-        result.set(raw.pageid, {
+        revisions.set(raw.pageid, {
           revid: revision.revid,
           contentModel: slot.contentmodel,
           content: slot.content,
@@ -612,7 +641,7 @@ async function fetchContent(
     }
     if (index + 1 < batches.length) await delay(requestIntervalMs);
   }
-  return result;
+  return { revisions, missingPageIds };
 }
 
 function deduplicateRecentChanges(
@@ -712,6 +741,7 @@ function inactiveResult(
     eventsSeen: 0,
     candidates: 0,
     changedPages: [],
+    deferredContentPageIds: [],
     filesChanged: false,
     dataCodesInvalidated: false,
     throughLocalSeq,
