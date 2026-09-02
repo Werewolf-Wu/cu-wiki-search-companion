@@ -6,6 +6,7 @@ import { WikiSearchDatabase } from '../src/storage/database';
 import { syncRecentChanges } from '../src/sync/recent-change-sync';
 import { WikiApi } from '../src/sync/wiki-api';
 import type { PageRecord, TitleSyncState } from '../src/types';
+import { abortTransactionAfterCallback } from './transaction-abort';
 
 const analyzer = new Analyzer(createBootstrapSegmenter());
 
@@ -139,6 +140,167 @@ describe('RecentChanges incremental sync', () => {
     expect(recentChangesRequest?.searchParams.get('rcend')).toBe('2026-08-31T03:10:00Z');
     expect(recentChangesRequest?.searchParams.get('assert')).toBe('user');
     expect(recentChangesRequest?.searchParams.has('rcshow')).toBe(false);
+
+    await destroy(database);
+  });
+
+  it('retries a mixed batch whose transaction aborts after its callback', async () => {
+    const requests: URL[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      requests.push(url);
+      const parameters = url.searchParams;
+      if (parameters.get('curtimestamp') === '1') {
+        return json({ curtimestamp: '2026-08-31T03:10:00Z', query: { general: {} } });
+      }
+      if (parameters.get('list') === 'recentchanges') {
+        return json({
+          query: {
+            recentchanges: [
+              {
+                type: 'edit',
+                ns: 0,
+                title: '更新页',
+                pageid: 1,
+                revid: 12,
+                old_revid: 11,
+                rcid: 101,
+                timestamp: '2026-08-31T03:06:00Z',
+              },
+              {
+                type: 'log',
+                ns: 0,
+                title: '删除页',
+                pageid: 2,
+                revid: 0,
+                old_revid: 21,
+                rcid: 102,
+                timestamp: '2026-08-31T03:07:00Z',
+                logtype: 'delete',
+                logaction: 'delete',
+                logparams: {},
+              },
+            ],
+          },
+        });
+      }
+      if (parameters.get('prop') === 'info') {
+        return json({
+          query: {
+            pages: [
+              {
+                pageid: 1,
+                ns: 0,
+                title: '更新页',
+                contentmodel: 'wikitext',
+                lastrevid: 12,
+              },
+              { pageid: 2, ns: 0, title: '删除页', missing: true },
+            ],
+          },
+        });
+      }
+      return json({
+        query: {
+          pages: [
+            {
+              pageid: 1,
+              revisions: [
+                {
+                  revid: 12,
+                  slots: { main: { contentmodel: 'wikitext', content: '更新后正文' } },
+                },
+              ],
+            },
+          ],
+        },
+      });
+    });
+    const oldUpdatedPage = page({
+      title: '更新页',
+      normalizedTitle: analyzer.normalize('更新页'),
+      revisionId: 11,
+      contentRevisionId: 11,
+      content: '更新前正文',
+    });
+    const oldDeletedPage = page({
+      id: 2,
+      title: '删除页',
+      normalizedTitle: analyzer.normalize('删除页'),
+      localSeq: 2,
+      revisionId: 21,
+      contentRevisionId: 21,
+      content: '删除前正文',
+    });
+    const oldCursor = {
+      through: '2026-08-31T03:05:00Z',
+      completedAt: Date.parse('2026-08-31T03:05:01Z'),
+      recentChanges: [{ rcid: 100, timestamp: '2026-08-31T03:04:00Z' }],
+    };
+    const database = await databaseWithBaseline([oldUpdatedPage, oldDeletedPage]);
+    await database.syncState.bulkPut([
+      { key: 'local-sequence', value: 2 },
+      { key: 'recent-changes-sync', value: oldCursor },
+    ]);
+    const updatedJobId = await database.jobs.add({
+      type: 'wikitext-content',
+      pageId: 1,
+      status: 'done',
+      targetRevisionId: 11,
+      updatedAt: 100,
+    });
+    const deletedJobId = await database.jobs.add({
+      type: 'wikitext-content',
+      pageId: 2,
+      status: 'done',
+      targetRevisionId: 21,
+      updatedAt: 200,
+    });
+    const oldJobs = await database.jobs.toArray();
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+    abortTransactionAfterCallback(database);
+
+    await expect(
+      syncRecentChanges(database, api, analyzer, { requestIntervalMs: 0 }),
+    ).rejects.toBeDefined();
+
+    expect(await database.pages.get(1)).toEqual(oldUpdatedPage);
+    expect(await database.pages.get(2)).toEqual(oldDeletedPage);
+    expect(await database.jobs.toArray()).toEqual(oldJobs);
+    expect((await database.syncState.get('local-sequence'))?.value).toBe(2);
+    expect((await database.syncState.get('recent-changes-sync'))?.value).toEqual(
+      oldCursor,
+    );
+
+    const resumed = await syncRecentChanges(database, api, analyzer, {
+      requestIntervalMs: 0,
+    });
+
+    expect(resumed).toMatchObject({ status: 'complete', throughLocalSeq: 4 });
+    expect(await database.pages.get(1)).toMatchObject({
+      revisionId: 12,
+      contentRevisionId: 12,
+      content: '更新后正文',
+      localSeq: 3,
+    });
+    expect(await database.pages.get(2)).toMatchObject({
+      deleted: true,
+      content: undefined,
+      contentRevisionId: undefined,
+      localSeq: 4,
+    });
+    expect(await database.jobs.get(updatedJobId)).toMatchObject({
+      status: 'done',
+      targetRevisionId: 12,
+    });
+    expect(await database.jobs.get(deletedJobId)).toBeUndefined();
+    expect((await database.syncState.get('local-sequence'))?.value).toBe(4);
+    expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
+      through: '2026-08-31T03:10:00Z',
+    });
+    expect(
+      requests.filter((request) => request.searchParams.get('list') === 'recentchanges'),
+    ).toHaveLength(2);
 
     await destroy(database);
   });
