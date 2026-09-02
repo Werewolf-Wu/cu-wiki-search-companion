@@ -15,7 +15,12 @@ export function isNonNegativeSafeInteger(value: unknown): value is number {
  */
 export async function readLocalSequence(database: WikiSearchDatabase): Promise<number> {
   const record = await database.syncState.get(LOCAL_SEQUENCE_KEY);
-  if (isNonNegativeSafeInteger(record?.value)) return record.value;
+  if (record !== undefined) {
+    if (isNonNegativeSafeInteger(record.value)) return record.value;
+    throw new Error(
+      `同步状态 "${LOCAL_SEQUENCE_KEY}" 已损坏：值必须是非负安全整数`,
+    );
+  }
 
   let maximum = 0;
   await database.pages.each((page) => {

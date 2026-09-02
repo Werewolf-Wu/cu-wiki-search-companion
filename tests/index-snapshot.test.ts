@@ -125,21 +125,37 @@ describe('VersionedSearchIndexCache', () => {
     ['string', '7'],
     ['NaN', Number.NaN],
     ['negative number', -1],
-  ])('does not use a %s local sequence in snapshot arithmetic', async (_label, value) => {
+    ['unsafe integer', Number.MAX_SAFE_INTEGER + 1],
+  ])('rejects a %s local sequence as corrupt state', async (_label, value) => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();
-    await database.pages.put(page(1, '坏状态回退', '正文', 'wikitext', 7));
+    await database.pages.put(page(1, '坏状态拒绝', '正文', 'wikitext', 7));
     await database.syncState.put({ key: 'local-sequence', value });
     const cache = new VersionedSearchIndexCache(database, { storage: unlimitedStorage() });
 
-    const handle = await cache.restoreOrRebuild('title', analyzer);
-    const published = await cache.publish(handle);
+    await expect(cache.restoreOrRebuild('title', analyzer)).rejects.toThrow(
+      '同步状态 "local-sequence" 已损坏',
+    );
 
-    expect(handle.throughLocalSeq).toBe(7);
-    expect(published).toMatchObject({
-      status: 'published',
-      record: { throughLocalSeq: 7 },
-    });
+    database.close();
+    await database.delete();
+  });
+
+  it('rejects corrupt local sequence state from direct publish and inspect', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(page(1, '坏状态边界', '正文', 'wikitext', 1));
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const cache = new VersionedSearchIndexCache(database, { storage: unlimitedStorage() });
+    const handle = await cache.restoreOrRebuild('title', analyzer);
+    await database.syncState.put({ key: 'local-sequence', value: 'corrupt' });
+
+    await expect(cache.publish(handle)).rejects.toThrow(
+      '同步状态 "local-sequence" 已损坏',
+    );
+    await expect(cache.inspect()).rejects.toThrow(
+      '同步状态 "local-sequence" 已损坏',
+    );
 
     database.close();
     await database.delete();
@@ -255,7 +271,7 @@ describe('VersionedSearchIndexCache', () => {
     await database.delete();
   });
 
-  it('parses a title snapshot once on restore and reuses its validated fingerprint in inspect', async () => {
+  it('parses once on restore and keeps only a metadata fingerprint for warm inspect', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();
     await database.pages.put(page(1, '单次解析', '正文', 'wikitext', 1));
@@ -273,6 +289,10 @@ describe('VersionedSearchIndexCache', () => {
 
     expect(restored.source).toBe('snapshot');
     expect(parse).toHaveBeenCalledTimes(1);
+    const replacement = await database.indexSnapshots.get(snapshotKey('title'));
+    if (!replacement) throw new Error('测试快照未发布');
+    replacement.json = '{runtime-must-not-retain-this-payload';
+    await database.indexSnapshots.put(replacement);
     parse.mockClear();
     expect((await cache.inspect()).find(({ kind }) => kind === 'title')).toMatchObject({
       status: 'available',

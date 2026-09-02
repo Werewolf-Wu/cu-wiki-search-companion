@@ -101,12 +101,25 @@ interface PublishState {
   snapshotGeneration: number;
 }
 
+interface SnapshotFingerprint {
+  key: string;
+  kind: SearchIndexKind;
+  snapshotFormatVersion: number;
+  compatibilityKey: string;
+  throughLocalSeq: number;
+  createdAt: number;
+  documentCount: number;
+  payloadBytes: number;
+  sha256: string;
+  serializationMs?: number;
+}
+
 interface RuntimeState {
   compatibilityKey?: string;
   status: SnapshotInspectionStatus;
   restoreMs?: number;
   message?: string;
-  validatedSnapshot?: IndexSnapshotRecord;
+  validatedSnapshotFingerprint?: SnapshotFingerprint;
 }
 
 export class VersionedSearchIndexCache {
@@ -150,7 +163,7 @@ export class VersionedSearchIndexCache {
       ? 'corrupt'
       : 'missing';
     let runtimeMessage: string | undefined;
-    let validatedSnapshot: IndexSnapshotRecord | undefined;
+    let validatedSnapshotFingerprint: SnapshotFingerprint | undefined;
 
     if (bundle.snapshot) {
       if (bundle.snapshot.compatibilityKey !== compatibilityKey) {
@@ -167,7 +180,7 @@ export class VersionedSearchIndexCache {
           if (index.size !== bundle.snapshot.documentCount) {
             throw new Error('快照文档数量不一致');
           }
-          validatedSnapshot = bundle.snapshot;
+          validatedSnapshotFingerprint = fingerprintOf(bundle.snapshot);
           const changedPages = bundle.pages
             .filter((page) => page.localSeq > bundle.snapshot!.throughLocalSeq)
             .sort((left, right) => left.localSeq - right.localSeq);
@@ -200,7 +213,7 @@ export class VersionedSearchIndexCache {
       status: runtimeStatus,
       restoreMs,
       message: runtimeMessage,
-      validatedSnapshot,
+      validatedSnapshotFingerprint,
     });
     return {
       kind,
@@ -349,7 +362,7 @@ export class VersionedSearchIndexCache {
         compatibilityKey: handle.compatibilityKey,
         status: 'available',
         message: undefined,
-        validatedSnapshot: record,
+        validatedSnapshotFingerprint: fingerprintOf(record),
       });
     }
     return result;
@@ -401,8 +414,8 @@ export class VersionedSearchIndexCache {
       }
       let status: SnapshotInspectionStatus;
       const matchesValidatedSnapshot = Boolean(
-        runtime?.validatedSnapshot &&
-          isSameSnapshot(record, runtime.validatedSnapshot),
+        runtime?.validatedSnapshotFingerprint &&
+          hasFingerprint(record, runtime.validatedSnapshotFingerprint),
       );
       const structurallyCorrupt =
         record.key !== snapshotKey(kind) ||
@@ -667,6 +680,39 @@ function isSameSnapshot(
     left.sha256 === right.sha256 &&
     left.json === right.json &&
     left.serializationMs === right.serializationMs
+  );
+}
+
+function fingerprintOf(record: IndexSnapshotRecord): SnapshotFingerprint {
+  return {
+    key: record.key,
+    kind: record.kind,
+    snapshotFormatVersion: record.snapshotFormatVersion,
+    compatibilityKey: record.compatibilityKey,
+    throughLocalSeq: record.throughLocalSeq,
+    createdAt: record.createdAt,
+    documentCount: record.documentCount,
+    payloadBytes: record.payloadBytes,
+    sha256: record.sha256,
+    serializationMs: record.serializationMs,
+  };
+}
+
+function hasFingerprint(
+  record: IndexSnapshotRecord,
+  fingerprint: SnapshotFingerprint,
+): boolean {
+  return (
+    record.key === fingerprint.key &&
+    record.kind === fingerprint.kind &&
+    record.snapshotFormatVersion === fingerprint.snapshotFormatVersion &&
+    record.compatibilityKey === fingerprint.compatibilityKey &&
+    record.throughLocalSeq === fingerprint.throughLocalSeq &&
+    record.createdAt === fingerprint.createdAt &&
+    record.documentCount === fingerprint.documentCount &&
+    record.payloadBytes === fingerprint.payloadBytes &&
+    record.sha256 === fingerprint.sha256 &&
+    record.serializationMs === fingerprint.serializationMs
   );
 }
 
