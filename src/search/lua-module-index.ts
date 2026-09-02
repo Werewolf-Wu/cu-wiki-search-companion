@@ -8,6 +8,7 @@ import {
   type CooperativeTaskScheduler,
 } from '../runtime/cooperative-task-scheduler';
 import type { PageRecord } from '../types';
+import { ConcurrentRebuildLifecycle } from './rebuild-lifecycle';
 
 interface IndexedLuaModule {
   id: number;
@@ -49,15 +50,20 @@ interface SerializedPreparedLuaSymbol extends LuaSymbolMatch {
   terms: string[];
 }
 
-interface PendingLuaRebuild {
-  updates: PageRecord[][];
+interface LuaIndexState {
+  index: MiniSearch<IndexedLuaModule>;
+  symbolsById: Map<number, PreparedLuaSymbol[]>;
 }
 
 export class LuaModuleIndex {
-  private index = this.createIndex();
-  private symbolsById = new Map<number, PreparedLuaSymbol[]>();
-  private rebuildGeneration = 0;
-  private readonly pendingRebuilds = new Set<PendingLuaRebuild>();
+  private readonly lifecycle = new ConcurrentRebuildLifecycle<
+    LuaIndexState,
+    PageRecord[]
+  >(
+    this.createState(),
+    ({ index, symbolsById }, pages) => this.applyPages(index, symbolsById, pages),
+    (pages) => pages.map((page) => ({ ...page })),
+  );
 
   constructor(
     private readonly analyzer: Analyzer,
@@ -66,46 +72,28 @@ export class LuaModuleIndex {
   ) {}
 
   rebuild(pages: PageRecord[]): void {
-    this.rebuildGeneration += 1;
-    const nextIndex = this.createIndex();
-    const nextSymbolsById = new Map<number, PreparedLuaSymbol[]>();
-    this.applyPages(nextIndex, nextSymbolsById, pages);
-    this.index = nextIndex;
-    this.symbolsById = nextSymbolsById;
+    const nextState = this.createState();
+    this.applyPages(nextState.index, nextState.symbolsById, pages);
+    this.lifecycle.rebuild(nextState);
   }
 
   async rebuildAsync(pages: PageRecord[], batchSize = 2): Promise<void> {
-    const generation = ++this.rebuildGeneration;
-    const nextIndex = this.createIndex();
-    const nextSymbolsById = new Map<number, PreparedLuaSymbol[]>();
-    const pending: PendingLuaRebuild = { updates: [] };
-    this.pendingRebuilds.add(pending);
-    try {
+    await this.lifecycle.rebuildAsync(async () => {
+      const nextState = this.createState();
       for (let offset = 0; offset < pages.length; offset += batchSize) {
         this.applyPages(
-          nextIndex,
-          nextSymbolsById,
+          nextState.index,
+          nextState.symbolsById,
           pages.slice(offset, offset + batchSize),
         );
         await this.taskScheduler.yield();
       }
-      for (const update of pending.updates) {
-        this.applyPages(nextIndex, nextSymbolsById, update);
-      }
-      if (generation === this.rebuildGeneration) {
-        this.index = nextIndex;
-        this.symbolsById = nextSymbolsById;
-      }
-    } finally {
-      this.pendingRebuilds.delete(pending);
-    }
+      return nextState;
+    });
   }
 
   update(pages: PageRecord[]): void {
-    for (const pending of this.pendingRebuilds) {
-      pending.updates.push(pages.map((page) => ({ ...page })));
-    }
-    this.applyPages(this.index, this.symbolsById, pages);
+    this.lifecycle.update(pages);
   }
 
   private applyPages(
@@ -134,9 +122,10 @@ export class LuaModuleIndex {
   }
 
   exportSnapshot(): unknown {
+    const { index, symbolsById } = this.lifecycle.current;
     return {
-      miniSearch: this.index.toJSON(),
-      symbolsById: [...this.symbolsById].map(([id, symbols]) => [
+      miniSearch: index.toJSON(),
+      symbolsById: [...symbolsById].map(([id, symbols]) => [
         id,
         symbols.map((symbol) => ({ ...symbol, terms: [...symbol.terms] })),
       ]),
@@ -153,17 +142,15 @@ export class LuaModuleIndex {
     ) {
       throw new Error('Lua 快照 payload 结构无效');
     }
-    const generation = ++this.rebuildGeneration;
-    const pending: PendingLuaRebuild = { updates: [] };
-    this.pendingRebuilds.add(pending);
-    const restoredSymbolsById = new Map<number, PreparedLuaSymbol[]>();
-    for (const [id, symbols] of payload.symbolsById) {
-      restoredSymbolsById.set(
-        id,
-        symbols.map((symbol) => ({ ...symbol, terms: new Set(symbol.terms) })),
-      );
-    }
-    try {
+    const symbolEntries = payload.symbolsById;
+    await this.lifecycle.rebuildAsync(async () => {
+      const restoredSymbolsById = new Map<number, PreparedLuaSymbol[]>();
+      for (const [id, symbols] of symbolEntries) {
+        restoredSymbolsById.set(
+          id,
+          symbols.map((symbol) => ({ ...symbol, terms: new Set(symbol.terms) })),
+        );
+      }
       const restored = await MiniSearch.loadJSAsync<IndexedLuaModule>(
         payload.miniSearch as AsPlainObject,
         this.indexOptions(),
@@ -171,16 +158,8 @@ export class LuaModuleIndex {
       if (restoredSymbolsById.size !== restored.documentCount) {
         throw new Error('Lua 快照符号数量不一致');
       }
-      for (const update of pending.updates) {
-        this.applyPages(restored, restoredSymbolsById, update);
-      }
-      if (generation === this.rebuildGeneration) {
-        this.index = restored;
-        this.symbolsById = restoredSymbolsById;
-      }
-    } finally {
-      this.pendingRebuilds.delete(pending);
-    }
+      return { index: restored, symbolsById: restoredSymbolsById };
+    });
   }
 
   search(query: string, limit = 20): LuaModuleSearchResult[] {
@@ -194,9 +173,10 @@ export class LuaModuleIndex {
       tokenize: (value: string): string[] => this.analyzer.queryTokens(value),
       processTerm: (term: string): string => term,
     };
-    let results = this.index.search(normalizedQuery, options);
+    const { index, symbolsById } = this.lifecycle.current;
+    let results = index.search(normalizedQuery, options);
     if (!results.length && terms.length > 1) {
-      results = this.index.search(normalizedQuery, { ...options, combineWith: 'OR' });
+      results = index.search(normalizedQuery, { ...options, combineWith: 'OR' });
     }
 
     const compactQuery = this.analyzer.compactNormalized(normalizedQuery);
@@ -204,7 +184,7 @@ export class LuaModuleIndex {
       .map((result) => {
         const title = String(result.title);
         const matches = this.findMatches(
-          this.symbolsById.get(Number(result.id)),
+          symbolsById.get(Number(result.id)),
           normalizedQuery,
           compactQuery,
           terms,
@@ -232,7 +212,14 @@ export class LuaModuleIndex {
   }
 
   get size(): number {
-    return this.index.documentCount;
+    return this.lifecycle.current.index.documentCount;
+  }
+
+  private createState(): LuaIndexState {
+    return {
+      index: this.createIndex(),
+      symbolsById: new Map<number, PreparedLuaSymbol[]>(),
+    };
   }
 
   private createIndex(): MiniSearch<IndexedLuaModule> {

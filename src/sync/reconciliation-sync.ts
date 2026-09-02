@@ -23,6 +23,7 @@ import {
   projectContentJob,
   searchablePageFactChanged,
 } from './content-job-policy';
+import { requestAllPages } from './all-pages';
 import { readFileResourceSyncState } from './file-resource-sync';
 import { readRecentChangeSyncState } from './recent-change-sync';
 import { readTitleSyncState } from './title-sync';
@@ -39,20 +40,6 @@ interface SiteInfoResponse {
   curtimestamp?: string;
   query?: {
     namespaces?: Record<string, { id: number; name: string; canonical?: string }>;
-  };
-}
-
-interface AllPagesResponse {
-  continue?: { gapcontinue?: string };
-  query?: {
-    pages?: Array<{
-      pageid: number;
-      ns: number;
-      title: string;
-      redirect?: boolean;
-      lastrevid?: number;
-      contentmodel?: string;
-    }>;
   };
 }
 
@@ -160,13 +147,10 @@ export async function reconcileWikiMirror(
       options.onProgress?.(state);
       const namespace = state.namespaceIds[state.namespaceIndex];
       if (namespace === undefined) break;
-      const response = await api.query<AllPagesResponse>({
+      const response = await requestAllPages(api, {
         assert: 'user',
-        generator: 'allpages',
-        prop: 'info',
-        gaplimit: 500,
-        gapnamespace: namespace,
-        ...(state.gapcontinue ? { gapcontinue: state.gapcontinue } : {}),
+        namespace,
+        gapcontinue: state.gapcontinue,
       });
       const rawPages = response.query?.pages ?? [];
       const nextContinue = response.continue?.gapcontinue;

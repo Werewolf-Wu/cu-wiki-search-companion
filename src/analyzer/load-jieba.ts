@@ -20,7 +20,7 @@ async function resourceUrl(name: string): Promise<string> {
   if (typeof GM !== 'undefined' && typeof GM.getResourceUrl === 'function') {
     return GM.getResourceUrl(name);
   }
-  throw new Error('Tampermonkey resource API is unavailable');
+  throw new Error('无法访问中文分词资源（resource-api-unavailable）');
 }
 
 export async function loadAnalyzer(): Promise<AnalyzerLoadResult> {
@@ -29,8 +29,12 @@ export async function loadAnalyzer(): Promise<AnalyzerLoadResult> {
       fetch(await resourceUrl('JIEBA_GLUE')),
       fetch(await resourceUrl('JIEBA_WASM')),
     ]);
-    if (!glueResponse.ok) throw new Error(`jieba glue returned HTTP ${glueResponse.status}`);
-    if (!wasmResponse.ok) throw new Error(`WASM resource returned HTTP ${wasmResponse.status}`);
+    if (!glueResponse.ok) {
+      throw new Error('中文分词脚本加载失败（jieba-glue-http-error）');
+    }
+    if (!wasmResponse.ok) {
+      throw new Error('中文分词 WASM 加载失败（jieba-wasm-http-error）');
+    }
     const glueUrl = URL.createObjectURL(
       new Blob([await glueResponse.text()], { type: 'text/javascript' }),
     );

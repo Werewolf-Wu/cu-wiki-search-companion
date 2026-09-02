@@ -11,6 +11,7 @@ import type {
   TitleSyncProgress,
   TitleSyncState,
 } from '../types';
+import { requestAllPages } from './all-pages';
 import { delay, WikiApi } from './wiki-api';
 
 const TITLE_SYNC_KEY = 'title-sync';
@@ -18,20 +19,6 @@ const TITLE_SYNC_KEY = 'title-sync';
 interface SiteInfoResponse {
   query: {
     namespaces: Record<string, { id: number; name: string; canonical?: string }>;
-  };
-}
-
-interface AllPagesResponse {
-  continue?: { gapcontinue?: string };
-  query?: {
-    pages: Array<{
-      pageid: number;
-      ns: number;
-      title: string;
-      redirect?: boolean;
-      lastrevid?: number;
-      contentmodel?: string;
-    }>;
   };
 }
 
@@ -91,12 +78,9 @@ export async function syncTitles(
       if (namespace === undefined) break;
       report(state, options.onProgress);
 
-      const response = await api.query<AllPagesResponse>({
-        generator: 'allpages',
-        prop: 'info',
-        gaplimit: 500,
-        gapnamespace: namespace,
-        ...(state.gapcontinue ? { gapcontinue: state.gapcontinue } : {}),
+      const response = await requestAllPages(api, {
+        namespace,
+        gapcontinue: state.gapcontinue,
       });
       const rawPages = response.query?.pages ?? [];
       const nextContinue = response.continue?.gapcontinue;

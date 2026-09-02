@@ -12,6 +12,7 @@ import {
   type CooperativeTaskScheduler,
 } from '../runtime/cooperative-task-scheduler';
 import type { PageRecord } from '../types';
+import { ConcurrentRebuildLifecycle } from './rebuild-lifecycle';
 
 interface IndexedContent {
   id: number;
@@ -32,15 +33,21 @@ export interface ContentSearchResult {
   score: number;
 }
 
-interface PendingContentRebuild {
-  updates: PageRecord[][];
+interface ContentIndexState {
+  index: MiniSearch<IndexedContent>;
+  extractedById: Map<number, string>;
 }
 
 export class ContentIndex {
-  private index = this.createIndex();
-  private extractedById = new Map<number, string>();
-  private rebuildGeneration = 0;
-  private readonly pendingRebuilds = new Set<PendingContentRebuild>();
+  private readonly lifecycle = new ConcurrentRebuildLifecycle<
+    ContentIndexState,
+    PageRecord[]
+  >(
+    this.createState(),
+    ({ index, extractedById }, pages) =>
+      this.applyPages(index, extractedById, pages),
+    (pages) => pages.map((page) => ({ ...page })),
+  );
 
   constructor(
     private readonly analyzer: Analyzer,
@@ -49,46 +56,28 @@ export class ContentIndex {
   ) {}
 
   rebuild(pages: PageRecord[]): void {
-    this.rebuildGeneration += 1;
-    const nextIndex = this.createIndex();
-    const nextExtractedById = new Map<number, string>();
-    this.applyPages(nextIndex, nextExtractedById, pages);
-    this.index = nextIndex;
-    this.extractedById = nextExtractedById;
+    const nextState = this.createState();
+    this.applyPages(nextState.index, nextState.extractedById, pages);
+    this.lifecycle.rebuild(nextState);
   }
 
   async rebuildAsync(pages: PageRecord[], batchSize = 2): Promise<void> {
-    const generation = ++this.rebuildGeneration;
-    const nextIndex = this.createIndex();
-    const nextExtractedById = new Map<number, string>();
-    const pending: PendingContentRebuild = { updates: [] };
-    this.pendingRebuilds.add(pending);
-    try {
+    await this.lifecycle.rebuildAsync(async () => {
+      const nextState = this.createState();
       for (let offset = 0; offset < pages.length; offset += batchSize) {
         this.applyPages(
-          nextIndex,
-          nextExtractedById,
+          nextState.index,
+          nextState.extractedById,
           pages.slice(offset, offset + batchSize),
         );
         await this.taskScheduler.yield();
       }
-      for (const update of pending.updates) {
-        this.applyPages(nextIndex, nextExtractedById, update);
-      }
-      if (generation === this.rebuildGeneration) {
-        this.index = nextIndex;
-        this.extractedById = nextExtractedById;
-      }
-    } finally {
-      this.pendingRebuilds.delete(pending);
-    }
+      return nextState;
+    });
   }
 
   update(pages: PageRecord[]): void {
-    for (const pending of this.pendingRebuilds) {
-      pending.updates.push(pages.map((page) => ({ ...page })));
-    }
-    this.applyPages(this.index, this.extractedById, pages);
+    this.lifecycle.update(pages);
   }
 
   private applyPages(
@@ -117,9 +106,10 @@ export class ContentIndex {
   }
 
   exportSnapshot(): unknown {
+    const { index, extractedById } = this.lifecycle.current;
     return {
-      miniSearch: this.index.toJSON(),
-      extractedById: [...this.extractedById],
+      miniSearch: index.toJSON(),
+      extractedById: [...extractedById],
     };
   }
 
@@ -133,14 +123,12 @@ export class ContentIndex {
     ) {
       throw new Error('正文快照 payload 结构无效');
     }
-    const generation = ++this.rebuildGeneration;
-    const pending: PendingContentRebuild = { updates: [] };
-    this.pendingRebuilds.add(pending);
-    const restoredExtractedById = new Map<number, string>();
-    for (const [id, extracted] of payload.extractedById) {
-      restoredExtractedById.set(id, extracted);
-    }
-    try {
+    const extractedEntries = payload.extractedById;
+    await this.lifecycle.rebuildAsync(async () => {
+      const restoredExtractedById = new Map<number, string>();
+      for (const [id, extracted] of extractedEntries) {
+        restoredExtractedById.set(id, extracted);
+      }
       const restored = await MiniSearch.loadJSAsync<IndexedContent>(
         payload.miniSearch as AsPlainObject,
         this.indexOptions(),
@@ -148,16 +136,8 @@ export class ContentIndex {
       if (restoredExtractedById.size !== restored.documentCount) {
         throw new Error('正文快照摘要数量不一致');
       }
-      for (const update of pending.updates) {
-        this.applyPages(restored, restoredExtractedById, update);
-      }
-      if (generation === this.rebuildGeneration) {
-        this.index = restored;
-        this.extractedById = restoredExtractedById;
-      }
-    } finally {
-      this.pendingRebuilds.delete(pending);
-    }
+      return { index: restored, extractedById: restoredExtractedById };
+    });
   }
 
   search(query: string, namespace?: number, limit = 20): ContentSearchResult[] {
@@ -173,9 +153,10 @@ export class ContentIndex {
       filter: (result: SearchResult): boolean =>
         namespace === undefined || result.namespace === namespace,
     };
-    let results = this.index.search(normalizedQuery, options);
+    const { index, extractedById } = this.lifecycle.current;
+    let results = index.search(normalizedQuery, options);
     if (!results.length && terms.length > 1) {
-      results = this.index.search(normalizedQuery, { ...options, combineWith: 'OR' });
+      results = index.search(normalizedQuery, { ...options, combineWith: 'OR' });
     }
 
     const compactQuery = this.analyzer.compactNormalized(normalizedQuery);
@@ -200,7 +181,7 @@ export class ContentIndex {
       .map((result) => ({
         ...result,
         snippet: makeSnippet(
-          this.extractedById.get(result.id) ?? '',
+          extractedById.get(result.id) ?? '',
           normalizedQuery,
           this.analyzer,
         ),
@@ -208,7 +189,11 @@ export class ContentIndex {
   }
 
   get size(): number {
-    return this.index.documentCount;
+    return this.lifecycle.current.index.documentCount;
+  }
+
+  private createState(): ContentIndexState {
+    return { index: this.createIndex(), extractedById: new Map<number, string>() };
   }
 
   private createIndex(): MiniSearch<IndexedContent> {

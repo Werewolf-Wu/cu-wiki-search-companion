@@ -11,6 +11,7 @@ import {
   type CooperativeTaskScheduler,
 } from '../runtime/cooperative-task-scheduler';
 import type { PageRecord } from '../types';
+import { ConcurrentRebuildLifecycle } from './rebuild-lifecycle';
 
 interface IndexedTitle {
   id: number;
@@ -40,10 +41,6 @@ interface LinearTitle {
   namespace: number;
   namespaceName: string;
   compactTitle: string;
-}
-
-interface PendingTitleRebuild {
-  updates: PageRecord[][];
 }
 
 /**
@@ -143,9 +140,14 @@ export class CombinedTitleIndex implements TitleSearchBackend {
 }
 
 export class TitleIndex implements TitleSearchBackend {
-  private index = this.createIndex();
-  private rebuildGeneration = 0;
-  private readonly pendingRebuilds = new Set<PendingTitleRebuild>();
+  private readonly lifecycle = new ConcurrentRebuildLifecycle<
+    MiniSearch<IndexedTitle>,
+    PageRecord[]
+  >(
+    this.createIndex(),
+    (index, pages) => this.applyPages(index, pages),
+    (pages) => pages.map((page) => ({ ...page })),
+  );
 
   constructor(
     private readonly analyzer: Analyzer,
@@ -154,35 +156,25 @@ export class TitleIndex implements TitleSearchBackend {
   ) {}
 
   rebuild(pages: PageRecord[]): void {
-    this.rebuildGeneration += 1;
     const nextIndex = this.createIndex();
     this.applyPages(nextIndex, pages);
-    this.index = nextIndex;
+    this.lifecycle.rebuild(nextIndex);
   }
 
   async rebuildAsync(pages: PageRecord[], batchSize = 5): Promise<void> {
-    const generation = ++this.rebuildGeneration;
-    const nextIndex = this.createIndex();
-    const pending: PendingTitleRebuild = { updates: [] };
-    this.pendingRebuilds.add(pending);
-    const activePages = pages.filter((page) => !page.deleted);
-    try {
+    await this.lifecycle.rebuildAsync(async () => {
+      const nextIndex = this.createIndex();
+      const activePages = pages.filter((page) => !page.deleted);
       for (let offset = 0; offset < activePages.length; offset += batchSize) {
         this.applyPages(nextIndex, activePages.slice(offset, offset + batchSize));
         await this.taskScheduler.yield();
       }
-      for (const update of pending.updates) this.applyPages(nextIndex, update);
-      if (generation === this.rebuildGeneration) this.index = nextIndex;
-    } finally {
-      this.pendingRebuilds.delete(pending);
-    }
+      return nextIndex;
+    });
   }
 
   update(pages: PageRecord[]): void {
-    for (const pending of this.pendingRebuilds) {
-      pending.updates.push(pages.map((page) => ({ ...page })));
-    }
-    this.applyPages(this.index, pages);
+    this.lifecycle.update(pages);
   }
 
   private applyPages(index: MiniSearch<IndexedTitle>, pages: PageRecord[]): void {
@@ -205,26 +197,19 @@ export class TitleIndex implements TitleSearchBackend {
   }
 
   exportSnapshot(): unknown {
-    return { miniSearch: this.index.toJSON() };
+    return { miniSearch: this.lifecycle.current.toJSON() };
   }
 
   async importSnapshot(payload: unknown): Promise<void> {
     if (!payload || typeof payload !== 'object' || !('miniSearch' in payload)) {
       throw new Error('标题快照 payload 结构无效');
     }
-    const generation = ++this.rebuildGeneration;
-    const pending: PendingTitleRebuild = { updates: [] };
-    this.pendingRebuilds.add(pending);
-    try {
-      const restored = await MiniSearch.loadJSAsync<IndexedTitle>(
+    await this.lifecycle.rebuildAsync(() =>
+      MiniSearch.loadJSAsync<IndexedTitle>(
         payload.miniSearch as AsPlainObject,
         this.indexOptions(),
-      );
-      for (const update of pending.updates) this.applyPages(restored, update);
-      if (generation === this.rebuildGeneration) this.index = restored;
-    } finally {
-      this.pendingRebuilds.delete(pending);
-    }
+      ),
+    );
   }
 
   search(query: string, namespace?: number, limit = 20): TitleSearchResult[] {
@@ -250,9 +235,12 @@ export class TitleIndex implements TitleSearchBackend {
       filter: (result: SearchResult): boolean =>
         namespace === undefined || result.namespace === namespace,
     };
-    let results = this.index.search(normalizedQuery, options);
+    let results = this.lifecycle.current.search(normalizedQuery, options);
     if (!results.length && terms.length > 1 && !shortCjkOnly) {
-      results = this.index.search(normalizedQuery, { ...options, combineWith: 'OR' });
+      results = this.lifecycle.current.search(normalizedQuery, {
+        ...options,
+        combineWith: 'OR',
+      });
     }
 
     const compactQuery = this.analyzer.compact(normalizedQuery);
@@ -277,7 +265,7 @@ export class TitleIndex implements TitleSearchBackend {
   }
 
   get size(): number {
-    return this.index.documentCount;
+    return this.lifecycle.current.documentCount;
   }
 
   private createIndex(): MiniSearch<IndexedTitle> {

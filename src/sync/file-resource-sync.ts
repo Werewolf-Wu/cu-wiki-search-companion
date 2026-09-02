@@ -11,25 +11,12 @@ import type {
   TitleSyncProgress,
   TitleSyncState,
 } from '../types';
+import { requestAllPages } from './all-pages';
 import { delay, WikiApi } from './wiki-api';
 
 const FILE_RESOURCE_SYNC_KEY = 'file-resource-sync';
 const RECENT_CHANGES_SYNC_KEY = 'recent-changes-sync';
 const FILE_NAMESPACE = 6;
-
-interface AllFilesResponse {
-  continue?: { gapcontinue?: string };
-  query?: {
-    pages: Array<{
-      pageid: number;
-      ns: number;
-      title: string;
-      redirect?: boolean;
-      lastrevid?: number;
-      contentmodel?: string;
-    }>;
-  };
-}
 
 export interface FileResourceSyncOptions {
   force?: boolean;
@@ -75,12 +62,9 @@ export async function syncFileResources(
   try {
     while (state.namespaceIndex === 0) {
       report(state, options.onProgress);
-      const response = await api.query<AllFilesResponse>({
-        generator: 'allpages',
-        prop: 'info',
-        gaplimit: 500,
-        gapnamespace: FILE_NAMESPACE,
-        ...(state.gapcontinue ? { gapcontinue: state.gapcontinue } : {}),
+      const response = await requestAllPages(api, {
+        namespace: FILE_NAMESPACE,
+        gapcontinue: state.gapcontinue,
       });
       const rawFiles = response.query?.pages ?? [];
       const nextContinue = response.continue?.gapcontinue;
