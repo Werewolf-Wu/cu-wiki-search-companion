@@ -345,6 +345,119 @@ describe('SearchPanel startup recovery', () => {
 });
 
 describe('SearchPanel keyboard lifecycle', () => {
+  it('accepts only plain Alt+K and gives the shortcut to the latest panel instance', () => {
+    new SearchPanel(maintenanceCallbacks());
+    new SearchPanel(maintenanceCallbacks());
+    const panels = [...document.querySelectorAll<HTMLDivElement>('#cu-wiki-search-host')].map(
+      (host) => host.shadowRoot?.querySelector<HTMLElement>('.panel'),
+    );
+    if (panels.some((panel) => !panel)) throw new Error('搜索面板没有挂载');
+    const latest = panels[1]!;
+
+    window.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'k', altKey: true, ctrlKey: true }),
+    );
+    window.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'k', altKey: true, metaKey: true }),
+    );
+    const altGraph = new KeyboardEvent('keydown', { key: 'k', altKey: true });
+    vi.spyOn(altGraph, 'getModifierState').mockImplementation(
+      (key) => key === 'AltGraph',
+    );
+    window.dispatchEvent(altGraph);
+
+    expect(panels.every((panel) => panel?.hidden)).toBe(true);
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'K', altKey: true }));
+    expect(panels[0]?.hidden).toBe(true);
+    expect(latest.hidden).toBe(false);
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', altKey: true }));
+    expect(latest.hidden).toBe(true);
+  });
+
+  it.each(['.query', '.mode', '.data-rules', '.rebuild-indexes'])(
+    'closes from %s when Escape bubbles through the open panel',
+    (selector) => {
+      const panel = new SearchPanel(maintenanceCallbacks());
+      const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+      const panelElement = root?.querySelector<HTMLElement>('.panel');
+      const control = root?.querySelector<HTMLElement>(selector);
+      if (!root || !panelElement || !control) throw new Error('搜索面板没有挂载');
+      panel.open();
+
+      control.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+      expect(panelElement.hidden).toBe(true);
+    },
+  );
+
+  it('leaves Escape to IME composition outside the query input and honors isComposing', () => {
+    const panel = new SearchPanel(maintenanceCallbacks());
+    const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    const panelElement = root?.querySelector<HTMLElement>('.panel');
+    const dataRules = root?.querySelector<HTMLTextAreaElement>('.data-rules');
+    if (!root || !panelElement || !dataRules) throw new Error('搜索面板没有挂载');
+    panel.open();
+
+    dataRules.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    dataRules.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+    );
+    expect(panelElement.hidden).toBe(false);
+
+    dataRules.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
+    dataRules.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Escape',
+        bubbles: true,
+        isComposing: true,
+      }),
+    );
+    expect(panelElement.hidden).toBe(false);
+
+    dataRules.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+    );
+    expect(panelElement.hidden).toBe(true);
+  });
+
+  it('keeps result arrows and Enter scoped to the query input', () => {
+    const first: TitleSearchResult = {
+      id: 1,
+      title: '第一页',
+      namespace: 0,
+      namespaceName: '',
+      score: 2,
+    };
+    const second: TitleSearchResult = {
+      id: 2,
+      title: '第二页',
+      namespace: 0,
+      namespaceName: '',
+      score: 1,
+    };
+    const callbacks = maintenanceCallbacks({ search: vi.fn(() => [first, second]) });
+    const panel = new SearchPanel(callbacks);
+    const root = document.querySelector<HTMLDivElement>('#cu-wiki-search-host')?.shadowRoot;
+    const input = root?.querySelector<HTMLInputElement>('.query');
+    const mode = root?.querySelector<HTMLSelectElement>('.mode');
+    if (!root || !input || !mode) throw new Error('搜索面板没有挂载');
+    panel.open();
+    input.value = '页面';
+    panel.refreshResults();
+    for (const item of root.querySelectorAll<HTMLElement>('.result')) {
+      item.scrollIntoView = vi.fn();
+    }
+
+    mode.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(callbacks.insert).not.toHaveBeenCalled();
+
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(callbacks.insert).toHaveBeenCalledWith(second, '页面');
+  });
+
   it('leaves Escape to the active IME and restores the editor focus when closing later', () => {
     const editor = document.createElement('textarea');
     editor.id = 'editor-focus-target';

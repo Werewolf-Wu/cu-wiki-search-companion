@@ -58,6 +58,17 @@ export interface SearchPanelCallbacks {
 }
 
 export class SearchPanel {
+  private static shortcutOwner?: WeakRef<SearchPanel>;
+  private static shortcutWindow?: Window;
+  private static readonly globalShortcutKeydown = (event: KeyboardEvent): void => {
+    const owner = SearchPanel.shortcutOwner?.deref();
+    if (!owner?.host.isConnected) {
+      SearchPanel.shortcutOwner = undefined;
+      return;
+    }
+    owner.handleGlobalShortcut(event);
+  };
+
   private readonly host: HTMLDivElement;
   private readonly root: ShadowRoot;
   private readonly panel: HTMLElement;
@@ -235,12 +246,12 @@ export class SearchPanel {
       );
     });
 
-    this.input.addEventListener('compositionstart', () => {
+    this.panel.addEventListener('compositionstart', () => {
       this.composing = true;
     });
-    this.input.addEventListener('compositionend', () => {
+    this.panel.addEventListener('compositionend', (event) => {
       this.composing = false;
-      this.scheduleSearch(0);
+      if (event.target === this.input) this.scheduleSearch(0);
     });
     this.input.addEventListener('input', () => {
       if (!this.composing) this.scheduleSearch(120);
@@ -251,15 +262,20 @@ export class SearchPanel {
       this.updateModePresentation();
       this.performSearch();
     });
-    this.input.addEventListener('keydown', (event) => this.handleKeydown(event));
+    this.panel.addEventListener('keydown', (event) => this.handleKeydown(event));
+    SearchPanel.claimGlobalShortcut(this);
+  }
 
-    window.addEventListener('keydown', (event) => {
-      if (event.altKey && event.key.toLocaleLowerCase() === 'k') {
-        event.preventDefault();
-        if (this.panel.hidden) this.open();
-        else this.close();
-      }
-    });
+  private static claimGlobalShortcut(panel: SearchPanel): void {
+    if (SearchPanel.shortcutWindow !== window) {
+      SearchPanel.shortcutWindow?.removeEventListener(
+        'keydown',
+        SearchPanel.globalShortcutKeydown,
+      );
+      window.addEventListener('keydown', SearchPanel.globalShortcutKeydown);
+      SearchPanel.shortcutWindow = window;
+    }
+    SearchPanel.shortcutOwner = new WeakRef(panel);
   }
 
   private scheduleSearch(delay: number): void {
@@ -391,6 +407,7 @@ export class SearchPanel {
       this.close();
       return;
     }
+    if (event.target !== this.input) return;
     if (!this.results.length) return;
     if (event.key === 'ArrowDown') {
       event.preventDefault();
@@ -405,6 +422,23 @@ export class SearchPanel {
       const result = this.results[this.selectedIndex];
       if (result) this.insert(result);
     }
+  }
+
+  private handleGlobalShortcut(event: KeyboardEvent): void {
+    if (
+      this.composing ||
+      event.isComposing ||
+      !event.altKey ||
+      event.ctrlKey ||
+      event.metaKey ||
+      event.getModifierState('AltGraph') ||
+      event.key.toLocaleLowerCase() !== 'k'
+    ) {
+      return;
+    }
+    event.preventDefault();
+    if (this.panel.hidden) this.open();
+    else this.close();
   }
 
   private insert(result: SearchPanelResult): void {

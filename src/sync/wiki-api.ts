@@ -129,11 +129,16 @@ export function delay(milliseconds: number): Promise<void> {
 
 function parseRetryAfter(value: string | null): number | undefined {
   if (value === null) return undefined;
+  const normalized = value.trim();
+  if (!normalized) return undefined;
 
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  if (/^\d+(?:\.\d+)?$/.test(normalized)) {
+    const seconds = Number(normalized);
+    if (Number.isFinite(seconds)) return seconds * 1_000;
+  }
+  if (!/[A-Za-z]/.test(normalized)) return undefined;
 
-  const timestamp = Date.parse(value);
+  const timestamp = Date.parse(normalized);
   if (Number.isNaN(timestamp)) return undefined;
   return Math.max(0, timestamp - Date.now());
 }

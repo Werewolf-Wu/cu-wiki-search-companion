@@ -224,7 +224,7 @@ describe('full mirror reconciliation', () => {
         now: () => now,
         requestIntervalMs: 0,
       }),
-    ).rejects.toThrow('模拟断网');
+    ).rejects.toThrow('Wiki API 网络请求失败（network-error）');
     expect(await database.pages.get(10)).toMatchObject({ title: '第一批页' });
     expect((await database.syncState.get('reconciliation-sync'))?.value).toMatchObject({
       status: 'failed',

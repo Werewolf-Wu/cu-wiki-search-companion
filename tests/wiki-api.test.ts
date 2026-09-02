@@ -207,29 +207,34 @@ describe('WikiApi retry behavior', () => {
     expect(waits).toEqual([20]);
   });
 
-  it('falls back to exponential delay for an invalid Retry-After header', async () => {
-    const fetcher = vi
-      .fn()
-      .mockResolvedValueOnce(
-        json(
-          { error: 'temporarily unavailable' },
-          { status: 503, headers: { 'Retry-After': 'not-a-delay' } },
-        ),
-      )
-      .mockResolvedValueOnce(json({ query: { pages: [] } }));
-    const waits: number[] = [];
-    const api = new WikiApi({
-      fetcher: fetcher as typeof fetch,
-      retries: 1,
-      baseDelayMs: 37,
-      sleep: async (milliseconds) => {
-        waits.push(milliseconds);
-      },
-    });
+  it.each(['not-a-delay', '', '-1'])(
+    'falls back to exponential delay for the invalid Retry-After header %j',
+    async (retryAfter) => {
+      const fetcher = vi
+        .fn()
+        .mockResolvedValueOnce(
+          json(
+            { error: 'temporarily unavailable' },
+            { status: 503, headers: { 'Retry-After': retryAfter } },
+          ),
+        )
+        .mockResolvedValueOnce(json({ query: { pages: [] } }));
+      const waits: number[] = [];
+      const api = new WikiApi({
+        fetcher: fetcher as typeof fetch,
+        retries: 1,
+        baseDelayMs: 37,
+        sleep: async (milliseconds) => {
+          waits.push(milliseconds);
+        },
+      });
 
-    await expect(api.query({ prop: 'info' })).resolves.toEqual({ query: { pages: [] } });
-    expect(waits).toEqual([37]);
-  });
+      await expect(api.query({ prop: 'info' })).resolves.toEqual({
+        query: { pages: [] },
+      });
+      expect(waits).toEqual([37]);
+    },
+  );
 
   it('honors an HTTP-date Retry-After header before the fallback delay', async () => {
     const now = new Date('2026-09-02T00:00:00.000Z');
