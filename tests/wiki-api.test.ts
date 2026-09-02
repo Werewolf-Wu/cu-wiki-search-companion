@@ -145,6 +145,162 @@ describe('WikiApi retry behavior', () => {
     expect(waits).toEqual([500]);
   });
 
+  it('retries a MediaWiki ratelimited payload before succeeding', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json({ error: { code: 'ratelimited', info: 'Too many requests' } }),
+      )
+      .mockResolvedValueOnce(json({ query: { allpages: [] } }));
+    const waits: number[] = [];
+    const api = new WikiApi({
+      fetcher: fetcher as typeof fetch,
+      retries: 1,
+      baseDelayMs: 25,
+      sleep: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+
+    await expect(api.query({ list: 'allpages' })).resolves.toEqual({
+      query: { allpages: [] },
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(waits).toEqual([25]);
+  });
+
+  it.each([400, 404])('fails permanent HTTP %i responses without retrying', async (status) => {
+    const fetcher = vi.fn(async () =>
+      json({ error: 'permanent request failure' }, { status, statusText: 'Bad Request' }),
+    );
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 4 });
+
+    const error = await api.query({ list: 'allpages' }).catch((value) => value);
+
+    expect(error).toBeInstanceOf(WikiApiError);
+    expect(error).toMatchObject({
+      code: `http-${status}`,
+      retryable: false,
+      status,
+      message: `Wiki API 请求失败（http-${status}）`,
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([408, 429, 500])('retries transient HTTP %i responses', async (status) => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(json({ error: 'transient' }, { status }))
+      .mockResolvedValueOnce(json({ query: { pages: [] } }));
+    const waits: number[] = [];
+    const api = new WikiApi({
+      fetcher: fetcher as typeof fetch,
+      retries: 1,
+      baseDelayMs: 20,
+      sleep: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+
+    await expect(api.query({ prop: 'info' })).resolves.toEqual({ query: { pages: [] } });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(waits).toEqual([20]);
+  });
+
+  it('falls back to exponential delay for an invalid Retry-After header', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json(
+          { error: 'temporarily unavailable' },
+          { status: 503, headers: { 'Retry-After': 'not-a-delay' } },
+        ),
+      )
+      .mockResolvedValueOnce(json({ query: { pages: [] } }));
+    const waits: number[] = [];
+    const api = new WikiApi({
+      fetcher: fetcher as typeof fetch,
+      retries: 1,
+      baseDelayMs: 37,
+      sleep: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+
+    await expect(api.query({ prop: 'info' })).resolves.toEqual({ query: { pages: [] } });
+    expect(waits).toEqual([37]);
+  });
+
+  it('honors an HTTP-date Retry-After header before the fallback delay', async () => {
+    const now = new Date('2026-09-02T00:00:00.000Z');
+    vi.setSystemTime(now);
+    try {
+      const fetcher = vi
+        .fn()
+        .mockResolvedValueOnce(
+          json(
+            { error: 'temporarily unavailable' },
+            {
+              status: 503,
+              headers: {
+                'Retry-After': new Date(now.getTime() + 3_000).toUTCString(),
+              },
+            },
+          ),
+        )
+        .mockResolvedValueOnce(json({ query: { pages: [] } }));
+      const waits: number[] = [];
+      const api = new WikiApi({
+        fetcher: fetcher as typeof fetch,
+        retries: 1,
+        baseDelayMs: 37,
+        sleep: async (milliseconds) => {
+          waits.push(milliseconds);
+        },
+      });
+
+      await expect(api.query({ prop: 'info' })).resolves.toEqual({ query: { pages: [] } });
+      expect(waits).toEqual([3_000]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries a fetch network failure but not a malformed successful response', async () => {
+    const networkFetcher = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValueOnce(json({ query: { pages: [] } }));
+    const networkApi = new WikiApi({
+      fetcher: networkFetcher as typeof fetch,
+      retries: 1,
+      sleep: async () => undefined,
+    });
+
+    await expect(networkApi.query({ prop: 'info' })).resolves.toEqual({
+      query: { pages: [] },
+    });
+
+    const malformedFetcher = vi.fn(async () =>
+      new Response('{invalid', {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const malformedApi = new WikiApi({
+      fetcher: malformedFetcher as typeof fetch,
+      retries: 3,
+    });
+
+    const error = await malformedApi.query({ prop: 'info' }).catch((value) => value);
+    expect(error).toMatchObject({
+      code: 'malformed-response',
+      retryable: false,
+      message: 'Wiki API 响应格式无效（malformed-response）',
+    });
+    expect(malformedFetcher).toHaveBeenCalledOnce();
+  });
+
   it('exposes login assertion failures without retrying them', async () => {
     const fetcher = vi.fn(async () =>
       json({ error: { code: 'assertuserfailed', info: 'Assertion that the user is logged in failed' } }),

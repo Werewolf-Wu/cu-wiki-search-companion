@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 import {
   DEFAULT_REQUEST_TIMEOUT_MS,
+  RequestTimeoutError,
   runWithRequestTimeout,
 } from './request-timeout';
 
@@ -15,6 +16,8 @@ export interface WikiApiOptions {
 interface ApiErrorPayload {
   error?: { code?: string; info?: string };
 }
+
+const RETRYABLE_API_ERROR_CODES = new Set(['maxlag', 'ratelimited']);
 
 export class WikiApiError extends Error {
   constructor(
@@ -68,24 +71,24 @@ export class WikiApi {
             });
             retryAfterMs = parseRetryAfter(response.headers.get('Retry-After'));
             if (!response.ok) {
-              const loginRequired = response.status === 401 || response.status === 403;
+              const code = `http-${response.status}`;
               throw new WikiApiError(
-                `Wiki API returned HTTP ${response.status}`,
-                `http-${response.status}`,
-                response.statusText || 'HTTP error',
-                !loginRequired,
+                `Wiki API 请求失败（${code}）`,
+                code,
+                response.statusText || `HTTP ${response.status}`,
+                isRetryableHttpStatus(response.status),
                 response.status,
               );
             }
             const payload = (await response.json()) as T & ApiErrorPayload;
             if (payload.error) {
               const code = payload.error.code ?? 'api-error';
-              const info = payload.error.info ?? 'unknown error';
+              const info = payload.error.info ?? '未提供错误详情';
               throw new WikiApiError(
-                `${code}: ${info}`,
+                `Wiki API 返回错误（${code}）`,
                 code,
                 info,
-                code === 'maxlag',
+                RETRYABLE_API_ERROR_CODES.has(code),
               );
             }
             return payload;
@@ -94,10 +97,11 @@ export class WikiApi {
         );
         return payload;
       } catch (error) {
-        lastError = error;
+        const requestError = normalizeWikiApiError(error);
+        lastError = requestError;
         if (
           attempt === this.retries ||
-          (error instanceof WikiApiError && !error.retryable)
+          !(requestError instanceof WikiApiError && requestError.retryable)
         ) {
           break;
         }
@@ -132,4 +136,42 @@ function parseRetryAfter(value: string | null): number | undefined {
   const timestamp = Date.parse(value);
   if (Number.isNaN(timestamp)) return undefined;
   return Math.max(0, timestamp - Date.now());
+}
+
+function isRetryableHttpStatus(status: number): boolean {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function normalizeWikiApiError(error: unknown): unknown {
+  if (error instanceof WikiApiError) return error;
+  if (error instanceof RequestTimeoutError) {
+    return new WikiApiError(
+      'Wiki API 请求超时（request-timeout）',
+      'request-timeout',
+      error.message,
+      true,
+    );
+  }
+  if (
+    error instanceof TypeError ||
+    (typeof DOMException !== 'undefined' &&
+      error instanceof DOMException &&
+      error.name === 'NetworkError')
+  ) {
+    return new WikiApiError(
+      'Wiki API 网络请求失败（network-error）',
+      'network-error',
+      error.message,
+      true,
+    );
+  }
+  if (error instanceof SyntaxError) {
+    return new WikiApiError(
+      'Wiki API 响应格式无效（malformed-response）',
+      'malformed-response',
+      error.message,
+      false,
+    );
+  }
+  return error;
 }
