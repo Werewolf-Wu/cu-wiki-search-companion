@@ -26,7 +26,7 @@ describe('userscript activation metadata', () => {
     const metaMatches = metadataMatches(metaSource);
     const packageVersion = (JSON.parse(packageManifestSource) as { version?: string }).version;
 
-    expect(packageVersion).toBe('0.3.1');
+    expect(packageVersion).toBe('0.3.2');
     expect(metadataValue(userScript.code, 'version')).toBe(packageVersion);
     expect(metadataValue(metaSource, 'version')).toBe(packageVersion);
     expect(metaMatches).toEqual(userMatches);
