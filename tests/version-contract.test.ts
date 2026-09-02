@@ -15,6 +15,16 @@ describe('cache version contract', () => {
     expect(CURRENT_VERSION_CONTRACT.analyzerPipeline).toBe(2);
   });
 
+  it('bumps only the corrected wikitext and Lua extractor contracts', () => {
+    expect(CURRENT_VERSION_CONTRACT).toMatchObject({
+      databaseSchema: 3,
+      pageFacts: 1,
+      contentJobFormat: 1,
+      extractors: { wikitext: 2, bson: 1, lua: 2 },
+      indexes: { title: 1, content: 1, lua: 1 },
+    });
+  });
+
   it('registers known schema-v3 legacy data without deleting facts, jobs, or cursors', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();

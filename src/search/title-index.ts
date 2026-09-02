@@ -224,11 +224,18 @@ export class TitleIndex implements TitleSearchBackend {
     if (!normalizedQuery) return [];
     const terms = this.analyzer.queryTokens(normalizedQuery);
     if (!terms.length) return [];
+    const queryCjk = this.analyzer.cjkOf(normalizedQuery);
+    const shortCjkOnly =
+      queryCjk.length > 0 &&
+      queryCjk.length <= 2 &&
+      this.analyzer.compactNormalized(normalizedQuery) === queryCjk;
 
     const options = {
       prefix: true,
-      fuzzy: (term: string): number =>
-        this.analyzer.cjkOf(term) ? (term.length >= 2 ? 1 : 0) : term.length >= 4 ? 1 : 0,
+      fuzzy: (term: string): number => {
+        const cjk = this.analyzer.cjkOf(term);
+        return cjk ? (cjk.length >= 3 ? 1 : 0) : term.length >= 4 ? 1 : 0;
+      },
       combineWith: 'AND' as const,
       tokenize: (value: string): string[] => this.analyzer.queryTokens(value),
       processTerm: (term: string): string => term,
@@ -236,7 +243,7 @@ export class TitleIndex implements TitleSearchBackend {
         namespace === undefined || result.namespace === namespace,
     };
     let results = this.index.search(normalizedQuery, options);
-    if (!results.length && terms.length > 1) {
+    if (!results.length && terms.length > 1 && !shortCjkOnly) {
       results = this.index.search(normalizedQuery, { ...options, combineWith: 'OR' });
     }
 

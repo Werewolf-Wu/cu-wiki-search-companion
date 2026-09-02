@@ -68,6 +68,29 @@ describe('Lua module search', () => {
     expect(extracted.dependencies).toEqual(['Module:Visible']);
   });
 
+  it('distinguishes assignments from comparison operators when collecting returned keys', () => {
+    const returnedRoot = extractLua(`
+      local p = {}
+      p.foo == expected
+      p.bar ~= expected
+      p.baz <= expected
+      p.qux >= expected
+      p.real = true
+      return p
+    `);
+    const returnedTable = extractLua(`
+      return {
+        identifier = true,
+        ["string-key"] = true,
+        [7] = true,
+        candidate == expected
+      }
+    `);
+
+    expect(returnedRoot.returnKeys).toEqual(['real']);
+    expect(returnedTable.returnKeys).toEqual(['identifier', 'string-key', '7']);
+  });
+
   it('skips an extreme member path and continues extracting later symbols', () => {
     const extremePath = `p${Array.from(
       { length: 400 },

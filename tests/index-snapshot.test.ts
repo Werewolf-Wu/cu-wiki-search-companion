@@ -271,6 +271,34 @@ describe('VersionedSearchIndexCache', () => {
     await database.delete();
   });
 
+  it('parses a complete content snapshot payload only once during restore', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.pages.put(
+      page(1, '单次解析正文', '使用医用级兴奋剂进行紧急救治。', 'wikitext', 1),
+    );
+    await database.syncState.put({ key: 'local-sequence', value: 1 });
+    const publishingCache = new VersionedSearchIndexCache(database, {
+      storage: unlimitedStorage(),
+    });
+    await publishingCache.publish(
+      await publishingCache.restoreOrRebuild('content', analyzer),
+    );
+    const parse = vi.spyOn(JSON, 'parse');
+
+    const restored = await new VersionedSearchIndexCache(database, {
+      storage: unlimitedStorage(),
+    }).restoreOrRebuild('content', analyzer);
+
+    expect(restored.source).toBe('snapshot');
+    expect(restored.index.search('紧急救治')[0]?.title).toBe('单次解析正文');
+    expect(parse).toHaveBeenCalledTimes(1);
+
+    parse.mockRestore();
+    database.close();
+    await database.delete();
+  });
+
   it('skips only JSON parsing for a warm metadata fingerprint', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();

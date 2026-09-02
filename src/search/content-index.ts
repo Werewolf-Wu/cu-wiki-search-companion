@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
-import MiniSearch, { type Options, type SearchResult } from 'minisearch';
+import MiniSearch, {
+  type AsPlainObject,
+  type Options,
+  type SearchResult,
+} from 'minisearch';
 
 import type { Analyzer } from '../analyzer/analyzer';
 import { extractContent } from '../content/extract-content';
@@ -137,8 +141,8 @@ export class ContentIndex {
       restoredExtractedById.set(id, extracted);
     }
     try {
-      const restored = await MiniSearch.loadJSONAsync<IndexedContent>(
-        JSON.stringify(payload.miniSearch),
+      const restored = await MiniSearch.loadJSAsync<IndexedContent>(
+        payload.miniSearch as AsPlainObject,
         this.indexOptions(),
       );
       if (restoredExtractedById.size !== restored.documentCount) {

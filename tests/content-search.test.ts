@@ -31,6 +31,21 @@ describe('wikitext content search', () => {
     expect(extracted).not.toContain('隐藏来源文字');
   });
 
+  it('decodes supported entities exactly once while preserving unknown entities as text', () => {
+    expect(
+      extractWikitext(
+        '&amp; &lt; &gt; &quot; &apos; &nbsp; &#20320;&#x597D; &copy;',
+      ),
+    ).toBe('& < > " \' 你好 &copy;');
+    expect(extractWikitext('&amp;lt;')).toBe('&lt;');
+  });
+
+  it('keeps an entity-encoded tag as searchable text instead of treating it as markup', () => {
+    expect(
+      extractWikitext('&lt;script&gt;alert(&quot;encoded&quot;)&lt;/script&gt;'),
+    ).toBe('<script>alert("encoded")</script>');
+  });
+
   it('extracts deeply nested BSON without exhausting the JavaScript call stack', () => {
     const depth = 12_000;
     const source = `${'{"level":'.repeat(depth)}"deepMarker"${'}'.repeat(depth)}`;

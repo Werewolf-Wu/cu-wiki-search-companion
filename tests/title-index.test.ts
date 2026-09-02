@@ -74,6 +74,18 @@ describe('TitleIndex', () => {
     expect(index.search('治')[0]?.id).toBe(1);
   });
 
+  it('does not broadly recall two-character CJK typos from one shared character', () => {
+    const index = new TitleIndex(analyzer);
+    index.rebuild([
+      page(1, '治疗指南'),
+      page(2, '治疗方案'),
+      page(3, '治安手册'),
+      page(4, '化疗说明'),
+    ]);
+
+    expect(index.search('治错')).toEqual([]);
+  });
+
   it('preserves an update that arrives while an async rebuild is yielding', async () => {
     const index = new TitleIndex(analyzer);
     index.rebuild([page(1, '现有页面'), page(2, '第二页旧标题')]);

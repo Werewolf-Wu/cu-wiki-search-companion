@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 const BLOCK_TAGS = /<(script|style|gallery|math)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
 const REFERENCES = /<ref\b[^>]*>[\s\S]*?<\/ref\s*>|<ref\b[^>]*\/\s*>/gi;
+const HTML_ENTITIES = /&(?:nbsp|amp|lt|gt|quot|apos|#(?:\d+|x[0-9a-f]+));/gi;
 
 export function extractWikitext(source: string): string {
   let text = source
@@ -16,12 +17,7 @@ export function extractWikitext(source: string): string {
     .replace(/\[(?:https?:)?\/\/\S+(?:\s+([^\]]+))?\]/g, (_match, label) => label ?? ' ')
     .replace(/<br\s*\/?>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;|&#160;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
+    .replace(HTML_ENTITIES, decodeHtmlEntity)
     .replace(/\{\{|\}\}|\{\||\|\}/g, ' ')
     .replace(/[|=]+/g, ' ')
     .replace(/'{2,}/g, '')
@@ -29,6 +25,31 @@ export function extractWikitext(source: string): string {
     .replace(/\s+/g, ' ')
     .trim();
   return text;
+}
+
+function decodeHtmlEntity(entity: string): string {
+  const body = entity.slice(1, -1).toLocaleLowerCase();
+  const named = {
+    nbsp: ' ',
+    amp: '&',
+    lt: '<',
+    gt: '>',
+    quot: '"',
+    apos: "'",
+  }[body];
+  if (named !== undefined) return named;
+
+  const hexadecimal = body.startsWith('#x');
+  const codePoint = Number.parseInt(body.slice(hexadecimal ? 2 : 1), hexadecimal ? 16 : 10);
+  if (
+    !Number.isSafeInteger(codePoint) ||
+    codePoint <= 0 ||
+    codePoint > 0x10ffff ||
+    (codePoint >= 0xd800 && codePoint <= 0xdfff)
+  ) {
+    return entity;
+  }
+  return String.fromCodePoint(codePoint);
 }
 
 export function extractLanguageVariants(source: string): string {

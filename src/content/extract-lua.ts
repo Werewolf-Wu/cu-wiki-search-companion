@@ -151,6 +151,13 @@ function tokenizeLua(source: string): LuaToken[] {
       continue;
     }
 
+    const comparison = source.slice(index, index + 2);
+    if (['==', '~=', '<=', '>='].includes(comparison)) {
+      tokens.push({ type: 'symbol', value: comparison });
+      index += 2;
+      continue;
+    }
+
     tokens.push({ type: 'symbol', value: character });
     index += 1;
   }
