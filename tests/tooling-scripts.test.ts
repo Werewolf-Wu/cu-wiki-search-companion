@@ -3,6 +3,7 @@
 import 'fake-indexeddb/auto';
 
 import installUserscriptSource from '../scripts/install-userscript.playwright.js?raw';
+import testIndexSnapshotsSource from '../scripts/test-index-snapshots.playwright.js?raw';
 import testMaintenanceSource from '../scripts/test-maintenance.playwright.js?raw';
 import testReconciliationSource from '../scripts/test-reconciliation.playwright.js?raw';
 import { WikiSearchDatabase } from '../src/storage/database';
@@ -11,6 +12,19 @@ type RunCodeScript = (page: unknown, userscriptUrl?: string) => Promise<unknown>
 const BrowserURL = globalThis.URL;
 
 describe('browser tooling scripts', () => {
+  it('resets deep search state before every snapshot reload', () => {
+    expect([...testIndexSnapshotsSource.matchAll(/await reloadCold\(\)/g)]).toHaveLength(4);
+    expect([...testIndexSnapshotsSource.matchAll(/await page\.reload/g)]).toHaveLength(1);
+    const reset = testIndexSnapshotsSource.slice(
+      testIndexSnapshotsSource.indexOf('async function reloadCold'),
+      testIndexSnapshotsSource.indexOf('async function waitForColdReady'),
+    );
+    expect(reset).toContain("mode.value = 'title'");
+    expect(reset).not.toContain('dispatchEvent');
+    expect(reset).toContain("toggle?.getAttribute('aria-expanded') === 'true'");
+    expect(reset).toContain('toggle.click()');
+  });
+
   it('installs through a dedicated edit page without touching existing reader or Tampermonkey pages', async () => {
     const context = new InstallContext();
     const reader = context.addInitial(

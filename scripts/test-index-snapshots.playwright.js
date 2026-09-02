@@ -14,7 +14,7 @@ async page => {
   page.on('request', onRequest);
 
   try {
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await reloadCold();
     await waitForColdReady();
     await page.waitForTimeout(15_000);
     const cold = await readDebug();
@@ -53,7 +53,7 @@ async page => {
         undefined,
         { polling: 100, timeout: 360_000 },
       );
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await reloadCold();
       await waitForColdReady();
       baselineJobs = await readContentJobCounts();
     }
@@ -80,7 +80,7 @@ async page => {
 
     const restoreRuns = [];
     for (let run = 0; run < 3; run += 1) {
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await reloadCold();
       await waitForColdReady();
       const requestOffset = contentRequestUrls.length;
       await openSearch();
@@ -133,7 +133,7 @@ async page => {
       { polling: 100 },
     );
 
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await reloadCold();
     await waitForColdReady();
     const rebuildRequestOffset = contentRequestUrls.length;
     await openSearch();
@@ -176,6 +176,17 @@ async page => {
     };
   } finally {
     page.off('request', onRequest);
+  }
+
+  async function reloadCold() {
+    await page.evaluate(() => {
+      const root = document.querySelector('#cu-wiki-search-host')?.shadowRoot;
+      const mode = root?.querySelector('.mode');
+      if (mode instanceof HTMLSelectElement) mode.value = 'title';
+      const toggle = root?.querySelector('.toggle');
+      if (toggle?.getAttribute('aria-expanded') === 'true') toggle.click();
+    });
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
   }
 
   async function waitForColdReady() {
