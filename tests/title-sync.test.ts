@@ -385,6 +385,9 @@ describe('title sync', () => {
     });
     expect(await database.pages.get(1)).toMatchObject({ deleted: false });
     expect(await database.pages.get(2)).toMatchObject({ title: '恢复后次页' });
+    expect((await database.syncState.get('title-sync'))?.value).not.toHaveProperty(
+      'apcontinue',
+    );
 
     requests.length = 0;
     const forced = await syncTitles(database, api, analyzer, {
@@ -394,6 +397,60 @@ describe('title sync', () => {
     expect(requests[0]?.searchParams.get('meta')).toBe('siteinfo');
     expect(requests[1]?.searchParams.has('gapcontinue')).toBe(false);
     expect(forced.generation).not.toBe(100);
+
+    database.close();
+    await database.delete();
+  });
+
+  it('persists new title continuations only as gapcontinue', async () => {
+    let failSecondPage = true;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      if (url.searchParams.get('meta') === 'siteinfo') {
+        return json({ query: { namespaces: { 0: { id: 0, name: '' } } } });
+      }
+      if (!url.searchParams.has('gapcontinue')) {
+        return json({
+          continue: { gapcontinue: '精确的下一页游标' },
+          query: {
+            pages: [
+              { pageid: 1, ns: 0, title: '首页', lastrevid: 1, contentmodel: 'wikitext' },
+            ],
+          },
+        });
+      }
+      if (failSecondPage) {
+        failSecondPage = false;
+        throw new TypeError('模拟断网');
+      }
+      return json({ query: { pages: [] } });
+    });
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+    await expect(
+      syncTitles(database, api, analyzer, { requestIntervalMs: 0 }),
+    ).rejects.toThrow();
+
+    expect((await database.syncState.get('title-sync'))?.value).toMatchObject({
+      status: 'failed',
+      gapcontinue: '精确的下一页游标',
+    });
+    expect((await database.syncState.get('title-sync'))?.value).not.toHaveProperty(
+      'apcontinue',
+    );
+
+    await expect(
+      syncTitles(database, api, analyzer, { requestIntervalMs: 0 }),
+    ).resolves.toMatchObject({ status: 'complete', pagesFetched: 1 });
+    expect(
+      fetcher.mock.calls.some(([input]) =>
+        new URL(String(input), 'https://casualtiesunknown.huijiwiki.com').searchParams.has(
+          'apcontinue',
+        ),
+      ),
+    ).toBe(false);
 
     database.close();
     await database.delete();

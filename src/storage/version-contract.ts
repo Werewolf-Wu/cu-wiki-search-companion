@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { WikiSearchDatabase } from './database';
+import {
+  isNonNegativeSafeInteger,
+  readValidatedSyncState,
+} from './sync-state';
 
 export const CACHE_VERSION_CONTRACT_KEY = 'cache-version-contract';
 
@@ -127,6 +131,16 @@ export async function initializeVersionContract(
   };
 }
 
+export async function readCacheVersionContract(
+  database: WikiSearchDatabase,
+): Promise<CacheVersionContract | undefined> {
+  return readValidatedSyncState(
+    database,
+    CACHE_VERSION_CONTRACT_KEY,
+    isVersionContract,
+  );
+}
+
 function areStructurallyEqual(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true;
   if (!left || !right || typeof left !== 'object' || typeof right !== 'object') {
@@ -179,21 +193,21 @@ export function createCompatibilityKey(
   return JSON.stringify(shared);
 }
 
-function isVersionContract(value: unknown): value is CacheVersionContract {
+export function isVersionContract(value: unknown): value is CacheVersionContract {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as Partial<CacheVersionContract>;
   return (
-    typeof candidate.databaseSchema === 'number' &&
-    typeof candidate.pageFacts === 'number' &&
-    typeof candidate.contentJobFormat === 'number' &&
-    typeof candidate.analyzerPipeline === 'number' &&
-    typeof candidate.dataCodeFormat === 'number' &&
-    typeof candidate.extractors?.wikitext === 'number' &&
-    typeof candidate.extractors.bson === 'number' &&
-    typeof candidate.extractors.lua === 'number' &&
-    typeof candidate.indexes?.title === 'number' &&
-    typeof candidate.indexes.content === 'number' &&
-    typeof candidate.indexes.lua === 'number' &&
+    isNonNegativeSafeInteger(candidate.databaseSchema) &&
+    isNonNegativeSafeInteger(candidate.pageFacts) &&
+    isNonNegativeSafeInteger(candidate.contentJobFormat) &&
+    isNonNegativeSafeInteger(candidate.analyzerPipeline) &&
+    isNonNegativeSafeInteger(candidate.dataCodeFormat) &&
+    isNonNegativeSafeInteger(candidate.extractors?.wikitext) &&
+    isNonNegativeSafeInteger(candidate.extractors.bson) &&
+    isNonNegativeSafeInteger(candidate.extractors.lua) &&
+    isNonNegativeSafeInteger(candidate.indexes?.title) &&
+    isNonNegativeSafeInteger(candidate.indexes.content) &&
+    isNonNegativeSafeInteger(candidate.indexes.lua) &&
     typeof candidate.libraries?.minisearch === 'string' &&
     typeof candidate.libraries.jieba === 'string'
   );

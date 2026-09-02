@@ -43,7 +43,7 @@ describe('sync-state validation', () => {
     await database.delete();
   });
 
-  it('accepts a legacy title continuation and ignores additional fields', async () => {
+  it('normalizes a legacy title continuation and ignores additional fields', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();
     await database.syncState.put({
@@ -62,10 +62,13 @@ describe('sync-state validation', () => {
       },
     });
 
-    await expect(readTitleSyncState(database)).resolves.toMatchObject({
-      apcontinue: '旧版续扫位置',
+    const state = await readTitleSyncState(database);
+
+    expect(state).toMatchObject({
+      gapcontinue: '旧版续扫位置',
       futureField: { preserved: true },
     });
+    expect(state).not.toHaveProperty('apcontinue');
 
     database.close();
     await database.delete();

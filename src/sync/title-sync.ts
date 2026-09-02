@@ -2,10 +2,9 @@
 import type { Analyzer } from '../analyzer/analyzer';
 import type { WikiSearchDatabase } from '../storage/database';
 import {
-  isTitleSyncState,
   LOCAL_SEQUENCE_KEY,
   readLocalSequence,
-  readValidatedSyncState,
+  readValidatedTitleSyncState,
 } from '../storage/sync-state';
 import type {
   PageRecord,
@@ -46,7 +45,7 @@ export interface TitleSyncOptions {
 export async function readTitleSyncState(
   database: WikiSearchDatabase,
 ): Promise<TitleSyncState | undefined> {
-  return readValidatedSyncState(database, TITLE_SYNC_KEY, isTitleSyncState);
+  return readValidatedTitleSyncState(database, TITLE_SYNC_KEY);
 }
 
 export async function syncTitles(
@@ -97,7 +96,7 @@ export async function syncTitles(
         prop: 'info',
         gaplimit: 500,
         gapnamespace: namespace,
-        ...(state.apcontinue ? { gapcontinue: state.apcontinue } : {}),
+        ...(state.gapcontinue ? { gapcontinue: state.gapcontinue } : {}),
       });
       const rawPages = response.query?.pages ?? [];
       const nextContinue = response.continue?.gapcontinue;
@@ -156,7 +155,7 @@ export async function syncTitles(
           namespaceIndex: nextContinue
             ? state.namespaceIndex
             : state.namespaceIndex + 1,
-          ...(nextContinue ? { apcontinue: nextContinue } : { apcontinue: undefined }),
+          ...(nextContinue ? { gapcontinue: nextContinue } : { gapcontinue: undefined }),
         };
         await database.pages.bulkPut(storedBatch);
         await database.syncState.bulkPut([

@@ -213,6 +213,12 @@ describe('file resource search', () => {
     expect(await database.fileResources.count()).toBe(2);
     expect((await database.fileResources.get(6001))?.writerSeq).toBe(2);
     expect((await database.fileResources.get(6002))?.writerSeq).toBe(3);
+    const storedFiles = await database.fileResources.toArray();
+    expect(storedFiles).toEqual([
+      expect.objectContaining({ seenInFileSync: first.generation }),
+      expect.objectContaining({ seenInFileSync: first.generation }),
+    ]);
+    expect(storedFiles.every((file) => !Object.hasOwn(file, 'seenInTitleSync'))).toBe(true);
     expect((await database.syncState.get('local-sequence'))?.value).toBe(3);
     expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
       fileChangeSeq: 3,
@@ -405,10 +411,16 @@ describe('file resource search', () => {
       generation: 100,
       pagesFetched: 2,
     });
-    expect(await database.fileResources.get(6001)).toMatchObject({ deleted: false });
+    const legacyFile = await database.fileResources.get(6001);
+    expect(legacyFile).toMatchObject({ deleted: false, seenInFileSync: 100 });
+    expect(legacyFile).not.toHaveProperty('seenInTitleSync');
     expect(await database.fileResources.get(6002)).toMatchObject({
       title: '文件:第二页.png',
+      seenInFileSync: 100,
     });
+    expect((await database.syncState.get('file-resource-sync'))?.value).not.toHaveProperty(
+      'apcontinue',
+    );
 
     requests.length = 0;
     const forced = await syncFileResources(database, api, analyzer, {

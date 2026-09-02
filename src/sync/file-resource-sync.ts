@@ -2,10 +2,9 @@
 import type { Analyzer } from '../analyzer/analyzer';
 import type { WikiSearchDatabase } from '../storage/database';
 import {
-  isTitleSyncState,
   LOCAL_SEQUENCE_KEY,
   readLocalSequence,
-  readValidatedSyncState,
+  readValidatedTitleSyncState,
 } from '../storage/sync-state';
 import type {
   PageRecord,
@@ -42,11 +41,7 @@ export interface FileResourceSyncOptions {
 export async function readFileResourceSyncState(
   database: WikiSearchDatabase,
 ): Promise<TitleSyncState | undefined> {
-  return readValidatedSyncState(
-    database,
-    FILE_RESOURCE_SYNC_KEY,
-    isTitleSyncState,
-  );
+  return readValidatedTitleSyncState(database, FILE_RESOURCE_SYNC_KEY);
 }
 
 export async function syncFileResources(
@@ -85,7 +80,7 @@ export async function syncFileResources(
         prop: 'info',
         gaplimit: 500,
         gapnamespace: FILE_NAMESPACE,
-        ...(state.apcontinue ? { gapcontinue: state.apcontinue } : {}),
+        ...(state.gapcontinue ? { gapcontinue: state.gapcontinue } : {}),
       });
       const rawFiles = response.query?.pages ?? [];
       const nextContinue = response.continue?.gapcontinue;
@@ -114,12 +109,12 @@ export async function syncFileResources(
               oldFile.revisionId > rawFile.lastrevid
             ) {
               return {
-                ...oldFile,
-                seenInTitleSync: state.generation,
+                ...withoutLegacyTitleGeneration(oldFile),
+                seenInFileSync: state.generation,
               };
             }
             const nextFile: PageRecord = {
-              ...oldFile,
+              ...(oldFile ? withoutLegacyTitleGeneration(oldFile) : {}),
               id: rawFile.pageid,
               title: rawFile.title,
               normalizedTitle: analyzer.normalize(rawFile.title),
@@ -129,7 +124,7 @@ export async function syncFileResources(
               revisionId: rawFile.lastrevid,
               contentModel: rawFile.contentmodel,
               localSeq: oldFile?.localSeq ?? rawFile.lastrevid ?? rawFile.pageid,
-              seenInTitleSync: state.generation,
+              seenInFileSync: state.generation,
               deleted: false,
             };
             if (fileFactChanged(oldFile, nextFile)) {
@@ -142,7 +137,7 @@ export async function syncFileResources(
             ...state,
             pagesFetched: state.pagesFetched + rawFiles.length,
             namespaceIndex: nextContinue ? 0 : 1,
-            ...(nextContinue ? { apcontinue: nextContinue } : { apcontinue: undefined }),
+            ...(nextContinue ? { gapcontinue: nextContinue } : { gapcontinue: undefined }),
           };
           const recentChangeRecord =
             sequence === initialSequence
@@ -177,13 +172,25 @@ export async function syncFileResources(
       database.pages,
       database.syncState,
       async () => {
-        const staleIds = await database.fileResources
-          .filter((file) => file.seenInTitleSync !== state.generation)
-          .primaryKeys();
+        const staleIds: number[] = [];
+        const migratedFiles: PageRecord[] = [];
+        await database.fileResources.each((file) => {
+          if ((file.seenInFileSync ?? file.seenInTitleSync) !== state.generation) {
+            staleIds.push(file.id);
+            return;
+          }
+          if (file.seenInFileSync === undefined) {
+            migratedFiles.push({
+              ...withoutLegacyTitleGeneration(file),
+              seenInFileSync: state.generation,
+            });
+          }
+        });
         const sequence = (await readLocalSequence(database)) + staleIds.length;
         const recentChangeRecord = staleIds.length
           ? await database.syncState.get(RECENT_CHANGES_SYNC_KEY)
           : undefined;
+        if (migratedFiles.length) await database.fileResources.bulkPut(migratedFiles);
         await database.fileResources.bulkDelete(staleIds);
         const nextState: TitleSyncState = {
           ...state,
@@ -230,6 +237,11 @@ function fileFactChanged(oldFile: PageRecord | undefined, nextFile: PageRecord):
     oldFile.contentModel !== nextFile.contentModel ||
     Boolean(oldFile.deleted) !== Boolean(nextFile.deleted)
   );
+}
+
+function withoutLegacyTitleGeneration(file: PageRecord): PageRecord {
+  const { seenInTitleSync: _legacyFileGeneration, ...currentFile } = file;
+  return currentFile;
 }
 
 function withFileChangeSequence(value: unknown, sequence: number): Record<string, unknown> {

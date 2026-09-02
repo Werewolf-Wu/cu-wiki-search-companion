@@ -9,7 +9,8 @@ export interface PageRecord {
   localSeq: number;
   /** Comparable global sequence for file-row writes; legacy file localSeq held revisions. */
   writerSeq?: number;
-  seenInTitleSync: number;
+  seenInTitleSync?: number;
+  seenInFileSync?: number;
   seenInReconciliation?: number;
   deleted?: boolean;
   revisionId?: number;
@@ -76,7 +77,7 @@ export interface TitleSyncState {
   namespaceIds: number[];
   namespaceNames: Record<number, string>;
   namespaceIndex: number;
-  apcontinue?: string;
+  gapcontinue?: string;
   generation: number;
   pagesFetched: number;
   startedAt: number;

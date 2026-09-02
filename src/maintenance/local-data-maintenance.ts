@@ -13,7 +13,7 @@ import {
   type DataRulesPreferenceStore,
 } from '../storage/data-rules-preference';
 import {
-  CACHE_VERSION_CONTRACT_KEY,
+  readCacheVersionContract,
   type CacheVersionContract,
 } from '../storage/version-contract';
 import { CONTENT_JOB_TYPE } from '../sync/content-job-policy';
@@ -100,12 +100,12 @@ export class LocalDataMaintenance {
   async inspect(): Promise<LocalDataDiagnostics> {
     const counts = { pages: 0, files: 0, dataCodes: 0, contentSources: 0, luaSources: 0 };
     const jobs = { done: 0, pending: 0, running: 0, failed: 0 };
-    const [dataCodes, recentState, reconciliationState, versionRecord, snapshots] =
+    const [dataCodes, recentState, reconciliationState, versionState, snapshots] =
       await Promise.all([
         this.database.dataCodes.count(),
         diagnosticState(() => readRecentChangeSyncState(this.database)),
         diagnosticState(() => readReconciliationSyncState(this.database)),
-        this.database.syncState.get(CACHE_VERSION_CONTRACT_KEY),
+        diagnosticState(() => readCacheVersionContract(this.database)),
         this.indexCache.inspect(),
         this.database.pages.each((page) => {
           if (page.deleted) return;
@@ -132,10 +132,10 @@ export class LocalDataMaintenance {
       jobs,
       recentChanges: recentState.value,
       reconciliation: reconciliationState.value,
-      versionContract: versionRecord?.value as CacheVersionContract | undefined,
+      versionContract: versionState.value,
       snapshots,
       storage,
-      warnings: [recentState.warning, reconciliationState.warning].filter(
+      warnings: [recentState.warning, reconciliationState.warning, versionState.warning].filter(
         (warning): warning is string => warning !== undefined,
       ),
     };

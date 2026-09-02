@@ -173,4 +173,56 @@ describe('cache version contract', () => {
     database.close();
     await database.delete();
   });
+
+  it.each([
+    ['NaN', Number.NaN],
+    ['negative', -1],
+    ['fraction', 1.5],
+    ['unsafe', Number.MAX_SAFE_INTEGER + 1],
+  ])('rejects %s values in every numeric contract field', async (_label, invalid) => {
+    const corruptContracts: CacheVersionContract[] = [
+      { ...CURRENT_VERSION_CONTRACT, databaseSchema: invalid },
+      { ...CURRENT_VERSION_CONTRACT, pageFacts: invalid },
+      { ...CURRENT_VERSION_CONTRACT, contentJobFormat: invalid },
+      { ...CURRENT_VERSION_CONTRACT, analyzerPipeline: invalid },
+      { ...CURRENT_VERSION_CONTRACT, dataCodeFormat: invalid },
+      {
+        ...CURRENT_VERSION_CONTRACT,
+        extractors: { ...CURRENT_VERSION_CONTRACT.extractors, wikitext: invalid },
+      },
+      {
+        ...CURRENT_VERSION_CONTRACT,
+        extractors: { ...CURRENT_VERSION_CONTRACT.extractors, bson: invalid },
+      },
+      {
+        ...CURRENT_VERSION_CONTRACT,
+        extractors: { ...CURRENT_VERSION_CONTRACT.extractors, lua: invalid },
+      },
+      {
+        ...CURRENT_VERSION_CONTRACT,
+        indexes: { ...CURRENT_VERSION_CONTRACT.indexes, title: invalid },
+      },
+      {
+        ...CURRENT_VERSION_CONTRACT,
+        indexes: { ...CURRENT_VERSION_CONTRACT.indexes, content: invalid },
+      },
+      {
+        ...CURRENT_VERSION_CONTRACT,
+        indexes: { ...CURRENT_VERSION_CONTRACT.indexes, lua: invalid },
+      },
+    ];
+
+    for (const contract of corruptContracts) {
+      const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+      await database.open();
+      await database.syncState.put({ key: CACHE_VERSION_CONTRACT_KEY, value: contract });
+
+      await expect(initializeVersionContract(database)).resolves.toMatchObject({
+        status: 'incompatible',
+      });
+
+      database.close();
+      await database.delete();
+    }
+  });
 });

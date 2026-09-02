@@ -25,13 +25,16 @@ export async function readValidatedSyncState<T>(
   throw new Error(`同步状态 "${key}" 已损坏：对象结构或字段类型无效`);
 }
 
-export function isTitleSyncState(value: unknown): value is TitleSyncState {
+export function isTitleSyncState(
+  value: unknown,
+): value is TitleSyncState & { apcontinue?: string } {
   if (!isObjectRecord(value)) return false;
   if (!isOneOf(value.status, ['running', 'complete', 'failed'])) return false;
   if (!isNonNegativeIntegerArray(value.namespaceIds)) return false;
   if (!isNamespaceNames(value.namespaceNames)) return false;
   if (!isNonNegativeSafeInteger(value.namespaceIndex)) return false;
   if (value.namespaceIndex > value.namespaceIds.length) return false;
+  if (value.gapcontinue !== undefined && typeof value.gapcontinue !== 'string') return false;
   if (value.apcontinue !== undefined && typeof value.apcontinue !== 'string') return false;
   if (!isNonNegativeSafeInteger(value.generation)) return false;
   if (!isNonNegativeSafeInteger(value.pagesFetched)) return false;
@@ -40,6 +43,18 @@ export function isTitleSyncState(value: unknown): value is TitleSyncState {
     return false;
   }
   return value.error === undefined || typeof value.error === 'string';
+}
+
+export async function readValidatedTitleSyncState(
+  database: WikiSearchDatabase,
+  key: string,
+): Promise<TitleSyncState | undefined> {
+  const state = await readValidatedSyncState(database, key, isTitleSyncState);
+  if (state === undefined) return undefined;
+  const { apcontinue, ...normalized } = state;
+  return normalized.gapcontinue === undefined && apcontinue !== undefined
+    ? { ...normalized, gapcontinue: apcontinue }
+    : normalized;
 }
 
 export function isRecentChangeSyncState(value: unknown): value is RecentChangeSyncState {

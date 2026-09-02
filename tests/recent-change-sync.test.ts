@@ -792,19 +792,63 @@ describe('RecentChanges incremental sync', () => {
     });
 
     expect(result).toMatchObject({ status: 'complete', filesChanged: true });
-    expect(await database.fileResources.get(6)).toMatchObject({
+    const updatedFile = await database.fileResources.get(6);
+    expect(updatedFile).toMatchObject({
       revisionId: 60,
       deleted: false,
+      seenInFileSync: 10,
     });
-    expect(await database.fileResources.get(7)).toMatchObject({
+    expect(updatedFile).not.toHaveProperty('seenInTitleSync');
+    const deletedFile = await database.fileResources.get(7);
+    expect(deletedFile).toMatchObject({
       deleted: true,
       writerSeq: 3,
     });
+    expect(deletedFile).not.toHaveProperty('seenInTitleSync');
     expect(await database.pages.get(6)).toBeUndefined();
     expect(await database.pages.get(7)).toBeUndefined();
     expect(
       requests.filter((request) => request.searchParams.get('prop') === 'revisions'),
     ).toHaveLength(0);
+
+    await destroy(database);
+  });
+
+  it('rejects a recent-change state corrupted after the initial read', async () => {
+    const database = await databaseWithBaseline([]);
+    await database.syncState.put({
+      key: 'recent-changes-sync',
+      value: {
+        through: '2026-08-31T03:05:00Z',
+        completedAt: Date.parse('2026-08-31T03:05:01Z'),
+        recentChanges: [],
+        fileChangeSeq: 1,
+      },
+    });
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'https://casualtiesunknown.huijiwiki.com');
+      if (url.searchParams.get('curtimestamp') === '1') {
+        return json({ curtimestamp: '2026-08-31T03:10:00Z', query: { general: {} } });
+      }
+      if (url.searchParams.get('list') === 'recentchanges') {
+        await database.syncState.put({
+          key: 'recent-changes-sync',
+          value: { through: 123, completedAt: 1, recentChanges: [] },
+        });
+        return json({ query: { recentchanges: [] } });
+      }
+      throw new Error(`不应请求：${url}`);
+    });
+    const api = new WikiApi({ fetcher: fetcher as typeof fetch, retries: 0 });
+
+    await expect(
+      syncRecentChanges(database, api, analyzer, { requestIntervalMs: 0 }),
+    ).rejects.toThrow('同步状态 "recent-changes-sync" 已损坏');
+
+    expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
+      through: 123,
+    });
+    expect((await database.syncState.get('local-sequence'))?.value).toBe(1);
 
     await destroy(database);
   });

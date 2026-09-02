@@ -418,13 +418,16 @@ export async function syncRecentChanges(
           typeof raw.lastrevid === 'number' &&
           oldFile.revisionId > raw.lastrevid
         ) {
-          filesToPut.push({ ...oldFile, seenInTitleSync: fileState.generation });
+          filesToPut.push({
+            ...withoutLegacyTitleGeneration(oldFile),
+            seenInFileSync: fileState.generation,
+          });
           continue;
         }
         const title = raw.title ?? oldFile?.title ?? candidates.byPageId.get(raw.pageid)?.title;
         if (!title) continue;
         const nextFile: PageRecord = {
-          ...oldFile,
+          ...(oldFile ? withoutLegacyTitleGeneration(oldFile) : {}),
           id: raw.pageid,
           title,
           normalizedTitle: analyzer.normalize(title),
@@ -432,7 +435,7 @@ export async function syncRecentChanges(
           namespaceName: '文件',
           isRedirect: Boolean(raw.redirect),
           localSeq: oldFile?.localSeq ?? sequence,
-          seenInTitleSync: fileState.generation,
+          seenInFileSync: fileState.generation,
           deleted: false,
           revisionId: raw.lastrevid,
           contentModel: raw.contentmodel ?? oldFile?.contentModel,
@@ -471,7 +474,7 @@ export async function syncRecentChanges(
           if (!file || file.deleted) continue;
           sequence += 1;
           tombstones.push({
-            ...file,
+            ...withoutLegacyTitleGeneration(file),
             deleted: true,
             localSeq: sequence,
             writerSeq: sequence,
@@ -484,9 +487,7 @@ export async function syncRecentChanges(
       }
       if (filesToPut.length) await database.fileResources.bulkPut(filesToPut);
     }
-    const currentRecentState = (await database.syncState.get(
-      RECENT_CHANGES_SYNC_KEY,
-    ))?.value as Partial<RecentChangeSyncState> | undefined;
+    const currentRecentState = await readRecentChangeSyncState(database);
     const state: RecentChangeSyncState = {
       through,
       completedAt: Date.now(),
@@ -717,6 +718,11 @@ function tombstone(page: PageRecord, generation: number): PageRecord {
     deleted: true,
     seenInTitleSync: generation,
   };
+}
+
+function withoutLegacyTitleGeneration(file: PageRecord): PageRecord {
+  const { seenInTitleSync: _legacyFileGeneration, ...currentFile } = file;
+  return currentFile;
 }
 
 function inactiveResult(

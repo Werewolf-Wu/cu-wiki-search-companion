@@ -207,6 +207,29 @@ describe('LocalDataMaintenance', () => {
     await database.delete();
   });
 
+  it('reports a malformed version contract instead of returning an unchecked value', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.syncState.put({
+      key: 'cache-version-contract',
+      value: { databaseSchema: Number.NaN },
+    });
+    const maintenance = new LocalDataMaintenance(
+      database,
+      new VersionedSearchIndexCache(database),
+    );
+
+    const diagnostics = await maintenance.inspect();
+
+    expect(diagnostics.versionContract).toBeUndefined();
+    expect(diagnostics.warnings).toEqual([
+      expect.stringContaining('cache-version-contract'),
+    ]);
+
+    database.close();
+    await database.delete();
+  });
+
   it('refreshes rebuilt handles and reports their final publication results', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
     await database.open();

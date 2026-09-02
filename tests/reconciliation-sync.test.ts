@@ -785,10 +785,13 @@ describe('full mirror reconciliation', () => {
 
     expect(result).toMatchObject({ status: 'complete', filesChanged: true });
     expect(await database.fileResources.get(6001)).toMatchObject({ deleted: true });
-    expect(await database.fileResources.get(6002)).toMatchObject({
+    const restoredFile = await database.fileResources.get(6002);
+    expect(restoredFile).toMatchObject({
       deleted: false,
       title: '文件:对账补回.png',
+      seenInFileSync: 1,
     });
+    expect(restoredFile).not.toHaveProperty('seenInTitleSync');
     expect((await database.syncState.get('recent-changes-sync'))?.value).toMatchObject({
       fileChangeSeq: expect.any(Number),
     });

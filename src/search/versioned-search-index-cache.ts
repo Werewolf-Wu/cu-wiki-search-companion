@@ -13,7 +13,7 @@ import {
   isNonNegativeSafeInteger,
   readLocalSequence,
 } from '../storage/sync-state';
-import type { IndexSnapshotRecord, PageRecord, SyncStateRecord } from '../types';
+import type { IndexSnapshotRecord, PageRecord } from '../types';
 import { ContentIndex } from './content-index';
 import { LuaModuleIndex } from './lua-module-index';
 import { TitleIndex } from './title-index';
@@ -333,13 +333,11 @@ export class VersionedSearchIndexCache {
         if (this.publishingSuppressed) {
           return { status: 'skipped', reason: 'cleared-this-session' };
         }
-        const [currentSequence, generationRecord] = await Promise.all([
+        const [currentSequence, currentGeneration] = await Promise.all([
           readLocalSequence(this.database),
-          this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
-            SyncStateRecord<number> | undefined
-          >,
+          readSnapshotGeneration(this.database),
         ]);
-        if (snapshotGenerationOf(generationRecord) !== candidateGeneration) {
+        if (currentGeneration !== candidateGeneration) {
           return { status: 'skipped', reason: 'cleared-this-session' };
         }
         if (currentSequence !== record.throughLocalSeq) {
@@ -458,10 +456,7 @@ export class VersionedSearchIndexCache {
       this.database.indexSnapshots,
       this.database.syncState,
       async () => {
-        const generationRecord = (await this.database.syncState.get(
-          SNAPSHOT_GENERATION_KEY,
-        )) as SyncStateRecord<number> | undefined;
-        const currentGeneration = snapshotGenerationOf(generationRecord);
+        const currentGeneration = await readSnapshotGeneration(this.database);
         if (currentGeneration >= Number.MAX_SAFE_INTEGER) {
           throw new Error('索引快照 generation 已达到安全整数上限');
         }
@@ -498,12 +493,10 @@ export class VersionedSearchIndexCache {
       this.database.pages,
       this.database.fileResources,
       async () => {
-        const [snapshot, currentSequence, generationRecord] = await Promise.all([
+        const [snapshot, currentSequence, snapshotGeneration] = await Promise.all([
           this.database.indexSnapshots.get(snapshotKey(kind)),
           readLocalSequence(this.database),
-          this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
-            SyncStateRecord<number> | undefined
-          >,
+          readSnapshotGeneration(this.database),
         ]);
         const pagesAreDelta = Boolean(
           snapshot &&
@@ -523,7 +516,7 @@ export class VersionedSearchIndexCache {
         return {
           snapshot,
           currentSequence,
-          snapshotGeneration: snapshotGenerationOf(generationRecord),
+          snapshotGeneration,
           pages,
           pagesAreDelta,
         };
@@ -539,17 +532,15 @@ export class VersionedSearchIndexCache {
       this.database.pages,
       this.database.fileResources,
       async () => {
-        const [snapshot, currentSequence, generationRecord] = await Promise.all([
+        const [snapshot, currentSequence, snapshotGeneration] = await Promise.all([
           this.database.indexSnapshots.get(snapshotKey(kind)),
           readLocalSequence(this.database),
-          this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
-            SyncStateRecord<number> | undefined
-          >,
+          readSnapshotGeneration(this.database),
         ]);
         return {
           snapshot,
           currentSequence,
-          snapshotGeneration: snapshotGenerationOf(generationRecord),
+          snapshotGeneration,
         };
       },
     );
@@ -575,14 +566,12 @@ export class VersionedSearchIndexCache {
       this.database.indexSnapshots,
       this.database.syncState,
       async () => {
-        const [current, generationRecord] = await Promise.all([
+        const [current, currentGeneration] = await Promise.all([
           this.database.indexSnapshots.get(snapshot.key),
-          this.database.syncState.get(SNAPSHOT_GENERATION_KEY) as Promise<
-            SyncStateRecord<number> | undefined
-          >,
+          readSnapshotGeneration(this.database),
         ]);
         if (
-          snapshotGenerationOf(generationRecord) === snapshotGeneration &&
+          currentGeneration === snapshotGeneration &&
           current &&
           isSameSnapshot(current, snapshot)
         ) {
@@ -726,9 +715,11 @@ function hasFingerprint(
   );
 }
 
-function snapshotGenerationOf(
-  record: SyncStateRecord<number> | undefined,
-): number {
-  const value = record?.value;
-  return isNonNegativeSafeInteger(value) ? value : 0;
+async function readSnapshotGeneration(database: WikiSearchDatabase): Promise<number> {
+  const record = await database.syncState.get(SNAPSHOT_GENERATION_KEY);
+  if (record === undefined) return 0;
+  if (isNonNegativeSafeInteger(record.value)) return record.value;
+  throw new Error(
+    `同步状态 "${SNAPSHOT_GENERATION_KEY}" 已损坏：值必须是非负安全整数`,
+  );
 }

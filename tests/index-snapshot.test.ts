@@ -32,6 +32,7 @@ describe('VersionedSearchIndexCache', () => {
     const rebuilt = await cache.restoreOrRebuild('title', analyzer);
 
     expect(rebuilt.source).toBe('rebuild');
+    expect(rebuilt.snapshotGeneration).toBe(0);
     expect(rebuilt.index.search('轻量标题')[0]?.title).toBe('轻量标题');
     expect(bulkRead).not.toHaveBeenCalled();
     bulkRead.mockRestore();
@@ -155,6 +156,23 @@ describe('VersionedSearchIndexCache', () => {
     );
     await expect(cache.inspect()).rejects.toThrow(
       '同步状态 "local-sequence" 已损坏',
+    );
+
+    database.close();
+    await database.delete();
+  });
+
+  it('rejects a corrupt persisted snapshot generation instead of treating it as zero', async () => {
+    const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+    await database.open();
+    await database.syncState.put({
+      key: 'search-index-generation',
+      value: 'corrupt',
+    });
+    const cache = new VersionedSearchIndexCache(database, { storage: unlimitedStorage() });
+
+    await expect(cache.restoreOrRebuild('title', analyzer)).rejects.toThrow(
+      '同步状态 "search-index-generation" 已损坏',
     );
 
     database.close();

@@ -193,18 +193,26 @@ export async function reconcileWikiMirror(
               ? (oldPage?.writerSeq ?? 0) > state.startLocalSeq
               : (oldPage?.localSeq ?? 0) > state.startLocalSeq;
             if (oldPage && writtenAfterFence) {
-              return { ...oldPage, seenInReconciliation: state.generation };
+              return {
+                ...(isFileBatch ? withoutLegacyTitleGeneration(oldPage) : oldPage),
+                seenInReconciliation: state.generation,
+              };
             }
             const remoteRevisionIsOlder =
               oldPage?.revisionId !== undefined &&
               rawPage.lastrevid !== undefined &&
               oldPage.revisionId > rawPage.lastrevid;
             if (oldPage && remoteRevisionIsOlder) {
-              return { ...oldPage, seenInReconciliation: state.generation };
+              return {
+                ...(isFileBatch ? withoutLegacyTitleGeneration(oldPage) : oldPage),
+                seenInReconciliation: state.generation,
+              };
             }
             const revisionChanged = oldPage?.revisionId !== rawPage.lastrevid;
             const nextPage: PageRecord = {
-              ...oldPage,
+              ...(isFileBatch && oldPage
+                ? withoutLegacyTitleGeneration(oldPage)
+                : oldPage),
               id: rawPage.pageid,
               title: rawPage.title,
               normalizedTitle: analyzer.normalize(rawPage.title),
@@ -216,9 +224,18 @@ export async function reconcileWikiMirror(
               deleted: false,
               revisionId: rawPage.lastrevid,
               contentModel: rawPage.contentmodel,
-              seenInTitleSync:
-                oldPage?.seenInTitleSync ??
-                (isFileBatch ? (fileState?.generation ?? 0) : titleState.generation),
+              ...(isFileBatch
+                ? {
+                    seenInFileSync:
+                      oldPage?.seenInFileSync ??
+                      oldPage?.seenInTitleSync ??
+                      fileState?.generation ??
+                      0,
+                  }
+                : {
+                    seenInTitleSync:
+                      oldPage?.seenInTitleSync ?? titleState.generation,
+                  }),
               seenInReconciliation: state.generation,
               ...(revisionChanged
                 ? { content: undefined, contentRevisionId: undefined }
@@ -340,12 +357,15 @@ async function finalizeReconciliation(
               (file.writerSeq ?? 0) <= state.startLocalSeq,
           )
           .toArray();
-        for (const file of staleFiles) {
+        staleFiles = staleFiles.map((file) => {
           sequence += 1;
-          file.deleted = true;
-          file.localSeq = sequence;
-          file.writerSeq = sequence;
-        }
+          return {
+            ...withoutLegacyTitleGeneration(file),
+            deleted: true,
+            localSeq: sequence,
+            writerSeq: sequence,
+          };
+        });
         if (staleFiles.length) await database.fileResources.bulkPut(staleFiles);
       }
 
@@ -459,4 +479,9 @@ function loginRequiredResult(state: ReconciliationSyncState): ReconciliationSync
     dataCodesInvalidated: state.dataCodesInvalidated,
     throughLocalSeq: state.throughLocalSeq,
   };
+}
+
+function withoutLegacyTitleGeneration(file: PageRecord): PageRecord {
+  const { seenInTitleSync: _legacyFileGeneration, ...currentFile } = file;
+  return currentFile;
 }
