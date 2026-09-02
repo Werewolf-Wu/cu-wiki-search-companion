@@ -10,7 +10,7 @@ import { ContentIndex } from '../src/search/content-index';
 import { WikiSearchDatabase } from '../src/storage/database';
 import { prepareContentJobs, syncContent } from '../src/sync/content-sync';
 import { WikiApi } from '../src/sync/wiki-api';
-import type { PageRecord } from '../src/types';
+import type { JobRecord, PageRecord } from '../src/types';
 
 const analyzer = new Analyzer({ cut, cutForSearch: cut_for_search });
 
@@ -539,6 +539,51 @@ describe('wikitext content search', () => {
     database.close();
     await database.delete();
   });
+
+  it.each([500, 2_000, 10_000])(
+    'keeps repeated prepare database work linear for %i unchanged jobs',
+    async (pageCount) => {
+      const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
+      await database.open();
+      const pages = Array.from({ length: pageCount }, (_, offset) =>
+        page(offset + 1, `P${offset + 1}`, '已有正文'),
+      );
+      await database.pages.bulkAdd(pages);
+      await database.jobs.bulkAdd(
+        pages.map(({ id, revisionId }, offset) => ({
+          id,
+          type: 'wikitext-content',
+          pageId: id,
+          status: 'done' as const,
+          targetRevisionId: revisionId,
+          updatedAt: offset + 1,
+        })),
+      );
+      await prepareContentJobs(database, false);
+
+      const pageReads = vi.fn((record: PageRecord) => record);
+      const jobReads = vi.fn((record: JobRecord) => record);
+      database.pages.hook('reading', pageReads);
+      database.jobs.hook('reading', jobReads);
+      const pagesEach = vi.spyOn(database.pages, 'each');
+      const jobsWhere = vi.spyOn(database.jobs, 'where');
+      const jobsBulkPut = vi.spyOn(database.jobs, 'bulkPut');
+      const jobsBulkDelete = vi.spyOn(database.jobs, 'bulkDelete');
+
+      await prepareContentJobs(database, false);
+
+      expect(pageReads).toHaveBeenCalledTimes(pageCount);
+      expect(jobReads).toHaveBeenCalledTimes(pageCount);
+      expect(pagesEach).toHaveBeenCalledTimes(1);
+      expect(jobsWhere).toHaveBeenCalledTimes(1);
+      expect(jobsBulkPut).not.toHaveBeenCalled();
+      expect(jobsBulkDelete).not.toHaveBeenCalled();
+      expect((await database.jobs.get(pageCount))?.updatedAt).toBe(pageCount);
+
+      database.close();
+      await database.delete();
+    },
+  );
 
   it('advances large-sync progress from batch transitions with linear job writes', async () => {
     const database = new WikiSearchDatabase(`test-${crypto.randomUUID()}`);
