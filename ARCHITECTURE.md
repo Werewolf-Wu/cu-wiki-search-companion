@@ -1,6 +1,6 @@
 # CU Wiki Search Companion 架构说明
 
-本文对应 0.3.2 架构，面向项目维护者与自动化开发工具。目标是让读者只依赖仓库内的公开材料，就能理解系统边界、数据所有权、启动时序、同步协议和修改时必须保持的不变量。
+本文对应 0.3.3 架构，面向项目维护者与自动化开发工具。目标是让读者只依赖仓库内的公开材料，就能理解系统边界、数据所有权、启动时序、同步协议和修改时必须保持的不变量。
 
 ## 1. 系统目标与核心约束
 
@@ -26,6 +26,8 @@ flowchart LR
   Entry --> API[WikiApi]
   Entry --> DB[(Dexie / IndexedDB)]
   Entry --> Pref[GM Data 字段规则]
+  Entry --> PageRuntime[src/runtime/page-search-runtime.ts]
+  PageRuntime --> Cache[VersionedSearchIndexCache]
 
   API --> TitleSync[标题基线]
   API --> ContentSync[正文队列]
@@ -55,7 +57,7 @@ flowchart LR
   DataIndex --> UI
 ~~~
 
-src/main.ts 是组合根。它负责生命周期和依赖装配，不拥有具体的同步或索引协议。复杂协议分别封装在 sync/、search/、storage/ 与 maintenance/ 中。
+src/main.ts 是组合根。它负责生命周期、依赖装配和 UI 回调，不拥有标题、正文、Lua 三类页面索引或快照 handle。`PageSearchRuntime` 统一持有这些页面搜索运行态、按模式准备、刷新与本地重建；DataCodeIndex 与文件 LinearTitleIndex 仍按既定边界留在 main.ts。复杂协议分别封装在 runtime/、sync/、search/、storage/ 与 maintenance/ 中。
 
 ## 3. 激活条件与启动时序
 
@@ -78,25 +80,31 @@ src/main.ts 是组合根。它负责生命周期和依赖装配，不拥有具�
 sequenceDiagram
   participant Page as 编辑页
   participant Main as main.ts
+  participant Runtime as PageSearchRuntime
   participant DB as IndexedDB
   participant UI as SearchPanel
   participant BG as 后台协调器
 
   Page->>Main: userscript 激活
-  Main->>DB: open + initializeVersionContract
-  DB-->>Main: 活动页面标题头 / dataCodes / sync states
-  Main->>Main: bootstrap Analyzer
-  Main->>Main: LinearTitleIndex + DataCodeIndex
+  Main->>DB: open + inspectVersionContract（只读）
+  DB-->>Main: 持久化版本状态（检查本身不登记契约）
+  Main->>Runtime: initialize()
+  Runtime->>DB: readActivePageHeaders
+  DB-->>Runtime: 活动页面标题头
+  Runtime-->>Main: bootstrap 标题搜索状态
+  Main->>Main: DataCodeIndex + sync states
   Main->>UI: ready，标题与 Data 可用
   Main->>BG: 页面可见且 idle 后检查 RC 与 Data freshness
-  Note over Main,DB: 不读快照，不加载 WASM，不建正文/Lua/文件索引
+  Note over Main,DB: initialize() 不读快照，不加载 WASM，不建正文/Lua/文件索引
 ~~~
+
+启动的版本检查只读；事实写入必须在取得跨标签写锁后重新检查并按需登记 legacy 契约。启动旧键清理采用机会性取锁，也可能完成这次登记；锁被占用时跳过，不阻塞本地搜索等待其他标签。
 
 bootstrap analyzer 使用 OpenCC 归一和一个极轻的整串 segmenter。冷启动以游标方式只物化 id、标题、命名空间和 localSeq 等标题头，LinearTitleIndex 再复制自己需要的稳定字段，不保留 PageRecord 或正文引用。此时标题通过线性 compact substring 查询；Data 代码也可从已缓存记录恢复。
 
 ### 3.3 用户打开搜索后的增强启动
 
-SearchPanel 按当前模式触发准备函数，单例 Promise 防止重复点击产生并发初始化：
+SearchPanel 按当前模式触发 `PageSearchRuntime` 的准备函数，单例 Promise 防止重复点击产生并发初始化。页面索引与 handle 不回传给 main.ts，入口只路由查询、状态和写入回调：
 
 1. 从 Tampermonkey resource 获取 jieba glue 与 WASM。
 2. glue 以 blob module 动态导入，WASM 直接以字节初始化。
@@ -106,7 +114,7 @@ SearchPanel 按当前模式触发准备函数，单例 Promise 防止重复点�
 6. Data 代码模式继续使用冷启动缓存；文件模式只按需读取 fileResources，二者都不加载 jieba 或三类 MiniSearch。
 7. 正文或 Lua 模式就绪后修复或续传共享正文 jobs；完整缓存不会重复请求 revisions，未加载的另一类索引日后从事实与快照追平。
 
-标题、正文和 Lua 快照绝不能在对应模式尚未打开时读取。文件表也只在首次切换到“文件资源”模式时读取。
+普通按模式准备时，正文和 Lua 只恢复当前选择的模式，彼此独立；增强标题是它们共有的本地前置准备。显式维护重建则按约定一次性本地重建并替换三类索引。`refreshSnapshotStatus()` 为维护/debug 诊断可以扫描三类快照并执行完整性检查，这不等于恢复索引。冷启动的 `initialize()` 仍不读取快照。文件表也只在首次切换到“文件资源”模式时读取。
 
 ### 3.4 后台页面与协作式调度
 
@@ -285,7 +293,9 @@ Data 代码：
 1. Web Lock cu-wiki-local-search:incremental-sync:v1 提供浏览器级互斥。
 2. incremental-sync-schedule 在 IndexedDB 中共享下次到期时间，默认间隔 5 分钟并增加最多 1 分钟 jitter。
 
-标题、正文、Data、文件同步、手动对账与维护重建共用同一写入缝隙。没有 Web Locks 时，周期和显式写入都返回 lock-unavailable，不在当前标签绕过互斥；已有本地镜像仍可只读搜索。正文批次在锁内只提交事实并广播失效，可能受 Page Visibility 暂停的内存索引刷新在锁释放后执行，因此隐藏标签不会仅因派生重建而长期占住跨标签写锁。
+标题、正文、Data、文件同步、手动对账与正文队列修复共用同一写入缝隙。没有 Web Locks 时，周期和显式写入都返回 lock-unavailable，不在当前标签绕过互斥；已有本地镜像仍可只读搜索。正文批次在锁内只提交事实并广播失效，可能受 Page Visibility 暂停的内存索引刷新在锁释放后执行，因此隐藏标签不会仅因派生重建而长期占住跨标签写锁。
+
+`IncrementalSyncCoordinator` 只有在锁已授予（定时任务还须已到期）后，才重新读取持久化版本契约并调用 `ensureVersionContractForWrite`；兼容性检查通过后才运行任务。缺少契约的已知 schema-v3 legacy 也只在这条锁内路径登记。启动旧同步键清理同样走 `runExclusiveIfAvailable`，锁不可用时跳过。标题/正文由 `PageSearchRuntime` 接线，RC/对账由 `MirrorSyncOrchestrator` 接线，Data、文件与正文队列维护由 main.ts 接线；这些生产事实写入口没有无锁直写兜底。索引快照等派生写入和用户明确触发的完整重置不属于事实写入许可。
 
 BroadcastChannel cu-wiki-local-search:changes:v1 只做失效通知：
 
@@ -338,14 +348,14 @@ CURRENT_VERSION_CONTRACT 当前包含：
 - database schema 3。
 - page facts 1、content job format 1。
 - analyzer pipeline 2（CJK unigram + bigram）。
-- wikitext/BSON/Lua extractor 各 1。
+- wikitext extractor 2、BSON extractor 1、Lua extractor 2。
 - title/content/Lua index 各 1。
 - Data code format 2。
 - MiniSearch 7.2.0、jieba 2.4.0。
 
 规则：
 
-- 缺少契约的既有 schema-v3 数据被视为已知 legacy v1，只登记契约，不清库、不联网。
+- 启动通过 `inspectVersionContract` 只读判断；缺少契约的既有 schema-v3 数据被视为已知 legacy v1，首次取得写锁后才登记契约，不清库、不联网。
 - analyzer、抽取器或索引版本变化只使相关派生快照过期。
 - 页面事实或 job 格式较旧只能通过显式本地迁移升级。
 - 本地事实版本高于当前代码时，进入只读不兼容模式：保留搜索、诊断和完整重置，停止后台写入。
@@ -475,6 +485,12 @@ CodeMirror 5 用 replaceSelection 后把光标显式放到插入内容之后，�
 - 冷启动不读重型派生数据。
 - 搜索域之间没有结果泄漏。
 
+新增三组关键回归覆盖：
+
+- `tests/fact-write-permission.test.ts`：显式/定时写入在活跃标签遇到事实格式升级时拒绝；排队取得锁后重新判断；派生版本差异不反复改契约；启动只读检查、锁内 legacy 登记、无锁不写，以及损坏/旧/未来契约的安全失败。
+- `tests/page-search-runtime.test.ts`：轻量初始化、同模式准备合并、远端 settlement 失败后的本地可用与重试、改名/内容替换/tombstone 重放、重建竞态的旧 handle 保护、无事实同步的本地重建和失败保留旧结果，以及未加载派生索引时强制同步不额外物化全库正文。
+- `tests/runtime-composition.test.ts`：真实入口的正常启动、数据库未就绪时早点击、无 Web Locks 时本地可搜索、隐藏标签广播延迟刷新，以及正文/Lua 按模式隔离。
+
 ### 13.1 发布自动化不变量
 
 push 工作流先在只读权限 job 中安装锁定依赖、运行测试和生产构建，再生成带 SHA-256 的资产。main 的滚动 Nightly job 按同一 ref 排队而不取消正在发布的任务；既有 release 的更新顺序固定为“上传已验证资产 → 成功编辑说明与 target → 最后 PATCH rolling tag”。若 release edit 失败，tag 必须仍指向上一次成功 Nightly，使下一次提交列表的比较基线不被污染。回归测试会在临时 Git 历史上实际执行这段 workflow shell，并用有状态的假 gh 验证失败与重试顺序。
@@ -483,6 +499,7 @@ push 工作流先在只读权限 job 中安装锁定依赖、运行测试和生�
 
 | 需求 | 首要修改点 | 必须联动检查 |
 | --- | --- | --- |
+| 页面搜索启动、准备、刷新或重建 | runtime/page-search-runtime.ts | 按模式加载、handle 序列、快照诊断与查询结果 |
 | 调整分词或归一 | analyzer/ | compatibility key、三类索引测试、快照失效 |
 | 调整正文语义 | content/extract-* | extractor version、content/lua 快照、摘要/符号测试 |
 | 调整搜索排序 | 对应 search/*-index.ts | 重建/恢复签名一致、page id 稳定排序 |
@@ -515,7 +532,7 @@ push 工作流先在只读权限 job 中安装锁定依赖、运行测试和生�
 1. 当前需求属于事实层、同步层、派生层、UI 层中的哪一层。
 2. 是否会改变可搜索页面事实；若会，localSeq 是否与事实原子提交。
 3. 是否影响版本契约或某一类快照 compatibility key。
-4. 是否会让编辑页冷启动加载 jieba、快照、正文、Lua 或文件；默认答案必须是否。
+4. 是否会让编辑页冷启动加载 jieba、恢复快照、正文、Lua 或文件；默认答案必须是否。
 5. 是否新增网络请求；错误、登录失效、重试、普通账号上限和 continuation 是否定义。
 6. 是否破坏五种搜索域的物理隔离。
 7. 多标签是否仍只有一个写者，其他标签是否只刷新已加载索引。

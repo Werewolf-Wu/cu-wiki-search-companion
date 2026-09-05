@@ -57,6 +57,32 @@ export type VersionContractState =
       migrated: false;
     };
 
+export class FactWriteCompatibilityError extends Error {
+  override readonly name = 'FactWriteCompatibilityError';
+
+  constructor(readonly reason: string) {
+    super(`事实写入版本不兼容：${reason}`);
+  }
+}
+
+/** Reads compatibility without registering or migrating persisted state. */
+export async function inspectVersionContract(
+  database: WikiSearchDatabase,
+): Promise<VersionContractState> {
+  return evaluateVersionContract(database, false);
+}
+
+/** Registers known legacy state or runs supported migrations before a fact write. */
+export async function ensureVersionContractForWrite(
+  database: WikiSearchDatabase,
+): Promise<Extract<VersionContractState, { status: 'compatible' }>> {
+  const state = await evaluateVersionContract(database, true);
+  if (state.status === 'incompatible') {
+    throw new FactWriteCompatibilityError(state.reason);
+  }
+  return state;
+}
+
 /**
  * Registers the pre-P4 schema-v3 layout as the one known legacy fact format.
  * Derived format changes never delete facts or alter remote sync cursors here.
@@ -64,60 +90,57 @@ export type VersionContractState =
 export async function initializeVersionContract(
   database: WikiSearchDatabase,
 ): Promise<VersionContractState> {
+  return evaluateVersionContract(database, true);
+}
+
+async function evaluateVersionContract(
+  database: WikiSearchDatabase,
+  allowWrites: boolean,
+): Promise<VersionContractState> {
   const record = await database.syncState.get(CACHE_VERSION_CONTRACT_KEY);
   if (record === undefined) {
-    await database.syncState.put({
-      key: CACHE_VERSION_CONTRACT_KEY,
-      value: CURRENT_VERSION_CONTRACT,
-    });
+    if (database.verno !== CURRENT_VERSION_CONTRACT.databaseSchema) {
+      return incompatible('本地数据库 schema 版本不兼容');
+    }
+    if (allowWrites) {
+      await database.syncState.put({
+        key: CACHE_VERSION_CONTRACT_KEY,
+        value: CURRENT_VERSION_CONTRACT,
+      });
+    }
     return {
       status: 'compatible',
       contract: CURRENT_VERSION_CONTRACT,
-      registeredLegacy: true,
+      registeredLegacy: allowWrites,
       migrated: false,
     };
   }
 
   if (!isVersionContract(record.value)) {
-    return {
-      status: 'incompatible',
-      reason: '本地版本契约无法识别',
-      registeredLegacy: false,
-      migrated: false,
-    };
+    return incompatible('本地版本契约无法识别');
   }
   const stored = record.value;
+  if (stored.databaseSchema !== CURRENT_VERSION_CONTRACT.databaseSchema) {
+    return incompatible('本地数据库 schema 版本不兼容', stored);
+  }
   const futureFact =
-    stored.databaseSchema > CURRENT_VERSION_CONTRACT.databaseSchema ||
     stored.pageFacts > CURRENT_VERSION_CONTRACT.pageFacts ||
     stored.contentJobFormat > CURRENT_VERSION_CONTRACT.contentJobFormat;
   if (futureFact) {
-    return {
-      status: 'incompatible',
-      contract: stored,
-      reason: '本地页面事实由更新版本创建，已停止后台写入',
-      registeredLegacy: false,
-      migrated: false,
-    };
+    return incompatible('本地页面事实由更新版本创建，已停止后台写入', stored);
   }
 
   const factsNeedMigration =
     stored.pageFacts < CURRENT_VERSION_CONTRACT.pageFacts ||
     stored.contentJobFormat < CURRENT_VERSION_CONTRACT.contentJobFormat;
   if (factsNeedMigration) {
+    if (!allowWrites) {
+      return incompatible('本地页面事实版本过旧且没有安全迁移路径', stored);
+    }
     const migrated = await migrateFacts(database, stored);
     if (!migrated) {
-      return {
-        status: 'incompatible',
-        contract: stored,
-        reason: '本地页面事实版本过旧且没有安全迁移路径',
-        registeredLegacy: false,
-        migrated: false,
-      };
+      return incompatible('本地页面事实版本过旧且没有安全迁移路径', stored);
     }
-  }
-
-  if (!areStructurallyEqual(stored, CURRENT_VERSION_CONTRACT)) {
     await database.syncState.put({
       key: CACHE_VERSION_CONTRACT_KEY,
       value: CURRENT_VERSION_CONTRACT,
@@ -125,9 +148,22 @@ export async function initializeVersionContract(
   }
   return {
     status: 'compatible',
-    contract: CURRENT_VERSION_CONTRACT,
+    contract: factsNeedMigration ? CURRENT_VERSION_CONTRACT : stored,
     registeredLegacy: false,
     migrated: factsNeedMigration,
+  };
+}
+
+function incompatible(
+  reason: string,
+  contract?: CacheVersionContract,
+): Extract<VersionContractState, { status: 'incompatible' }> {
+  return {
+    status: 'incompatible',
+    contract,
+    reason,
+    registeredLegacy: false,
+    migrated: false,
   };
 }
 
@@ -138,33 +174,6 @@ export async function readCacheVersionContract(
     database,
     CACHE_VERSION_CONTRACT_KEY,
     isVersionContract,
-  );
-}
-
-function areStructurallyEqual(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) return true;
-  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') {
-    return false;
-  }
-  if (Array.isArray(left) || Array.isArray(right)) {
-    return (
-      Array.isArray(left) &&
-      Array.isArray(right) &&
-      left.length === right.length &&
-      left.every((value, index) => areStructurallyEqual(value, right[index]))
-    );
-  }
-  const leftRecord = left as Record<string, unknown>;
-  const rightRecord = right as Record<string, unknown>;
-  const leftKeys = Object.keys(leftRecord);
-  const rightKeys = Object.keys(rightRecord);
-  return (
-    leftKeys.length === rightKeys.length &&
-    leftKeys.every(
-      (key) =>
-        Object.hasOwn(rightRecord, key) &&
-        areStructurallyEqual(leftRecord[key], rightRecord[key]),
-    )
   );
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { WikiSearchDatabase } from '../storage/database';
 import { isIncrementalSyncScheduleState } from '../storage/sync-state';
+import { ensureVersionContractForWrite } from '../storage/version-contract';
 
 const LOCK_NAME = 'cu-wiki-local-search:incremental-sync:v1';
 const SCHEDULE_STATE_KEY = 'incremental-sync-schedule';
@@ -67,6 +68,7 @@ export class IncrementalSyncCoordinator {
           : undefined;
         if (stored && this.now() < stored.nextDueAt) return 'not-due';
 
+        await ensureVersionContractForWrite(this.database);
         const completed = await task();
         if (completed === false) return 'ran';
         const lastSuccessAt = this.now();
@@ -84,13 +86,27 @@ export class IncrementalSyncCoordinator {
   }
 
   async runExclusive(task: () => Promise<void>): Promise<ExclusiveSyncResult> {
+    return this.requestExclusive(task, false);
+  }
+
+  async runExclusiveIfAvailable(
+    task: () => Promise<void>,
+  ): Promise<ExclusiveSyncResult> {
+    return this.requestExclusive(task, true);
+  }
+
+  private async requestExclusive(
+    task: () => Promise<void>,
+    ifAvailable: boolean,
+  ): Promise<ExclusiveSyncResult> {
     if (!this.lockManager) return 'lock-unavailable';
 
     return this.lockManager.request(
       LOCK_NAME,
-      { mode: 'exclusive' },
+      { mode: 'exclusive', ifAvailable },
       async (lock) => {
         if (!lock) return 'lock-unavailable';
+        await ensureVersionContractForWrite(this.database);
         await task();
         return 'ran';
       },

@@ -50,15 +50,21 @@ export class RuntimeLifecycleCoordinator {
     if (active) return active;
     const request = Promise.resolve().then(async () => {
       let result: 'ran' | 'lock-unavailable';
+      let taskStarted = false;
       try {
         result = this.options.writer
-          ? await this.options.writer.runExclusive(task)
-          : (await task(), 'ran' as const);
+          ? await this.options.writer.runExclusive(async () => {
+              taskStarted = true;
+              await task();
+            })
+          : 'lock-unavailable';
       } catch (error) {
-        try {
-          await afterRelease?.();
-        } catch {
-          // The writer failure is authoritative; a derived refresh can retry later.
+        if (taskStarted) {
+          try {
+            await afterRelease?.();
+          } catch {
+            // The writer failure is authoritative; a derived refresh can retry later.
+          }
         }
         throw error;
       }

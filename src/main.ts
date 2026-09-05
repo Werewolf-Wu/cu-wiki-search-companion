@@ -8,11 +8,9 @@ import {
 } from './data/data-field-rules';
 import { insertAtEditorSelection, wikiLink } from './editor';
 import { LocalDataMaintenance } from './maintenance/local-data-maintenance';
-import { AnalyzerPreparationCoordinator } from './runtime/analyzer-preparation';
 import { changeBroadcastEffect } from './runtime/change-broadcast';
 import { browserTaskScheduler } from './runtime/cooperative-task-scheduler';
 import { DataCodeSyncSession } from './runtime/data-code-sync-session';
-import { ContentSyncSession } from './runtime/content-sync-session';
 import { InitialBackgroundRefreshCoordinator } from './runtime/initial-background-refresh';
 import {
   MirrorSyncOrchestrator,
@@ -23,31 +21,31 @@ import {
 import { CommittedRecentChangeRefresh } from './runtime/recent-change-commit-refresh';
 import { CommittedReconciliationRefresh } from './runtime/reconciliation-commit-refresh';
 import {
+  PageSearchRuntime,
+  type PageSearchRuntimeState,
+} from './runtime/page-search-runtime';
+import {
   RuntimeLifecycleCoordinator,
   type StorageInvalidation,
   type StorageInvalidationRequest,
 } from './runtime/runtime-lifecycle-coordinator';
-import { StagedPreparationCoordinator } from './runtime/staged-preparation';
-import { ContentIndex, type ContentSearchResult } from './search/content-index';
+import type { ContentSearchResult } from './search/content-index';
 import { DataCodeIndex, type DataCodeSearchResult } from './search/data-code-index';
-import { LuaModuleIndex, type LuaModuleSearchResult } from './search/lua-module-index';
+import type { LuaModuleSearchResult } from './search/lua-module-index';
 import {
-  type SearchIndexHandle,
   type SnapshotInspection,
-  type SnapshotPublishResult,
   VersionedSearchIndexCache,
 } from './search/versioned-search-index-cache';
 import {
-  CombinedTitleIndex,
   LinearTitleIndex,
-  TitleIndex,
-  type TitleSearchBackend,
   type TitleSearchResult,
 } from './search/title-index';
-import { readActivePageHeaders, WikiSearchDatabase } from './storage/database';
+import { WikiSearchDatabase } from './storage/database';
 import { dataRulesPreference } from './storage/data-rules-preference';
-import { readLocalSequence } from './storage/sync-state';
-import { initializeVersionContract } from './storage/version-contract';
+import {
+  FactWriteCompatibilityError,
+  inspectVersionContract,
+} from './storage/version-contract';
 import { syncContent } from './sync/content-sync';
 import { readDataCodeSyncState, syncDataCodes } from './sync/data-code-sync';
 import { syncFileResources } from './sync/file-resource-sync';
@@ -62,7 +60,7 @@ import {
 } from './sync/reconciliation-sync';
 import { syncTitles } from './sync/title-sync';
 import { WikiApi } from './sync/wiki-api';
-import type { NamespaceInfo, PageRecord, TitleSyncProgress } from './types';
+import type { TitleSyncProgress } from './types';
 import { SearchPanel, type MaintenanceActionFeedback } from './ui/search-panel';
 
 declare const __CU_WIKI_BUILD_ID__: string;
@@ -137,9 +135,11 @@ const pageWindow = unsafeWindow as unknown as MediaWikiWindow;
 const bootStartedAt = performance.now();
 const LEGACY_DATA_EXTRACTION_RULES_KEY = 'data-extraction-rules';
 let startupPanel: SearchPanel | undefined;
+let rejectStartup: ((error: unknown) => void) | undefined;
 
 if (shouldActivate()) {
   void start().catch((error: unknown) => {
+    rejectStartup?.(error);
     startupPanel?.setStartupFailure(errorMessage(error), () => pageWindow.location.reload());
     console.error('[CU Wiki Search] startup failed', error);
   });
@@ -159,34 +159,37 @@ async function start(): Promise<void> {
   const maintenance = new LocalDataMaintenance(database, indexCache, {
     broadcast: { postMessage: (message) => incrementalChannel?.postMessage(message) },
   });
-  let searchBackend: TitleSearchBackend | undefined;
-  let bootstrapIndex: LinearTitleIndex | undefined;
-  let titleIndex: TitleIndex | undefined;
+  let pageSearchRuntime: PageSearchRuntime | undefined;
   let fileSearchBackend: LinearTitleIndex | undefined;
   let dataCodeIndex: DataCodeIndex | undefined;
-  let contentIndex: ContentIndex | undefined;
-  let luaModuleIndex: LuaModuleIndex | undefined;
-  let titleHandle: SearchIndexHandle<'title'> | undefined;
-  let contentHandle: SearchIndexHandle<'content'> | undefined;
-  let luaHandle: SearchIndexHandle<'lua'> | undefined;
-  let syncPromise: Promise<SyncAttemptResult> | undefined;
   let fileSyncPromise: Promise<void> | undefined;
   let incrementalCoordinator: IncrementalSyncCoordinator | undefined;
   let runtimeLifecycle: RuntimeLifecycleCoordinator | undefined;
   let dataCodeSyncSession: DataCodeSyncSession<DataCodeCommit> | undefined;
   let mirrorSyncOrchestrator: MirrorSyncOrchestrator | undefined;
   let writesCompatible = true;
-  let lastAppliedLocalSeq = 0;
   let lastAppliedFileChangeSeq = 0;
-  let analyzerResult: AnalyzerLoadResult | undefined;
   let dataCodeRulesSource = DEFAULT_DATA_CODE_RULES;
   let fileReady: Promise<void> | undefined;
   let fileReadySettled = false;
   let resolveInitialCacheReady!: () => void;
-  const initialCacheReady = new Promise<void>((resolve) => {
+  let rejectInitialCacheReady!: (error: unknown) => void;
+  const initialCacheReady = new Promise<void>((resolve, reject) => {
     resolveInitialCacheReady = resolve;
+    rejectInitialCacheReady = reject;
   });
-  const namespaces = new Map<number, string>();
+  void initialCacheReady.catch(() => undefined);
+  let resolvePageSearchRuntimeReady!: (runtime: PageSearchRuntime) => void;
+  let rejectPageSearchRuntimeReady!: (error: unknown) => void;
+  const pageSearchRuntimeReady = new Promise<PageSearchRuntime>((resolve, reject) => {
+    resolvePageSearchRuntimeReady = resolve;
+    rejectPageSearchRuntimeReady = reject;
+  });
+  void pageSearchRuntimeReady.catch(() => undefined);
+  rejectStartup = (error) => {
+    rejectInitialCacheReady(error);
+    rejectPageSearchRuntimeReady(error);
+  };
   const contentModel = pageWindow.mw?.config?.get('wgPageContentModel');
   const canInsertWikiText = typeof contentModel !== 'string' || contentModel === 'wikitext';
   const initialBackgroundRefresh = new InitialBackgroundRefreshCoordinator({
@@ -198,10 +201,9 @@ async function start(): Promise<void> {
 
   const panel = new SearchPanel({
     prepareSearch: (kind) => {
-      const preparation =
-        kind === 'title'
-          ? ensureEnhancedTitleStarted()
-          : ensureDerivedSearchStarted(kind);
+      const preparation = pageSearchRuntimeReady.then((runtime) =>
+        runtime.prepare(kind),
+      );
       observeRuntimeTask(
         preparation,
         'enhanced search startup',
@@ -215,10 +217,12 @@ async function start(): Promise<void> {
         '文件资源加载失败，本地缓存仍可用',
       );
     },
-    search: (query, namespace) => searchBackend?.search(query, namespace) ?? [],
+    search: (query, namespace) =>
+      pageSearchRuntime?.searchTitles(query, namespace) ?? [],
     searchFiles: (query) => fileSearchBackend?.search(query) ?? [],
-    searchLua: (query) => luaModuleIndex?.search(query) ?? [],
-    searchContent: (query, namespace) => contentIndex?.search(query, namespace) ?? [],
+    searchLua: (query) => pageSearchRuntime?.searchLua(query) ?? [],
+    searchContent: (query, namespace) =>
+      pageSearchRuntime?.searchContent(query, namespace) ?? [],
     searchCodes: (query) => dataCodeIndex?.search(query) ?? [],
     insert: (result, query) => {
       if (!canInsertWikiText) {
@@ -290,40 +294,11 @@ async function start(): Promise<void> {
     reconcileNow: () => requestManualReconciliation(),
     clearSnapshots: async () => {
       await maintenance.clearSnapshots();
-      await updateSnapshotDebug();
+      await pageSearchRuntime?.refreshSnapshotStatus();
     },
     requestPersistence: () => maintenance.requestPersistence(),
     resetLocalMirror: (resetDataRules) =>
       maintenance.resetLocalMirror({ resetDataRules }),
-  });
-  const contentSyncSession = new ContentSyncSession({
-    synchronize: (force) => performContentSync(force),
-    reportFailure: (error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      panel.setStatus(`正文同步暂停，本地已有正文仍可搜索：${message}`, 'error');
-      console.error('[CU Wiki Search] content sync failed', error);
-    },
-  });
-  const analyzerPreparation = new AnalyzerPreparationCoordinator(async () => {
-    await initialCacheReady;
-    await browserTaskScheduler.waitUntilVisible();
-    const loadedAnalyzer = await loadAnalyzer();
-    analyzerResult = loadedAnalyzer;
-    debugApi.engine = loadedAnalyzer.engine;
-    debugApi.jiebaReadyMs = Math.round(performance.now() - bootStartedAt);
-    return loadedAnalyzer;
-  });
-  const titlePreparation = new StagedPreparationCoordinator({
-    prepareLocal: () => prepareEnhancedTitleIndex(),
-    settle: () => settleEnhancedTitleIndex(),
-  });
-  const contentPreparation = new StagedPreparationCoordinator({
-    prepareLocal: () => prepareDerivedSearchIndex('content'),
-    settle: () => settleDerivedSearchIndex('content'),
-  });
-  const luaPreparation = new StagedPreparationCoordinator({
-    prepareLocal: () => prepareDerivedSearchIndex('lua'),
-    settle: () => settleDerivedSearchIndex('lua'),
   });
   startupPanel = panel;
   panel.setInsertMode(canInsertWikiText);
@@ -342,11 +317,13 @@ async function start(): Promise<void> {
     incrementalStatus: 'idle',
     reconciliationStatus: 'idle',
     snapshots: [],
-    search: (query, namespace) => searchBackend?.search(query, namespace) ?? [],
+    search: (query, namespace) =>
+      pageSearchRuntime?.searchTitles(query, namespace) ?? [],
     searchFiles: (query) => fileSearchBackend?.search(query) ?? [],
     searchCodes: (query) => dataCodeIndex?.search(query) ?? [],
-    searchContent: (query, namespace) => contentIndex?.search(query, namespace) ?? [],
-    searchLua: (query) => luaModuleIndex?.search(query) ?? [],
+    searchContent: (query, namespace) =>
+      pageSearchRuntime?.searchContent(query, namespace) ?? [],
+    searchLua: (query) => pageSearchRuntime?.searchLua(query) ?? [],
     forceSync: () => requestManualReconciliation(),
     forceFileSync: () => ensureFileSearchStarted(true),
     forceDataCodeSync: () => requestManualDataCodeSync(),
@@ -356,17 +333,66 @@ async function start(): Promise<void> {
   pageWindow.__CU_WIKI_SEARCH__ = debugApi;
 
   await database.open();
-  const versionState = await initializeVersionContract(database);
+  const versionState = await inspectVersionContract(database);
   writesCompatible = versionState.status === 'compatible';
   const fallbackAnalyzer = new Analyzer(createBootstrapSegmenter(), 'bootstrap');
+  incrementalCoordinator = new IncrementalSyncCoordinator(database);
+  runtimeLifecycle = new RuntimeLifecycleCoordinator({
+    applyStorageInvalidation: applyStorageInvalidation,
+    writer: incrementalCoordinator,
+  });
+  pageSearchRuntime = new PageSearchRuntime({
+    database,
+    indexCache,
+    bootstrapAnalyzer: fallbackAnalyzer,
+    loadAnalyzer: async () => {
+      await initialCacheReady;
+      return loadAnalyzer();
+    },
+    waitUntilVisible: () => browserTaskScheduler.waitUntilVisible(),
+    synchronizeTitles: async (force, analyzer, onBatch) => {
+      const coordinated = await incrementalCoordinator!.runExclusive(() =>
+        syncTitles(database, api, analyzer, {
+          force,
+          onBatch,
+          onProgress: (progress) => panel.setStatus(progressMessage(progress)),
+        }).then(() => undefined),
+      );
+      if (coordinated === 'lock-unavailable') throw writerLockUnavailableError();
+    },
+    synchronizeContent: async (force) => {
+      let progress: Awaited<ReturnType<typeof syncContent>> | undefined;
+      const coordinated = await runtimeLifecycle!.runContentWriter(async () => {
+        progress = await syncContent(database, api, {
+          force,
+          onBatch: () => {
+            incrementalChannel?.postMessage({ type: 'content-committed' });
+          },
+          onProgress: (current) => {
+            panel.setStatus(
+              `同步页面正文 ${current.done}/${current.total}` +
+                (current.failed ? ` · ${current.failed} 失败` : ''),
+            );
+          },
+        });
+      });
+      if (coordinated === 'lock-unavailable') throw writerLockUnavailableError();
+      if (!progress) throw new Error('正文同步未返回进度');
+      return progress;
+    },
+    rebuildIndexes: (analyzer) => maintenance.rebuildSearchIndexes(analyzer),
+    onStateChange: (state) => applyPageSearchState(state),
+    onStatus: ({ message, tone }) => panel.setStatus(message, tone),
+    startedAt: bootStartedAt,
+  });
+  resolvePageSearchRuntimeReady(pageSearchRuntime);
+  await pageSearchRuntime.initialize();
   const [
-    pages,
     dataCodes,
     dataCodeSyncState,
     recentChangeState,
     reconciliationState,
   ] = await Promise.all([
-    readActivePageHeaders(database),
     database.dataCodes.toArray(),
     readDataCodeSyncState(database),
     readRecentChangeSyncState(database),
@@ -392,17 +418,20 @@ async function start(): Promise<void> {
       console.warn(`[CU Wiki Search] ignored invalid ${origin} Data code rules`, error);
     }
   }
-  await database.syncState.delete(LEGACY_DATA_EXTRACTION_RULES_KEY);
+  if (writesCompatible) {
+    try {
+      await incrementalCoordinator.runExclusiveIfAvailable(() =>
+        database.syncState.delete(LEGACY_DATA_EXTRACTION_RULES_KEY),
+      );
+    } catch (error) {
+      if (error instanceof FactWriteCompatibilityError) writesCompatible = false;
+      else throw error;
+    }
+  }
   panel.setDataCodeRules(dataCodeRulesSource, DEFAULT_DATA_CODE_RULES);
-  analyzerResult = { analyzer: fallbackAnalyzer, engine: 'bootstrap' };
-  if (writesCompatible) incrementalCoordinator = new IncrementalSyncCoordinator(database);
-  runtimeLifecycle = new RuntimeLifecycleCoordinator({
-    applyStorageInvalidation: applyStorageInvalidation,
-    writer: incrementalCoordinator,
-  });
   const committedReconciliationRefresh = new CommittedReconciliationRefresh({
     readState: () => readReconciliationSyncState(database),
-    lastAppliedSequence: () => lastAppliedLocalSeq,
+    lastAppliedSequence: () => pageSearchRuntime?.state.throughLocalSeq ?? 0,
     refresh: (invalidation) => refreshIndexesFromStorage(invalidation),
     broadcast: (message) => incrementalChannel?.postMessage(message),
   });
@@ -410,10 +439,6 @@ async function start(): Promise<void> {
     refresh: (invalidation) => refreshIndexesFromStorage(invalidation),
     broadcast: (message) => incrementalChannel?.postMessage(message),
   });
-  lastAppliedLocalSeq = pages.reduce(
-    (maximum, page) => Math.max(maximum, page.localSeq),
-    0,
-  );
   lastAppliedFileChangeSeq = recentChangeState?.fileChangeSeq ?? 0;
   debugApi.incrementalThrough = recentChangeState?.through;
   debugApi.reconciliationStatus =
@@ -425,56 +450,49 @@ async function start(): Promise<void> {
           ? 'error'
           : 'idle';
   debugApi.reconciliationCompletedAt = reconciliationState?.completedAt;
-  bootstrapIndex = new LinearTitleIndex(fallbackAnalyzer, pages);
-  searchBackend = bootstrapIndex;
   dataCodeIndex = new DataCodeIndex(fallbackAnalyzer, dataCodes);
   dataCodeSyncSession = new DataCodeSyncSession<DataCodeCommit>({
     refresh: (force) => performDataCodeRefresh(force),
     save: (source) => performDataCodeSave(source),
     apply: (commit) => applyDataCodeCommit(commit),
   });
-  if (incrementalCoordinator) {
-    mirrorSyncOrchestrator = new MirrorSyncOrchestrator({
-      coordinator: incrementalCoordinator,
-      facts: {
-        reconcile: (force, onProgress) =>
-          reconcileWikiMirror(database, api, fallbackAnalyzer, {
-            force,
-            onProgress,
-          }),
-        catchUp: () => syncRecentChanges(database, api, fallbackAnalyzer),
-      },
-      committed: {
-        refreshStorage: () => refreshIndexesFromStorage(),
-        refreshReconciliation: () => committedReconciliationRefresh.apply(),
-        refreshRecentChanges: (result) => committedRecentChangeRefresh.apply(result),
-      },
-      derived: {
-        refreshData: () => requestDataCodeSync(false),
-        hasLoadedContentIndex: () => Boolean(contentIndex || luaModuleIndex),
-        refreshContent: () => runContentSync(false),
-      },
-      onEvent: (event) => handleMirrorSyncEvent(event),
-    });
-  }
-  collectNamespaces(pages, namespaces);
-  panel.setNamespaces(namespaceOptions(namespaces));
+  mirrorSyncOrchestrator = new MirrorSyncOrchestrator({
+    coordinator: incrementalCoordinator,
+    facts: {
+      reconcile: (force, onProgress) =>
+        reconcileWikiMirror(database, api, fallbackAnalyzer, {
+          force,
+          onProgress,
+        }),
+      catchUp: () => syncRecentChanges(database, api, fallbackAnalyzer),
+    },
+    committed: {
+      refreshStorage: () => refreshIndexesFromStorage(),
+      refreshReconciliation: () => committedReconciliationRefresh.apply(),
+      refreshRecentChanges: (result) => committedRecentChangeRefresh.apply(result),
+    },
+    derived: {
+      refreshData: () => requestDataCodeSync(false),
+      hasLoadedContentIndex: () =>
+        pageSearchRuntime?.hasLoadedContentIndex() ?? false,
+      refreshContent: () => runContentSync(false),
+    },
+    onEvent: (event) => handleMirrorSyncEvent(event),
+  });
   debugApi.ready = true;
-  debugApi.engine = 'bootstrap';
-  debugApi.indexedPages = searchBackend.size;
+  debugApi.engine = pageSearchRuntime.state.engine;
+  debugApi.indexedPages = pageSearchRuntime.state.indexedPages;
   debugApi.indexedDataCodes = dataCodeIndex.size;
-  debugApi.snapshots = (['title', 'content', 'lua'] as const).map((kind) => ({
-    kind,
-    status: 'not-started',
-  }));
+  debugApi.snapshots = [...pageSearchRuntime.state.snapshots];
   debugApi.startupMs = Math.round(performance.now() - bootStartedAt);
   panel.setStatus(
     writesCompatible
-      ? `已恢复 ${searchBackend.size} 个标题 · ${dataCodeIndex.size} 个 Data 代码 · 各模式按需加载`
+      ? `已恢复 ${pageSearchRuntime.state.indexedPages} 个标题 · ${dataCodeIndex.size} 个 Data 代码 · 各模式按需加载`
       : `本地数据版本不兼容，已停止后台写入；可搜索现有数据或执行完整重置`,
     writesCompatible ? 'success' : 'error',
   );
   resolveInitialCacheReady();
+  rejectStartup = undefined;
 
   if (typeof BroadcastChannel === 'function') {
     incrementalChannel = new BroadcastChannel('cu-wiki-local-search:changes:v1');
@@ -532,103 +550,6 @@ async function start(): Promise<void> {
     );
   }
 
-  function ensureEnhancedTitleStarted(): Promise<void> {
-    return titlePreparation.prepare();
-  }
-
-  async function prepareEnhancedTitleIndex(): Promise<void> {
-    panel.setStatus('正在按需加载分词引擎与标题索引…');
-    const loadedAnalyzer = await analyzerPreparation.prepare();
-    const restoredTitle = await indexCache.restoreOrRebuild(
-      'title',
-      loadedAnalyzer.analyzer,
-    );
-    const upgradedIndex = restoredTitle.index;
-    if (!bootstrapIndex) throw new Error('本地标题缓存尚未就绪');
-    titleHandle = restoredTitle;
-    titleIndex = upgradedIndex;
-    searchBackend = new CombinedTitleIndex(upgradedIndex, bootstrapIndex);
-    debugApi.indexedPages = upgradedIndex.size;
-    await updateSnapshotDebug();
-    panel.refreshResults();
-  }
-
-  async function settleEnhancedTitleIndex(): Promise<void> {
-    panel.setStatus('正在同步标题…');
-    const syncResult = await runSync(false);
-    if (syncResult.status === 'error') throw syncResult.error;
-    if (!analyzerResult || !titleIndex) throw new Error('增强标题索引尚未就绪');
-    if (analyzerResult.warning) {
-      panel.setStatus(
-        `jieba 加载失败，已用 Intl.Segmenter · ${titleIndex.size} 标题`,
-        'error',
-      );
-    } else {
-      panel.setStatus(
-        `标题索引已就绪 · ${titleIndex.size} 标题 · 正文与 Lua 按模式加载`,
-        'success',
-      );
-    }
-  }
-
-  function ensureDerivedSearchStarted(kind: 'content' | 'lua'): Promise<void> {
-    return kind === 'content' ? contentPreparation.prepare() : luaPreparation.prepare();
-  }
-
-  async function prepareDerivedSearchIndex(kind: 'content' | 'lua'): Promise<void> {
-    panel.setStatus(
-      kind === 'content' ? '正在按需恢复正文索引…' : '正在按需恢复 Lua 索引…',
-    );
-    await titlePreparation.prepareLocal();
-    await browserTaskScheduler.waitUntilVisible();
-    if (!analyzerResult || analyzerResult.engine === 'bootstrap') {
-      throw new Error('增强分词引擎尚未就绪');
-    }
-    if (kind === 'content') {
-      const restored = await indexCache.restoreOrRebuild(
-        'content',
-        analyzerResult.analyzer,
-      );
-      contentHandle = restored;
-      contentIndex = restored.index;
-      debugApi.indexedContentPages = restored.index.size;
-    } else {
-      const restored = await indexCache.restoreOrRebuild(
-        'lua',
-        analyzerResult.analyzer,
-      );
-      luaHandle = restored;
-      luaModuleIndex = restored.index;
-      debugApi.indexedLuaModules = restored.index.size;
-    }
-    panel.refreshResults();
-  }
-
-  async function settleDerivedSearchIndex(kind: 'content' | 'lua'): Promise<void> {
-    const handle = kind === 'content' ? contentHandle : luaHandle;
-    if (!handle) throw new Error(`${searchKindLabel(kind)}尚未就绪`);
-    await ensureEnhancedTitleStarted();
-    await settleRestoredDerivedHandle(handle);
-    const readyMs = Math.round(performance.now() - bootStartedAt);
-    if (kind === 'content') debugApi.contentIndexReadyMs = readyMs;
-    else debugApi.luaIndexReadyMs = readyMs;
-    debugApi.contentReadyMs = Math.max(
-      debugApi.contentIndexReadyMs ?? 0,
-      debugApi.luaIndexReadyMs ?? 0,
-    );
-    await updateSnapshotDebug();
-    panel.refreshResults();
-  }
-
-  async function settleRestoredDerivedHandle<K extends 'content' | 'lua'>(
-    handle: SearchIndexHandle<K>,
-  ): Promise<void> {
-    await runContentSync(false);
-    await indexCache.refresh(handle);
-    const warning = snapshotPublishWarning(await indexCache.publish(handle));
-    if (warning) panel.setStatus(warning, 'error');
-  }
-
   function ensureFileSearchStarted(force: boolean): Promise<void> {
     if (!fileReady) {
       fileReadySettled = false;
@@ -679,9 +600,7 @@ async function start(): Promise<void> {
           },
         });
       };
-      const coordinated = incrementalCoordinator
-        ? await incrementalCoordinator.runExclusive(run)
-        : (await run(), 'ran' as const);
+      const coordinated = await incrementalCoordinator!.runExclusive(run);
       if (coordinated === 'lock-unavailable') {
         throw new Error('无法取得跨标签写入锁，请确认浏览器支持 Web Locks 后重试');
       }
@@ -702,12 +621,9 @@ async function start(): Promise<void> {
   }
 
   async function requestSync(force: boolean): Promise<void> {
-    await titlePreparation.prepareLocal();
-    const result = await runSync(force);
-    if (result.status === 'error') {
-      titlePreparation.invalidateSettlement();
-      throw result.error;
-    }
+    const runtime = pageSearchRuntime;
+    if (!runtime) throw new Error('页面搜索运行态尚未就绪');
+    await runtime.synchronizeTitles(force);
   }
 
   async function saveDataCodeRules(source: string): Promise<void> {
@@ -810,8 +726,10 @@ async function start(): Promise<void> {
   }
 
   async function requestContentSync(force: boolean): Promise<void> {
-    await ensureEnhancedTitleStarted();
-    return runContentSync(force);
+    const runtime = pageSearchRuntime;
+    if (!runtime) throw new Error('页面搜索运行态尚未就绪');
+    await runtime.prepare('title');
+    return runtime.synchronizeContent(force);
   }
 
   async function requestIncrementalSync(): Promise<void> {
@@ -966,47 +884,13 @@ async function start(): Promise<void> {
   async function applyStorageInvalidation(
     invalidation: StorageInvalidation,
   ): Promise<void> {
-    const [sequence, incrementalState, dataState] = await Promise.all([
-      invalidation.pages ? readLocalSequence(database) : 0,
+    const [incrementalState, dataState] = await Promise.all([
       invalidation.pages || invalidation.files
         ? readRecentChangeSyncState(database)
         : undefined,
       invalidation.data ? readDataCodeSyncState(database) : undefined,
     ]);
-    let indexChanged = false;
-    const sequenceAdvanced = invalidation.pages && sequence > lastAppliedLocalSeq;
-    const handleBehind = [titleHandle, contentHandle, luaHandle].some(
-      (handle) =>
-        invalidation.pages && handle !== undefined && sequence > handle.throughLocalSeq,
-    );
-    if (sequenceAdvanced || handleBehind) {
-      indexChanged = true;
-      const changedPages = sequenceAdvanced
-        ? await database.pages
-            .where('localSeq')
-            .above(lastAppliedLocalSeq)
-            .toArray()
-        : [];
-      if (titleHandle) await indexCache.refresh(titleHandle);
-      if (contentHandle) await indexCache.refresh(contentHandle);
-      if (luaHandle) await indexCache.refresh(luaHandle);
-      if (sequenceAdvanced) {
-        const allPages = await readActivePageHeaders(database);
-        bootstrapIndex = new LinearTitleIndex(fallbackAnalyzer, allPages);
-        searchBackend = titleIndex
-          ? new CombinedTitleIndex(titleIndex, bootstrapIndex)
-          : bootstrapIndex;
-        collectNamespaces(changedPages, namespaces);
-        panel.setNamespaces(namespaceOptions(namespaces));
-      }
-      debugApi.indexedPages = searchBackend?.size ?? titleIndex?.size ?? 0;
-      debugApi.indexedContentPages = contentIndex?.size ?? 0;
-      debugApi.indexedLuaModules = luaModuleIndex?.size ?? 0;
-      lastAppliedLocalSeq = Math.max(lastAppliedLocalSeq, sequence);
-      if (titleHandle) indexCache.schedulePublish(titleHandle);
-      if (contentHandle) indexCache.schedulePublish(contentHandle);
-      if (luaHandle) indexCache.schedulePublish(luaHandle);
-    }
+    if (invalidation.pages) await pageSearchRuntime?.refresh();
 
     const fileChangeSeq = incrementalState?.fileChangeSeq ?? 0;
     if (invalidation.files || fileChangeSeq > lastAppliedFileChangeSeq) {
@@ -1036,191 +920,44 @@ async function start(): Promise<void> {
         }
       }
     }
-    if (indexChanged) await updateSnapshotDebug();
     panel.refreshResults();
   }
 
   function runContentSync(force: boolean): Promise<void> {
     if (!ensureWritesAllowed()) return Promise.resolve();
-    return contentSyncSession.run(force);
-  }
-
-  async function performContentSync(force: boolean): Promise<void> {
-    let finalProgress: Awaited<ReturnType<typeof syncContent>> | undefined;
-    const writeContentFacts = async (): Promise<void> => {
-      finalProgress = await syncContent(database, api, {
-        force,
-        onBatch: () => {
-          incrementalChannel?.postMessage({ type: 'content-committed' });
-        },
-        onProgress: (progress) => {
-          panel.setStatus(
-            `同步页面正文 ${progress.done}/${progress.total}` +
-              (progress.failed ? ` · ${progress.failed} 失败` : ''),
-          );
-        },
-      });
-    };
-    const refreshDerivedIndexes = async (): Promise<void> => {
-      await refreshIndexesFromStorage();
-      debugApi.indexedContentPages = contentIndex?.size ?? 0;
-      debugApi.indexedLuaModules = luaModuleIndex?.size ?? 0;
-      panel.refreshResults();
-    };
-    let coordinated: 'ran' | 'lock-unavailable';
-    if (runtimeLifecycle) {
-      coordinated = await runtimeLifecycle.runContentWriter(
-        writeContentFacts,
-        refreshDerivedIndexes,
-      );
-    } else {
-      await writeContentFacts();
-      await refreshDerivedIndexes();
-      coordinated = 'ran';
-    }
-    if (coordinated === 'lock-unavailable') {
-      throw new Error('另一个标签页正在写入本地镜像，请稍后重试');
-    }
-    if (!finalProgress) throw new Error('正文同步未返回进度');
-    if (force && (contentIndex || luaModuleIndex)) {
-      const allPages = await database.pages.filter((page) => !page.deleted).toArray();
-      await contentIndex?.rebuildAsync(allPages);
-      await luaModuleIndex?.rebuildAsync(allPages);
-    }
-    let snapshotWarning: string | undefined;
-    if (contentHandle) {
-      await indexCache.refresh(contentHandle);
-      snapshotWarning = snapshotPublishWarning(await indexCache.publish(contentHandle));
-    }
-    if (luaHandle) {
-      await indexCache.refresh(luaHandle);
-      snapshotWarning ??= snapshotPublishWarning(await indexCache.publish(luaHandle));
-    }
-    await updateSnapshotDebug();
-    debugApi.indexedContentPages = contentIndex?.size ?? 0;
-    debugApi.indexedLuaModules = luaModuleIndex?.size ?? 0;
-    panel.refreshResults();
-    const loadedIndexes =
-      contentIndex || luaModuleIndex
-        ? ` · ${contentIndex?.size ?? 0} 正文 / ${luaModuleIndex?.size ?? 0} Lua`
-        : ' · 正文与 Lua 索引将在切换模式时按需恢复';
-    panel.setStatus(
-      snapshotWarning ??
-        `正文同步完成 · ${finalProgress.done}/${finalProgress.total} 页${loadedIndexes}`,
-      finalProgress.failed || snapshotWarning ? 'error' : 'success',
-    );
-  }
-
-  async function runSync(force: boolean): Promise<SyncAttemptResult> {
-    if (!ensureWritesAllowed()) {
-      return { status: 'error', error: new Error('本地数据版本不兼容') };
-    }
-    if (syncPromise) return syncPromise;
-    if (!analyzerResult || !titleIndex) {
-      return { status: 'error', error: new Error('增强标题索引尚未就绪') };
-    }
-    const activeIndex = titleIndex;
-    const activeAnalyzer = analyzerResult.analyzer;
-    syncPromise = (async () => {
-      try {
-        let receivedBatch = false;
-        const run = async (): Promise<void> => {
-          await syncTitles(database, api, activeAnalyzer, {
-            force,
-            onBatch: (batch) => {
-              receivedBatch = true;
-              activeIndex.update(batch);
-              collectNamespaces(batch, namespaces);
-              panel.setNamespaces(namespaceOptions(namespaces));
-              debugApi.indexedPages = activeIndex.size;
-              panel.refreshResults();
-            },
-            onProgress: (progress) => panel.setStatus(progressMessage(progress)),
-          });
-        };
-        const coordinated = incrementalCoordinator
-          ? await incrementalCoordinator.runExclusive(run)
-          : (await run(), 'ran' as const);
-        if (coordinated === 'lock-unavailable') {
-          throw new Error('另一个标签页正在写入本地镜像，请稍后重试');
-        }
-        if (receivedBatch) {
-          const allPages = await readActivePageHeaders(database);
-          await activeIndex.rebuildAsync(allPages);
-          bootstrapIndex = new LinearTitleIndex(activeAnalyzer, allPages);
-          searchBackend = new CombinedTitleIndex(activeIndex, bootstrapIndex);
-          panel.refreshResults();
-        }
-        await refreshIndexesFromStorage();
-        const snapshotWarning = titleHandle
-          ? snapshotPublishWarning(await indexCache.publish(titleHandle))
-          : undefined;
-        await updateSnapshotDebug();
-        debugApi.indexedPages = activeIndex.size;
-        panel.setStatus(
-          snapshotWarning ??
-            `标题同步完成 · ${activeIndex.size} 页 · ${dataCodeIndex?.size ?? 0} 个 Data 代码 · ${analyzerResult?.engine}`,
-          snapshotWarning ? 'error' : 'success',
-        );
-        return { status: 'complete' } as const;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        panel.setStatus(`同步失败，本地搜索仍可用：${message}`, 'error');
-        console.error('[CU Wiki Search] title sync failed', error);
-        return { status: 'error', error } as const;
-      } finally {
-        syncPromise = undefined;
-      }
-    })();
-    return syncPromise;
+    return pageSearchRuntime?.synchronizeContent(force) ?? Promise.resolve();
   }
 
   async function rebuildSearchIndexes(): Promise<MaintenanceActionFeedback | undefined> {
-    assertWritesAllowed();
-    await Promise.all([
-      titlePreparation.waitForActiveLocal(),
-      contentPreparation.waitForActiveLocal(),
-      luaPreparation.waitForActiveLocal(),
-    ]);
-    const rebuilt = await analyzerPreparation.runLocal((loadedAnalyzer) =>
-      maintenance.rebuildSearchIndexes(loadedAnalyzer.analyzer),
-    );
-    titleHandle = rebuilt.title;
-    contentHandle = rebuilt.content;
-    luaHandle = rebuilt.lua;
-    titleIndex = rebuilt.title.index;
-    contentIndex = rebuilt.content.index;
-    luaModuleIndex = rebuilt.lua.index;
-    const pages = await readActivePageHeaders(database);
-    bootstrapIndex = new LinearTitleIndex(fallbackAnalyzer, pages);
-    searchBackend = new CombinedTitleIndex(titleIndex, bootstrapIndex);
-    lastAppliedLocalSeq = Math.max(
-      rebuilt.title.throughLocalSeq,
-      rebuilt.content.throughLocalSeq,
-      rebuilt.lua.throughLocalSeq,
-    );
-    debugApi.indexedPages = titleIndex.size;
-    debugApi.indexedContentPages = contentIndex.size;
-    debugApi.indexedLuaModules = luaModuleIndex.size;
-    await updateSnapshotDebug();
-    panel.refreshResults();
-    if (rebuilt.warnings.length) {
+    const runtime = await pageSearchRuntimeReady;
+    const warnings = await runtime.rebuildIndexes();
+    if (warnings.length) {
       return {
-        message: `索引已重建，某些快照未保存：${rebuilt.warnings.map(({ message }) => message).join('；')}；当前搜索可用`,
+        message: `索引已重建，某些快照未保存：${warnings.map(({ message }) => message).join('；')}；当前搜索可用`,
         tone: 'normal',
       };
     }
     return undefined;
   }
 
-  async function updateSnapshotDebug(): Promise<void> {
-    debugApi.snapshots = await indexCache.inspect();
+  function applyPageSearchState(state: PageSearchRuntimeState): void {
+    debugApi.engine = state.engine;
+    debugApi.indexedPages = state.indexedPages;
+    debugApi.indexedContentPages = state.indexedContentPages;
+    debugApi.indexedLuaModules = state.indexedLuaModules;
+    debugApi.jiebaReadyMs = state.jiebaReadyMs;
+    debugApi.contentIndexReadyMs = state.contentIndexReadyMs;
+    debugApi.luaIndexReadyMs = state.luaIndexReadyMs;
+    debugApi.contentReadyMs = state.contentReadyMs;
+    debugApi.snapshots = [...state.snapshots];
+    panel.setNamespaces([...state.namespaces]);
+    panel.refreshResults();
   }
 
   function ensureWritesAllowed(): boolean {
     if (writesCompatible) return true;
     panel.setStatus(
-      '本地数据版本高于当前脚本，后台写入已停止；请使用完整重置恢复兼容状态',
+      '本地数据版本不兼容，后台写入已停止；请更新脚本或检查本地状态',
       'error',
     );
     return false;
@@ -1249,31 +986,11 @@ async function start(): Promise<void> {
     userMessage?: string,
   ): void {
     void task.catch((error: unknown) => {
+      if (error instanceof FactWriteCompatibilityError) writesCompatible = false;
       if (userMessage) panel.setStatus(`${userMessage}：${errorMessage(error)}`, 'error');
       console.error(`[CU Wiki Search] ${context} failed`, error);
     });
   }
-
-  function snapshotPublishWarning(result: SnapshotPublishResult): string | undefined {
-    if (result.status === 'published') return undefined;
-    if (result.reason === 'too-large') {
-      return '索引快照超过 64 MiB，已跳过保存；当前搜索仍可正常使用';
-    }
-    if (result.reason === 'quota') {
-      return 'IndexedDB 剩余配额不足，已跳过快照；当前搜索仍可正常使用';
-    }
-    return undefined;
-  }
-}
-
-function collectNamespaces(pages: PageRecord[], namespaces: Map<number, string>): void {
-  for (const page of pages) {
-    if (!page.deleted) namespaces.set(page.namespace, page.namespaceName);
-  }
-}
-
-function namespaceOptions(namespaces: Map<number, string>): NamespaceInfo[] {
-  return [...namespaces].map(([id, name]) => ({ id, name: name || '（主）' }));
 }
 
 function progressMessage(progress: TitleSyncProgress): string {
@@ -1284,6 +1001,10 @@ function progressMessage(progress: TitleSyncProgress): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function writerLockUnavailableError(): Error {
+  return new Error('无法取得跨标签写入锁，请确认浏览器支持 Web Locks 后重试');
 }
 
 function searchKindLabel(kind: 'title' | 'content' | 'lua'): string {
